@@ -1,7 +1,7 @@
 ---
 id: task-4
 title: Recompiler and runtime architecture design
-status: Planned
+status: Ready
 ---
 ## Problem before solution
 We need a design that beats existing recomps on correctness and upgradability. Known hard parts (hypotheses to confirm): IL2CPP managed exceptions are C++ exceptions (unwinding across lifted code); Boehm GC scans guest stacks and registers conservatively; heavy virtual and interface dispatch through vtables and generic sharing; NEON and FP exactness; atomics and memory ordering across guest threads; NVN plus Maxwell shaders; frame-rate assumptions in game logic.

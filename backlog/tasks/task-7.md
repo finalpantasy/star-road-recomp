@@ -1,7 +1,7 @@
 ---
 id: task-7
 title: Research bugs players still report in 1.0.1 (fix list for the port)
-status: Ready
+status: Verified
 ---
 ## Problem before solution
 The owner wants the PC version to fix bugs that remain in Switch 1.0.1. Nobody has collected them yet.
@@ -13,9 +13,9 @@ Execution: subchat, Sonnet, medium effort (web research).
 ## Acceptance and evidence
 | ID | Criterion | Scenario/assertion | Required evidence | Result |
 |---|---|---|---|---|
-| AC1 | Each bug has at least one working source link and a 1.0.1 status (confirmed, likely, fixed, unknown) | Doc review | Doc | NOT_RUN |
-| AC2 | Official 1.0.1 patch notes quoted by link and summarized | Doc review | Doc | NOT_RUN |
-| AC3 | Ranked top 10 by player impact | Doc review | Doc | NOT_RUN |
+| AC1 | Each bug has at least one working source link and a 1.0.1 status (confirmed, likely, fixed, unknown) | Doc review | Doc | PASS (lead review 2026-11-24) |
+| AC2 | Official 1.0.1 patch notes quoted by link and summarized | Doc review | Doc | PASS (lead review 2026-11-24) |
+| AC3 | Ranked top 10 by player impact | Doc review | Doc | PASS (lead review 2026-11-24) |
 ## Human gates
 The owner picks which bugs to fix and which speedrun glitches stay as options.
 ## Recovery and return condition

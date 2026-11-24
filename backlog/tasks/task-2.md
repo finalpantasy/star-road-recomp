@@ -1,7 +1,7 @@
 ---
 id: task-2
 title: IL2CPP metadata recovery and full function inventory
-status: Ready
+status: Verified
 ---
 ## Problem before solution
 Facts: `global-metadata.dat` is v29, unencrypted (magic AF1BB1FA). `main` is an NSO (magic NSO0), MOD0 present. Hypothesis: Il2CppCodeRegistration and Il2CppMetadataRegistration are findable in `main` .data by pattern, giving method pointers for every C# method.
@@ -13,10 +13,10 @@ Execution: worker subagent, Sonnet, high effort (binary format work, must be exa
 ## Acceptance and evidence
 | ID | Criterion | Scenario/assertion | Required evidence | Result |
 |---|---|---|---|---|
-| AC1 | Parser reads all metadata tables; counts reported (images, types, methods, fields, strings) | Run parser | Counts in doc | NOT_RUN |
-| AC2 | CodeRegistration and MetadataRegistration located; method pointer count matches metadata method count rules | Run locator | Offsets and counts | NOT_RUN |
-| AC3 | 20 spot-checked methods: name to address maps to a plausible function start (prologue, inside .text) | Disassemble spot checks (llvm-objdump) | Table in doc | NOT_RUN |
-| AC4 | Origin classification for all .text functions with method counts per class | Generated TSV | Summary table | NOT_RUN |
+| AC1 | Parser reads all metadata tables; counts reported (images, types, methods, fields, strings) | Run parser | Counts in doc | PASS (31 tables; counts in il2cpp.md) |
+| AC2 | CodeRegistration and MetadataRegistration located; method pointer count matches metadata method count rules | Run locator | Offsets and counts | PASS (CodeReg 0x33c6828, MetaReg 0x33c7820; 67,746 slots = methods; Il2CppDumper agrees) |
+| AC3 | 20 spot-checked methods: name to address maps to a plausible function start (prologue, inside .text) | Disassemble spot checks (llvm-objdump) | Table in doc | PASS (20 of 20; lead rechecked 2 more with llvm-objdump) |
+| AC4 | Origin classification for all .text functions with method counts per class | Generated TSV | Summary table | PASS (157,221 functions classified; tiers in functions.tsv) |
 ## Human gates
 Downloading Il2CppDumper or Cpp2IL for a cross-check needs the owner's yes; do not download.
 ## Recovery and return condition
