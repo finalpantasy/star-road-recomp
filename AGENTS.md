@@ -29,6 +29,7 @@ None yet.
 - Quality bar (the owner, 2026-11-24): aim for the best recompilation and decompilation ever made. Take ideas from other recomps (New Pokemon Snap, ACNH, LAS, N64Recomp, XenonRecomp, UnleashedRecomp); do not copy their code wholesale. Our own design, written for this game.
 - Third-party tools (hactool, nstool, Ghidra, SwitchLoader, IL2CPP dumpers, LLVM) may be used as tools. Code copied into this repo must be license-compatible and credited.
 - Nothing from the game ever enters Git: no binaries, assets, keys, metadata, extracted text, generated recompiled code, or dumps. Generated code lives on A: and is rebuilt from the user's own dump.
+- Public repo: github.com/finalpantasy/super-mario-rpg-star-road. Push with `GH_TOKEN=$(gh auth token -u finalpantasy)` and `git -c credential.helper= -c "credential.helper=!gh auth git-credential" push`; never switch the active gh account. Before every push grep the diff and metadata for personal details.
 - Public identity: commits as `finalpantasy` with its noreply email. No real names, personal emails or `C:\Users\...` paths in any committed file or message.
 - Correctness is measured against the original: every subsystem gets a reference test (recorded inputs, state hashes, captures) before it is called done.
 - Upgrades (4K, high frame rate, quality of life, mods) are built from day one (D-004), each behind an option with a faithful mode for A/B checks.

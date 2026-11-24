@@ -21,5 +21,6 @@ Checkpoint/return rule: workers report once at done or blocked (context: hand of
 | task-1 | smrpg-extract `local_8002ca73-d772-4b26-89e1-b15956ec4ab4` | `tools/extract.py` | Sonnet low | Verified; lead rechecked ExeFS hashes. Released. |
 | task-2 | smrpg-il2cpp `local_5497e2ca-368e-4637-a2f3-71a0076a47b5` | `tools/il2cpp/`, `docs/analysis/il2cpp.md` | Sonnet high | Running. |
 | task-3 | smrpg-survey `local_866547cc-3341-42a9-bdcc-61422d9c1a77` | `tools/survey/`, `docs/analysis/platform-survey.md` | Sonnet medium | Running. |
-| task-7 | smrpg-bugs `local_6d272edb-9ebe-457e-88ae-7e61663e7af4` | `docs/analysis/known-bugs-1.0.1.md` | Sonnet medium | Running. |
+| task-7 | smrpg-bugs `local_6d272edb-9ebe-457e-88ae-7e61663e7af4` | `docs/analysis/known-bugs-1.0.1.md` | Sonnet medium | Second pass running (browser and reddit-reader) after a thin first pass. |
 | task-8 | smrpg-retools `local_3f1d12dc-77cb-41dd-90eb-0d76b6584edf` | `docs/analysis/re-tools.md`, `F:\AI\Recomps\research_notes\ai-re-tools-2026-11.md` | Sonnet medium | Running; scope widened by message 2026-11-24 (skills, frameworks incl. Kirikae, verification, runtime tools, workbench idea). |
+| task-9 | smrpg-priorart `local_56d775aa-ae3d-4427-8281-1f1c2da48f99` | `docs/analysis/prior-art.md` | Sonnet medium | Running. |

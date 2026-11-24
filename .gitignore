@@ -43,3 +43,4 @@ evidence/*.bin
 .vs/
 .vscode/
 *.log
+evidence/last-check.*
