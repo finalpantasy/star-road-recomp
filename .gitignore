@@ -44,3 +44,6 @@ evidence/*.bin
 .vscode/
 *.log
 evidence/last-check.*
+
+# Reused code (D-009): local only, never committed or pushed until rewritten as our own
+reuse/

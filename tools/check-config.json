@@ -2,12 +2,50 @@
   "commands": [
     {
       "id": "inputs",
-      "argv": ["{python}", "-I", "{root}/tests/test_inputs.py", "--report", "{run_dir}/inputs.json"],
+      "argv": [
+        "{python}",
+        "-I",
+        "{root}/tests/test_inputs.py",
+        "--report",
+        "{run_dir}/inputs.json"
+      ],
       "timeout_seconds": 600,
       "report": "{run_dir}/inputs.json",
+      "format": "json"
+    },
+    {
+      "id": "lifter",
+      "argv": [
+        "{python}",
+        "-I",
+        "{root}/tests/test_lifter.py",
+        "--report",
+        "{run_dir}/lifter.json"
+      ],
+      "timeout_seconds": 600,
+      "report": "{run_dir}/lifter.json",
+      "format": "json"
+    },
+    {
+      "id": "no-reuse",
+      "argv": [
+        "{python}",
+        "-I",
+        "{root}/tests/test_no_reuse.py",
+        "--report",
+        "{run_dir}/no_reuse.json"
+      ],
+      "timeout_seconds": 120,
+      "report": "{run_dir}/no_reuse.json",
       "format": "json"
     }
   ],
   "extra_inputs": [],
-  "exclude_inputs": ["docs", "backlog", "STATE.md", "Super Mario RPG [0100BC0018138000] [v0].xci", "v-super_mario_rpg_v65536.nsp"]
+  "exclude_inputs": [
+    "docs",
+    "backlog",
+    "STATE.md",
+    "Super Mario RPG [0100BC0018138000] [v0].xci",
+    "v-super_mario_rpg_v65536.nsp"
+  ]
 }

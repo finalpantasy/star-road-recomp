@@ -1,0 +1,25 @@
+# Star Road Recomp texture path (task-11). Our own code. C11, clang (LLVM-MinGW), Windows x64.
+# Standalone:  cmake -S runtime/gfx/texture -B A:/AI/Recomps/smrpg-work/textures/build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=clang
+# From the runtime: add_subdirectory(gfx/texture) and link smrpg_texture.
+cmake_minimum_required(VERSION 3.20)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(smrpg_texture C)
+endif()
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+add_library(smrpg_texture STATIC tex_format.c tex_layout.c tex_astc.c tex_bc.c)
+target_include_directories(smrpg_texture PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(smrpg_texture PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+if(NOT WIN32)
+  target_link_libraries(smrpg_texture PUBLIC m)
+endif()
+# Offline checker and unit tests (not part of the game build).
+option(SMRPG_TEXTURE_TOOLS "build texture_check and unit tests" ON)
+if(SMRPG_TEXTURE_TOOLS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/texture_check.c)
+  add_executable(texture_check tools/texture_check.c tools/tex_unityfs.c tools/png_write.c)
+  target_link_libraries(texture_check PRIVATE smrpg_texture)
+  target_compile_options(texture_check PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+  add_executable(texture_unit ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/texture/texture_unit.c)
+  target_link_libraries(texture_unit PRIVATE smrpg_texture)
+  target_compile_options(texture_unit PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+endif()

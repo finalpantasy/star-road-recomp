@@ -1,0 +1,7 @@
+[nvn] STUB nvnBlendStateGetAdvancedMode called (no implementation; returns 0)
+sizes: NVNtexture 0x80 (impl uses 0x80), NVNtextureView 0x10
+proc table: 535 names, 332 implemented, 203 logged stubs; 0 implemented have no generated signature
+USED STUB nvnCommandBufferBindStorageBuffersDeferred : deferred storage buffer binding has no Vulkan equivalent worth emulating until a translated shader uses it
+USED STUB nvnCommandBufferSetViewportSwizzles : viewport swizzle (NV_viewport_swizzle) is not available on the Vulkan target; the game only sets identity
+used list: 265 names, 263 implemented, 2 stubbed
+nvn_unit: 2161 checks, 0 failed
