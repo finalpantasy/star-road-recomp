@@ -1,15 +1,15 @@
 ---
 id: task-5
 title: Lifter v0 and boot to first service call
-status: Planned
+status: Ready
 ---
 ## Problem before solution
 No code yet.
 ## Outcome and scope
 Lift all of v1.0.1 `main`, `subsdk0`, `sdk` to C, compile and link with a minimal runtime; the program runs its init and reaches its first SVC and service calls, which are logged. Non-goals: graphics, audio.
 ## Dependencies and ownership
-Depends on task-4. Owners set when Ready.
-Execution: set at Ready (likely Sonnet high per component, Opus for unclear failures).
+Depends on task-4 (Verified 2026-11-24). Owner: smrpg-lifter.
+Execution: subchat, Sonnet high; escalate unclear failures to the lead (Opus).
 ## Acceptance and evidence
 | ID | Criterion | Scenario/assertion | Required evidence | Result |
 |---|---|---|---|---|
