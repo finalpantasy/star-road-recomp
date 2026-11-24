@@ -1,0 +1,19 @@
+{
+  "comment": "Identity of the owner's dump and the extracted files the project builds from. Hashes only, never game content.",
+  "work_root_default": "A:/AI/Recomps/smrpg-work",
+  "dumps": {
+    "base_xci": {"path": "Super Mario RPG [0100BC0018138000] [v0].xci", "size": 6874182656, "sha256": "b07710bf43c059b9833d5c5bb05599396c49ae85e7be46b46f8273669c54a604"},
+    "update_nsp": {"path": "v-super_mario_rpg_v65536.nsp", "size": 129831190, "sha256": "bc945653edda1d3270378a535b03c284fd7cd9ba38cf280384c5197df8ebda73"}
+  },
+  "title": {"program_id": "0100BC0018138000", "target_version": 65536, "unity": "2021.3.15f1", "il2cpp_metadata_version": 29},
+  "extracted": {
+    "base/exefs/main": "34a40469b346ef719213d6d0dd5725314755b23f36d483e39596abc008f0201e",
+    "base/exefs/main.npdm": "8d037995aebb36197e6fb9b55caa9a11394f89a294eebc3654fa8ed5e27a959b",
+    "v101/exefs/main": "7da4288368b14543473092ed5f30fc9fe47aad0d30ccf87894961f6889c78c6e",
+    "v101/exefs/main.npdm": "e4f02b7ad7da41cb495c51d91ec518da301f3b193de2175f135ed4494f173339",
+    "v101/exefs/rtld": "a80d86eb5ae6ddec62c78e06d5ebf45142a7e2f173d0bfd9da224526d1872e47",
+    "v101/exefs/sdk": "adc1ae2f67c278b7501312a0a3a410585c2e33db0fa6b6733672904e6e87c960",
+    "v101/exefs/subsdk0": "aa9dd7e5a20cba0e850e68967e380be58de8e3de19fdd93c5a60486b4e0901f0"
+  },
+  "romfs": {"dir": "v101/romfs", "file_count": 1934, "total_bytes": 6820991879}
+}

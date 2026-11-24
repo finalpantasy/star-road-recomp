@@ -1,0 +1,45 @@
+# Owner dumps and anything derived from the game: never committed
+*.xci
+*.nsp
+*.nca
+*.nso
+*.nro
+*.keys
+*.keys.txt
+prod.keys
+title.keys
+*.tik
+*.cert
+romfs/
+exefs/
+extracted/
+generated/
+dumps/
+global-metadata.dat
+*.bundle
+*.assets
+*.resS
+*.usm
+*.acb
+*.awb
+
+# Credentials and local settings
+.env
+.env.*
+*.pem
+.claude/settings.local.json
+
+# Builds, caches, evidence captures
+build/
+out/
+target/
+.cache/
+__pycache__/
+*.pyc
+evidence/runs/
+evidence/*.png
+evidence/*.mp4
+evidence/*.bin
+.vs/
+.vscode/
+*.log

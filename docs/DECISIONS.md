@@ -1,0 +1,12 @@
+# Decisions
+Record date, decision ID, choice, rationale/evidence, approval/source, and what would reopen it.
+Mark unresolved choices OPEN. Defaults are provisional unless explicitly approved or within delegated technical scope.
+
+| ID | Date | Decision | Rationale / evidence | Source | Reopen if |
+|---|---|---|---|---|---|
+| D-001 | 2026-11-24 | Target build: v65536 update (1.0.1) over base v0. Base kept as diff reference. | Only update in the dump. v1.0.1 `main` differs from base; `sdk`, `rtld`, `subsdk0` identical (hashes in tools/inputs.json). | Lead | A later update is dumped. |
+| D-002 | 2026-11-24 | Two stages: (1) AOT static recompilation ARM64 to x86-64 of the whole program (game, Unity runtime, IL2CPP runtime, SDK) with HLE of Horizon OS and NVN; (2) full decompilation of the game layer onto a native engine, replacing Unity, verified function by function against stage 1. | Game is Unity 2021.3.15f1 IL2CPP: `global-metadata.dat` keeps every C# type, method and field name, so stage 2 is unusually tractable. Stage 1 gives a playable oracle for differential testing. | The owner (request) + lead | Stage 1 proves infeasible for a measured reason. |
+| D-003 | 2026-11-24 | OPEN: decomp and engine language (C, Rust, Odin). | The owner: "I am not sure yet". Lead leans C: recompiler output is C, so functions can be swapped one at a time inside the running game. Decide from the task-6 spike evidence. | the owner | n/a |
+| D-004 | 2026-11-24 | Upgrades from day one: 4K and high-res, high frame rate, quality of life, mods. Ultrawide low priority. Every upgrade has an option and a faithful mode. | The owner's answers. | the owner | The owner changes priority. |
+| D-005 | 2026-11-24 | Repository: local Git plus a public GitHub repo. Provisional lead rule: public repo holds only original code (tools, recompiler, runtime, engine). Publishing decompiled game source is OPEN (takedown risk). Public repo is created only with the owner's yes for the account, name and timing; release policy needs real screenshots in the README. | The owner: "public github and local git". The repo lives under the `finalpantasy` account. | the owner + lead | The owner decides decomp source publication. |
+| D-006 | 2026-11-24 | Third-party tools are used as tools; code is our own (ideas from other recomps, no wholesale reuse). | The owner: "We can take ideas, but I want this to be done right". | the owner | n/a |

@@ -1,0 +1,13 @@
+{
+  "commands": [
+    {
+      "id": "inputs",
+      "argv": ["{python}", "-I", "{root}/tests/test_inputs.py", "--report", "{run_dir}/inputs.json"],
+      "timeout_seconds": 600,
+      "report": "{run_dir}/inputs.json",
+      "format": "json"
+    }
+  ],
+  "extra_inputs": [],
+  "exclude_inputs": ["docs", "backlog", "STATE.md", "Super Mario RPG [0100BC0018138000] [v0].xci", "v-super_mario_rpg_v65536.nsp"]
+}
