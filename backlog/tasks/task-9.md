@@ -1,7 +1,7 @@
 ---
 id: task-9
 title: Prior art for this game (other recomps, ports, mods, emulator notes), ideas only
-status: Ready
+status: Verified
 ---
 ## Problem before solution
 Others may have started a Super Mario RPG (Switch 2023) recompilation, decomp, PC port or mod toolkit. Their findings can save us time. The owner's rule: take ideas, never their code.
@@ -13,8 +13,8 @@ Execution: subchat, Sonnet, medium effort (web research).
 ## Acceptance and evidence
 | ID | Criterion | Scenario/assertion | Required evidence | Result |
 |---|---|---|---|---|
-| AC1 | Each project has a verified link, status and license | Doc review | Doc | NOT_RUN |
-| AC2 | Top ideas mapped to our task cards (task-2 to task-7) | Doc review | Doc | NOT_RUN |
+| AC1 | Each project has a verified link, status and license | Doc review | Doc | PASS (lead spot-checked item 1 via gh API) |
+| AC2 | Top ideas mapped to our task cards (task-2 to task-7) | Doc review | Doc | PASS (section 3) |
 ## Human gates
 None.
 ## Recovery and return condition
