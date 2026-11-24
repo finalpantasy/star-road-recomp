@@ -1,6 +1,8 @@
-# Star Road: Super Mario RPG PC Recompilation
+# Star Road Recomp: Super Mario RPG PC Port
 
-A native Windows PC version of **Super Mario RPG** (Nintendo Switch, 2023, version 1.0.1), built from your own legally dumped copy of the game.
+**Star Road Recomp** is a native Windows PC version of **Super Mario RPG** (Nintendo Switch, 2023 remake, version 1.0.1), built by static recompilation and, later, a full decompilation. It runs from your own legally dumped copy of the game.
+
+Also searched for as: Super Mario RPG PC, SMRPG PC port, Super Mario RPG Switch recompilation, Mario RPG remake native PC, Super Mario RPG decomp.
 
 The plan has two stages:
 
