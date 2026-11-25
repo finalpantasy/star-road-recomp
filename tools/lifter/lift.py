@@ -120,6 +120,8 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
                 sym[f["rt"]] = ("tab", s[1], f["sz"], f["sgn"], f["opt"], f["amt"], f["rm"], f)
             else:
                 sym[f["rt"]] = None
+        elif nm == "log_reg" and f["opc"] == 1 and f["rn"] == 31 and not f["neg"] and f["amt"] == 0 and f["shift"] == 0 and f["sf"] == 1:
+            sym[f["rd"]] = sym.get(f["rm"])      # mov xd, xm keeps the symbolic value (table base parked in a callee-saved reg across a call)
         elif nm in ("addsub_reg", "addsub_ext") and not f["sub"]:
             sa, sb = sym.get(f["rn"]), sym.get(f["rm"])
             sh = f["amt"] if nm == "addsub_reg" else f["amt"]

@@ -117,6 +117,15 @@ static int InfoValue(int w) {
     case NVN_DEVICE_INFO_QUEUE_COMMAND_MEMORY_MIN_SIZE: case NVN_DEVICE_INFO_QUEUE_COMPUTE_MEMORY_MIN_SIZE: return 0x4000;
     case NVN_DEVICE_INFO_QUEUE_COMMAND_MEMORY_DEFAULT_SIZE: case NVN_DEVICE_INFO_QUEUE_COMPUTE_MEMORY_DEFAULT_SIZE: return 0x100000;
     case NVN_DEVICE_INFO_QUEUE_COMMAND_MEMORY_MIN_FLUSH_THRESHOLD: return 0x1000;
+    // Separate texture and sampler bindings (NVN_DEVICE_FLAG_ENABLE_SEPARATE_SAMPLER_TEXTURE_SUPPORT). Unity sizes its per-program binding
+    // tables from these: a 0 leaves them unallocated and the first draw crashes. The counts are what the translated shaders can address:
+    // separate textures sit in c[2] at 0x168 + 8 r (r < 128, 0x168..0x568) and separate samplers at 0x568 + 8 s (s < 32).
+    case NVN_DEVICE_INFO_SEPARATE_TEXTURE_BINDINGS_PER_STAGE: return 128;
+    case NVN_DEVICE_INFO_SEPARATE_SAMPLER_BINDINGS_PER_STAGE: return 32;
+    case NVN_DEVICE_INFO_QUEUE_CONTROL_MEMORY_GRANULARITY: return 0x1000;
+    case NVN_DEVICE_INFO_QUEUE_CONTROL_MEMORY_MIN_SIZE: return 0x1000;
+    case NVN_DEVICE_INFO_QUEUE_CONTROL_MEMORY_DEFAULT_SIZE: return 0x10000;
+    case NVN_DEVICE_INFO_DEBUG_GROUPS_MAX_DOMAIN_ID: return 0;
     case NVN_DEVICE_INFO_MAX_TEXTURES_PER_WINDOW: return 4;
     case NVN_DEVICE_INFO_MIN_TEXTURES_PER_WINDOW: return 2;
     case NVN_DEVICE_INFO_MAX_PATCH_SIZE: return 32;
@@ -161,6 +170,7 @@ NVN_API(nvnQueueFenceSync, void, (void* queue, void* sync, int cond, int flags))
 NVN_API(nvnQueueWaitSync, bool, (void* queue, const void* sync)) {
   (void)queue; const Sync* s = ImplOf<Sync>(sync);
   if (!s || !s->eventId) return true;
+  ApiUnlock free;                                  // other threads keep calling NVN while this one waits
   return WaitTimeline(s->value, UINT64_MAX);      // the GPU queue is one in-order queue, so a host wait is equivalent
 }
 NVN_API(nvnQueuePresentTexture, void, (void* queue, void* window, int index)) {
@@ -176,6 +186,7 @@ NVN_API(nvnSyncWait, int, (const void* sync, uint64_t timeoutNs)) {
   const Sync* s = ImplOf<Sync>(sync);
   if (!s || !s->eventId || s->value == 0) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
   if (TimelineDone() >= s->value) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+  ApiUnlock free;
   return WaitTimeline(s->value, timeoutNs) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 
@@ -222,8 +233,8 @@ NVN_API(nvnWindowGetCrop, void, (const void* window, int32_t* rect)) {
 void LinkAnchorDevice() {}
 
 // ---- program ------------------------------------------------------------------------------------------------------
-NVN_API(nvnProgramInitialize, bool, (void* prog, void* dev)) { (void)dev; ProgramImpl* p = new ProgramImpl; p->id = ++g_programIds; SetHdr(prog, kMagicProgram, p); return true; }
-NVN_API(nvnProgramFinalize, void, (void* prog)) { delete ImplOf<ProgramImpl>(prog); ClearHdr(prog); }
+NVN_API(nvnProgramInitialize, bool, (void* prog, void* dev)) { (void)dev; ProgramImpl* p = new ProgramImpl; p->id = ++g_programIds; SetHdr(prog, kMagicProgram, p); LiveAdd(p); return true; }
+NVN_API(nvnProgramFinalize, void, (void* prog)) { ProgramImpl* p = ImplOf<ProgramImpl>(prog); if (p) { QueueScrub(p); LiveDel(p); delete p; } ClearHdr(prog); }
 NVN_API(nvnProgramSetDebugLabel, void, (void* prog, const char* l)) { (void)prog; (void)l; }
 NVN_API(nvnProgramSetSampleShading, void, (void* prog, int mode)) { (void)prog; (void)mode; LogOnce("sampleshading", "ProgramSetSampleShading is ignored"); }
 NVN_API(nvnProgramSetShaders, bool, (void* prog, int n, const ShaderData* d)) {

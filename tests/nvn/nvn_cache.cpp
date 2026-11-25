@@ -1,4 +1,4 @@
-// Star Road Recomp: NVN shader cache reader test (task-12, Phase A cache reuse-v1). Our own code (D-008).
+// Star Road Recomp: NVN shader cache reader test (task-12, shader cache v1). Our own code (D-008).
 //
 // Reads the translated shader cache (docs/SHADER_CACHE.md section 5) through the same reader the game uses and runs it on the
 // machine's Vulkan device. Hidden, muted, no window and no audio:
@@ -246,7 +246,7 @@ struct Vtx { float x, y, z, u, v; };
 int main(int argc, char** argv) {
   bool wantValidation = true, doSweep = true, sweepOnly = false;
   int nVariants = 600, minGs = 60;
-  std::string outDir = ".", cacheDir = getenv("NVN_CACHE_DIR") ? getenv("NVN_CACHE_DIR") : "A:/AI/Recomps/smrpg-work/shaders/cache/reuse-v1";
+  std::string outDir = ".", cacheDir = getenv("NVN_CACHE_DIR") ? getenv("NVN_CACHE_DIR") : "A:/AI/Recomps/smrpg-work/shaders/cache/v1";
   setvbuf(stdout, nullptr, _IONBF, 0);
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--no-validation")) wantValidation = false;
@@ -546,15 +546,25 @@ int main(int argc, char** argv) {
     std::map<std::string, int> why;
     std::map<int, size_t> readyByStage;
     std::map<std::string, std::vector<uint32_t>> vsOuts, fsIns;       // interface locations, for the pairing check below
+    double tLoad = 0, tCheck = 0, tReady = 0;
+    auto Now = []() { return (double)GetTickCount64() / 1000.0; };
+    double sweepStart = Now();
     for (size_t i = 0; i < okKeys.size(); i++) {
+      if (i && i % 4000 == 0) { double rs, ps; ShaderCacheLoadTimes(&rs, &ps); printf("sweep progress: %zu of %zu stage programs after %.0f s (load %.0f s of which file reads %.0f s and manifest parse %.0f s, device check %.0f s, module and layout %.0f s)\n", i, okKeys.size(), Now() - sweepStart, tLoad, rs, ps, tCheck, tReady); }
+      double t0 = Now();
       StageProgram* sp = ShaderCacheGet(okKeys[i]);
+      tLoad += Now() - t0;
       if (sp->ok && sp->man.stage == NVN_SHADER_STAGE_VERTEX) vsOuts[okKeys[i]] = sp->man.outLocs;
       if (sp->ok && sp->man.stage == NVN_SHADER_STAGE_FRAGMENT) { auto& v = fsIns[okKeys[i]]; for (auto& in : sp->man.inputs) v.push_back(in.location); }
       if (!sp->ok) { notLoaded++; why["load: " + sp->reason.substr(0, 80)]++; ShaderCacheDrop(okKeys[i]); continue; }
+      double t1 = Now();
       if (!ShaderCacheCheckDevice(sp)) { rejectedDev++; why[sp->reason.substr(0, 90)]++; ShaderCacheDrop(okKeys[i]); continue; }
+      double t2 = Now(); tCheck += t2 - t1;
       if (ShaderStageReady(sp)) { ready++; readyByStage[sp->man.stage]++; } else { bad++; why["module/layout creation failed"]++; }
+      tReady += Now() - t2;
       ShaderCacheDrop(okKeys[i]);
     }
+    printf("sweep time: %.1f s (load %.1f s, device check %.1f s, module and layout %.1f s)\n", Now() - sweepStart, tLoad, tCheck, tReady);
     printf("sweep: %zu stage programs: %zu ready (module and set layout built), %zu rejected by the device check, %zu not loaded, %zu module or layout failures\n",
            okKeys.size(), ready, rejectedDev, notLoaded, bad);
     for (auto& kv : readyByStage) printf("  ready %-8s %zu\n", StageName(kv.first), kv.second);

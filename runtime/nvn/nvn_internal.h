@@ -121,6 +121,7 @@ struct Pool {
   uint64_t gen = 1;
   std::string label;
   std::vector<TextureImpl*> textures;   // textures stored in this pool (re-upload on FlushMappedRange)
+  bool dead = false;                  // finalized: the struct is kept (textures and buffers may still point at it) but holds nothing
 };
 
 struct BufImpl {
@@ -129,12 +130,16 @@ struct BufImpl {
   uint64_t debugId = 0;
 };
 
+struct SampPool;
 struct SamplerImpl {
   VkSampler sampler = VK_NULL_HANDLE;
   SamplerBuilderG desc{};
+  std::vector<std::pair<SampPool*, uint32_t>> poolRefs;   // sampler pool slots that point at this sampler (scrubbed when it is finalized)
 };
 
+struct TexPool;
 struct TextureImpl {
+  std::vector<std::pair<TexPool*, uint32_t>> poolRefs;   // texture pool slots that point at this texture (scrubbed when it is finalized)
   VkImage image = VK_NULL_HANDLE;
   MemAlloc mem;
   VkFormat vkFormat = VK_FORMAT_UNDEFINED;
@@ -216,6 +221,7 @@ bool ShaderCacheCheckDevice(StageProgram* sp);
 bool ShaderCacheConstants(StageProgram* sp, VkBuffer* buf, VkDeviceSize* off);
 bool ShaderStageReady(StageProgram* sp);                                  // device check, VkShaderModule and descriptor set layout (tests, warm up)
 void ShaderCacheDrop(const std::string& key);                             // forget a loaded stage and its Vulkan objects (sweeps; no program may use it)
+void ShaderCacheLoadTimes(double* readSec, double* parseSec);               // total time spent reading cache files and parsing manifests (diagnostics)
 size_t ShaderCacheIndexSize();                                         // entries in index.jsonl
 bool ShaderCacheIndexAt(size_t i, std::string* key, int* stage, bool* ok);   // enumerate the index (tests, sweeps)
 const std::string& ShaderCacheRoot();

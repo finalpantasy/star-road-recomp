@@ -65,7 +65,7 @@ def main():
     rc, secs = run(gpu_cmd, gpu_log, test_dir, env)
     results.append(("nvn_gpu (clear, textured quad, RGBA4, depth range, sync, copies, hidden window, validation)", rc, secs, gpu_log))
     if "--no-cache" not in args:
-        # Shader cache reader (docs/SHADER_CACHE.md section 5): hidden and muted, no window, no audio device.
+        # Shader cache v1 reader (docs/SHADER_CACHE.md): hidden and muted, no window, no audio device.
         env["SDL_AUDIODRIVER"] = "dummy"
         env["SDL_AUDIO_DRIVER"] = "dummy"
         pipe_log = os.path.join(REPORTS, "nvn_cache_pipelines.txt")

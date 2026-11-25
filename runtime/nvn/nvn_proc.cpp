@@ -9,6 +9,9 @@
 
 namespace nvn {
 
+std::mutex& ApiMutex() { static std::mutex m; return m; }
+bool& ApiHeld() { static thread_local bool held = false; return held; }
+
 struct RegRec { std::string name; void* fn; void (*thunk)(Ctx*); std::string sig; };
 static std::vector<RegRec>& Regs() { static std::vector<RegRec> r; return r; }
 

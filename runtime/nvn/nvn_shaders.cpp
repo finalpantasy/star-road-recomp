@@ -342,6 +342,9 @@ bool ShaderCacheCheckDevice(StageProgram* sp) {
   return sp->ok;
 }
 
+double g_loadReadSec = 0, g_loadParseSec = 0;
+void ShaderCacheLoadTimes(double* readSec, double* parseSec) { *readSec = g_loadReadSec; *parseSec = g_loadParseSec; }
+
 StageProgram* ShaderCacheGet(const std::string& keyIn) {
   auto al = g_alias.find(keyIn);
   const std::string& key = al != g_alias.end() ? al->second : keyIn;
@@ -374,9 +377,14 @@ StageProgram* ShaderCacheGet(const std::string& keyIn) {
       sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true; loadConsts();
     } else sp->reason = "translation failed: " + ix->second.reason;
   } else {
+    LARGE_INTEGER q0, q1, q2, qf; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     std::string spvb = ReadFile(g_root + "/" + ix->second.spv), mj = ReadFile(g_root + "/" + ix->second.meta);
+    QueryPerformanceCounter(&q1);
     J j;
-    if (spvb.size() >= 20 && ParseJson(mj, j) && ParseManifest(j, sp->man)) {
+    bool parsed = spvb.size() >= 20 && ParseJson(mj, j) && ParseManifest(j, sp->man);
+    QueryPerformanceCounter(&q2);
+    g_loadReadSec += (double)(q1.QuadPart - q0.QuadPart) / qf.QuadPart; g_loadParseSec += (double)(q2.QuadPart - q1.QuadPart) / qf.QuadPart;
+    if (parsed) {
       sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true; loadConsts();
     } else sp->reason = "cache files missing or unreadable";
     sp->man.stage = ix->second.stage;

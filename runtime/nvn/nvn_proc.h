@@ -11,6 +11,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "nvn_core.h"
 #include "nvn_internal.h"
 
 extern "C" {
@@ -53,6 +54,7 @@ template <class T> constexpr char SigLetter() {
 template <class F> struct FnTraits;
 template <class R, class... A> struct FnTraits<R (*)(A...)> {
   template <auto Fn> static void Call(Ctx* c) {
+    ApiGuard guard;                               // one NVN call at a time (see nvn_core.h)
     ArgReader rd{c};
     std::tuple<A...> t{rd.template get<A>()...};     // braced list: evaluated left to right
     if constexpr (std::is_void_v<R>) std::apply(Fn, t);

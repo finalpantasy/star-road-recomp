@@ -36,7 +36,7 @@ struct Scratch {
     }
     if (!got) {
       VkDeviceSize sz = std::max<VkDeviceSize>(size, 4u << 20);
-      if (!CreateBuf(&nb, sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, MemKind::HostVisible)) return false;
+      if (!CreateBuf(&nb, sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, MemKind::HostVisible)) return false;
     }
     used.push_back(nb); cur = used.size() - 1; off = size;
     *b = nb.buf; *o = 0; *ptr = nb.map; return true;
@@ -384,8 +384,12 @@ static bool Topology(uint32_t prim, VkPrimitiveTopology* t) {
     case NVN_DRAW_PRIMITIVE_TRIANGLES_ADJACENCY: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY; return true;
     case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP_ADJACENCY: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY; return true;
     case NVN_DRAW_PRIMITIVE_PATCHES: *t = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST; return true;
+    // no Vulkan equivalent: the draw is turned into an index list of one of these (ExpandPrimitive)
+    case NVN_DRAW_PRIMITIVE_LINE_LOOP: *t = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; return true;
+    case NVN_DRAW_PRIMITIVE_QUADS: case NVN_DRAW_PRIMITIVE_QUAD_STRIP: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; return true;
+    case NVN_DRAW_PRIMITIVE_POLYGON: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; return true;       // convex polygons: a fan
   }
-  return false;   // LINE_LOOP, QUADS, QUAD_STRIP, POLYGON have no Vulkan equivalent
+  return false;
 }
 
 static VkFormat RtFormat(const RtBind& r) {
@@ -651,6 +655,7 @@ static bool BeginRendering(RS& s) {
   if (!s.nColor && !s.depth.tex) { LogOnce("nort", "draw with no render targets bound (skipped)"); return false; }
   VkRenderingAttachmentInfo ca[8]; VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1; bool haveDepth = false, haveStencil = false;
+  for (uint32_t i = 0; i < s.nColor; i++) if (!s.color[i].tex) { LogOnce("rtgone", "draw with a color target that was finalized or is missing (skipped)"); return false; }
   for (uint32_t i = 0; i < s.nColor; i++) {
     TextureG* g = s.color[i].tex; TextureImpl* t = g->impl;
     ToGeneral(s, t); t->gpuWritten = true; t->lastUse = s.value;
@@ -725,9 +730,39 @@ static void PrepareResources(RS& s) {
   }
 }
 
+// Primitives Vulkan lacks (LINE_LOOP, QUADS, QUAD_STRIP) are drawn from an index list built here. `at(i)` gives the i-th source index
+// (the running vertex number for a non-indexed draw). Returns the number of indices written to `out`.
+template <class At> static uint32_t ExpandPrimitive(uint32_t prim, uint32_t n, At at, std::vector<uint32_t>* out) {
+  out->clear();
+  if (prim == NVN_DRAW_PRIMITIVE_QUADS) {
+    for (uint32_t k = 0; k + 3 < n; k += 4) { uint32_t a = at(k), b = at(k + 1), c = at(k + 2), d = at(k + 3); out->insert(out->end(), {a, b, c, a, c, d}); }
+  } else if (prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {        // quad i is vertices 2i, 2i+1, 2i+3, 2i+2
+    for (uint32_t k = 0; k + 3 < n; k += 2) { uint32_t a = at(k), b = at(k + 1), c = at(k + 2), d = at(k + 3); out->insert(out->end(), {a, b, d, a, d, c}); }
+  } else if (prim == NVN_DRAW_PRIMITIVE_LINE_LOOP) {
+    if (n >= 2) { for (uint32_t k = 0; k < n; k++) out->push_back(at(k)); out->push_back(at(0)); }
+  }
+  return (uint32_t)out->size();
+}
+static bool NeedsExpand(uint32_t prim) { return prim == NVN_DRAW_PRIMITIVE_QUADS || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP || prim == NVN_DRAW_PRIMITIVE_LINE_LOOP; }
+
+// Upload an expanded index list to scratch memory and bind it. False when the scratch allocation failed.
+static bool BindExpanded(RS& s, const std::vector<uint32_t>& idx) {
+  VkBuffer b; VkDeviceSize o; void* p;
+  if (!s.scratch->Alloc(idx.size() * 4, 4, &b, &o, &p)) return false;
+  memcpy(p, idx.data(), idx.size() * 4);
+  g_vk.f.vkCmdBindIndexBuffer(s.cb, b, o, VK_INDEX_TYPE_UINT32);
+  return true;
+}
+
 static bool PrepareDraw(RS& s, uint32_t prim, bool* skip) {
   *skip = true;
-  if (!s.prog || !s.prog->complete) { LogOnce("noprog", "draw without a complete program (skipped)"); return false; }
+  if (!s.prog) { g_stats.noProgNull++; LogOnce("noprog", "draw with no program bound (skipped)"); return false; }
+  if (!s.prog->complete) {
+    g_stats.noProgIncomplete++;
+    std::string why; for (StageProgram* sp : s.prog->stages) { if (sp && !sp->ok) why += " " + sp->key.substr(0, 12) + "(" + sp->reason + ")"; }
+    LogOnce(("noprog" + std::to_string(s.prog->id)).c_str(), "draw with an incomplete program %llu (skipped), stages not usable:%s", (unsigned long long)s.prog->id, why.empty() ? " none listed (no vertex stage?)" : why.c_str());
+    return false;
+  }
   for (int st = 0; st < 5; st++) if (s.prog->byStage[st] && !EnsureStage(s.prog->byStage[st])) { return false; }
   EnsureGlobals();
   PrepareResources(s);
@@ -754,6 +789,13 @@ static bool PrepareDraw(RS& s, uint32_t prim, bool* skip) {
 // ---- exec ---------------------------------------------------------------------------------------------------------------
 static void Exec(RS& s, const CmdList& l, int depth);
 
+// A clear rectangle must lie inside the render area; the scissor the game sets is often larger (the hardware clips it to the target).
+static void ClampToArea(VkRect2D& r, VkExtent2D area) {
+  r.offset.x = std::min<int32_t>(r.offset.x, (int32_t)area.width); r.offset.y = std::min<int32_t>(r.offset.y, (int32_t)area.height);
+  r.extent.width = std::min<uint32_t>(r.extent.width, area.width - (uint32_t)r.offset.x);
+  r.extent.height = std::min<uint32_t>(r.extent.height, area.height - (uint32_t)r.offset.y);
+}
+
 static TextureView ViewAt(const uint8_t* p) { TextureView v; memcpy(&v, p, sizeof v); return v; }
 
 static void DoClearColor(RS& s, const Cmd& c) {
@@ -764,6 +806,8 @@ static void DoClearColor(RS& s, const Cmd& c) {
   if ((uint32_t)c.i[1] != 0xF) LogOnce("clrmask", "ClearColor with a partial color mask clears all channels");
   VkClearRect cr{}; cr.rect = {{0, 0}, s.area}; cr.layerCount = s.renderLayers;
   if (s.scSet) { cr.rect.offset = {std::max(0, s.scissor[0]), std::max(0, s.scissor[1])}; cr.rect.extent = {(uint32_t)std::max(0, s.scissor[2]), (uint32_t)std::max(0, s.scissor[3])}; }
+  ClampToArea(cr.rect, s.area);
+  if (!cr.rect.extent.width || !cr.rect.extent.height) return;
   g_vk.f.vkCmdClearAttachments(s.cb, 1, &ca, 1, &cr); g_stats.clears++;
 }
 
@@ -777,6 +821,8 @@ static void DoClearDepth(RS& s, const Cmd& c) {
   VkClearAttachment ca{}; ca.aspectMask = a; ca.clearValue.depthStencil = {c.f[0], (uint32_t)c.i[1]};
   VkClearRect cr{}; cr.rect = {{0, 0}, s.area}; cr.layerCount = s.renderLayers;
   if (s.scSet) { cr.rect.offset = {std::max(0, s.scissor[0]), std::max(0, s.scissor[1])}; cr.rect.extent = {(uint32_t)std::max(0, s.scissor[2]), (uint32_t)std::max(0, s.scissor[3])}; }
+  ClampToArea(cr.rect, s.area);
+  if (!cr.rect.extent.width || !cr.rect.extent.height) return;
   g_vk.f.vkCmdClearAttachments(s.cb, 1, &ca, 1, &cr); g_stats.clears++;
 }
 
@@ -851,24 +897,26 @@ static void Exec(RS& s, const CmdList& l, int depth) {
       case Op::BindVertexAttrib: if (c.i[1]) for (auto& b : s.attrSet) b = false;
         if (c.i[0] >= 0 && c.i[0] < 16) { memcpy(&s.attr[c.i[0]], c.st, sizeof(VertexAttribG)); s.attrSet[c.i[0]] = true; } break;
       case Op::BindVertexStream: if (c.i[0] >= 0 && c.i[0] < 16) memcpy(&s.stream[c.i[0]], c.st, sizeof(VertexStreamG)); break;
-      case Op::BindProgram: s.prog = (ProgramImpl*)c.p[0]; s.progStages = (uint32_t)c.i[0]; break;
+      case Op::BindProgram: s.prog = IsLive((void*)c.p[0]) ? (ProgramImpl*)c.p[0] : nullptr; s.progStages = (uint32_t)c.i[0]; break;
       case Op::BindVertexBuffer: if (c.i[0] >= 0 && c.i[0] < 16) s.vb[c.i[0]] = {(uint64_t)c.l[0], (uint64_t)c.l[1]}; break;
       case Op::BindVertexBuffers: for (int k = 0; k < c.i[1]; k++) if (c.i[0] + k < 16) memcpy(&s.vb[c.i[0] + k], c.blob.data() + 16 * k, 16); break;
       case Op::BindUniform: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 16) s.ub[c.i[0]][c.i[1]] = {(uint64_t)c.l[0], (uint64_t)c.l[1]}; break;
       case Op::BindUniforms: for (int k = 0; k < c.i[2]; k++) if (c.i[0] < 6 && c.i[1] + k < 16) memcpy(&s.ub[c.i[0]][c.i[1] + k], c.blob.data() + 16 * k, 16); break;
       case Op::BindStorage: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 16) s.sb[c.i[0]][c.i[1]] = {(uint64_t)c.l[0], (uint64_t)c.l[1]}; break;
-      case Op::BindSepTexture: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 64) s.c2[c.i[0]][(c.i[2] + 8 * c.i[1]) / 4] = (uint32_t)c.l[0]; break;
-      case Op::BindSepSampler: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 64) s.c2[c.i[0]][(0x568 + 8 * c.i[1]) / 4] = (uint32_t)c.l[0]; break;
+      case Op::BindSepTexture: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 128) s.c2[c.i[0]][(c.i[2] + 8 * c.i[1]) / 4] = (uint32_t)c.l[0]; break;
+      case Op::BindSepSampler: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 128) s.c2[c.i[0]][(0x568 + 8 * c.i[1]) / 4] = (uint32_t)c.l[0]; break;
       case Op::BindImage: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 32) s.img[c.i[0]][c.i[1]] = (uint64_t)c.l[0]; break;
       case Op::SetRenderTargets: {
         uint32_t n = std::min(8, c.i[0]); s.nColor = n;
         const uint8_t* b = c.blob.data();
         for (uint32_t i = 0; i < 8; i++) {
           TextureG* t = nullptr; memcpy(&t, b + 8 * i, 8);
+          if (t && !(t->magic == kMagicTexture && t->impl)) t = nullptr;        // finalized since it was recorded
           s.color[i].tex = i < n ? t : nullptr;
           s.color[i].view = ViewAt(b + 64 + 16 * i);
         }
         memcpy(&s.depth.tex, b + 64 + 128, 8); s.depth.view = ViewAt(b + 64 + 128 + 8);
+        if (s.depth.tex && !(s.depth.tex->magic == kMagicTexture && s.depth.tex->impl)) s.depth.tex = nullptr;
         s.rtDirty = true; s.pipeDirty = true; EndRendering(s); break;
       }
       case Op::SetViewport: memcpy(s.viewport, c.i, 16); s.vpSet = true; break;
@@ -886,15 +934,29 @@ static void Exec(RS& s, const CmdList& l, int depth) {
       case Op::SetStencilRef: if (c.i[0] & 1) s.stRef[0] = (uint32_t)c.i[1]; if (c.i[0] & 2) s.stRef[1] = (uint32_t)c.i[1]; break;
       case Op::SetStencilMask: if (c.i[0] & 1) s.stWrite[0] = (uint32_t)c.i[1]; if (c.i[0] & 2) s.stWrite[1] = (uint32_t)c.i[1]; break;
       case Op::SetStencilValueMask: if (c.i[0] & 1) s.stMask[0] = (uint32_t)c.i[1]; if (c.i[0] & 2) s.stMask[1] = (uint32_t)c.i[1]; break;
-      case Op::SetTexturePool: s.texPool = (TexPool*)c.p[0]; break;
-      case Op::SetSamplerPool: s.sampPool = (SampPool*)c.p[0]; break;
+      case Op::SetTexturePool: s.texPool = IsLive((void*)c.p[0]) ? (TexPool*)c.p[0] : nullptr; break;      // a pool finalized since the command was recorded is gone
+      case Op::SetSamplerPool: s.sampPool = IsLive((void*)c.p[0]) ? (SampPool*)c.p[0] : nullptr; break;
       case Op::Draw: case Op::DrawInstanced: {
         bool skip; if (!PrepareDraw(s, (uint32_t)c.i[0], &skip)) { g_stats.skippedDraws++; break; }
+        if (NeedsExpand((uint32_t)c.i[0])) {
+          std::vector<uint32_t> idx; uint32_t first = (uint32_t)c.i[1];
+          if (!ExpandPrimitive((uint32_t)c.i[0], (uint32_t)c.i[2], [&](uint32_t k) { return first + k; }, &idx) || !BindExpanded(s, idx)) { g_stats.skippedDraws++; break; }
+          F.vkCmdDrawIndexed(s.cb, (uint32_t)idx.size(), c.op == Op::Draw ? 1u : (uint32_t)c.i[4], 0, 0, c.op == Op::Draw ? 0u : (uint32_t)c.i[3]); g_stats.draws++; break;
+        }
         F.vkCmdDraw(s.cb, (uint32_t)c.i[2], c.op == Op::Draw ? 1u : (uint32_t)c.i[4], (uint32_t)c.i[1], c.op == Op::Draw ? 0u : (uint32_t)c.i[3]); g_stats.draws++; break;
       }
       case Op::DrawElements: case Op::DrawElementsInstanced: {
         bool skip; if (!PrepareDraw(s, (uint32_t)c.i[0], &skip)) { g_stats.skippedDraws++; break; }
         VkBuffer ib; uint64_t io;
+        if (NeedsExpand((uint32_t)c.i[0])) {
+          uint32_t isz = c.i[1] == NVN_INDEX_TYPE_UNSIGNED_INT ? 4u : c.i[1] == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2u : 1u, n = (uint32_t)c.i[2];
+          const uint8_t* src = HostPtr((uint64_t)c.l[0], (uint64_t)n * isz);
+          if (!src) { LogOnce("badidx2", "DrawElements of QUADS/QUAD_STRIP/LINE_LOOP needs its index data in a memory pool (skipped)"); g_stats.skippedDraws++; break; }
+          auto at = [&](uint32_t k) -> uint32_t { return isz == 4 ? ((const uint32_t*)src)[k] : isz == 2 ? ((const uint16_t*)src)[k] : src[k]; };
+          std::vector<uint32_t> idx;
+          if (!ExpandPrimitive((uint32_t)c.i[0], n, at, &idx) || !BindExpanded(s, idx)) { g_stats.skippedDraws++; break; }
+          F.vkCmdDrawIndexed(s.cb, (uint32_t)idx.size(), c.op == Op::DrawElements ? 1u : (uint32_t)c.i[5], 0, c.i[3], c.op == Op::DrawElements ? 0u : (uint32_t)c.i[4]); g_stats.draws++; break;
+        }
         if (!ResolveBuffer((uint64_t)c.l[0], 1, &ib, &io)) { LogOnce("badidx", "DrawElements index address unresolved (skipped)"); g_stats.skippedDraws++; break; }
         VkIndexType it = c.i[1] == NVN_INDEX_TYPE_UNSIGNED_INT ? VK_INDEX_TYPE_UINT32 : c.i[1] == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT8;
         if (it == VK_INDEX_TYPE_UINT8 && !g_vk.hasIdx8) { LogOnce("idx8", "8-bit indices need VK_EXT_index_type_uint8"); g_stats.skippedDraws++; break; }
@@ -959,13 +1021,30 @@ static void Exec(RS& s, const CmdList& l, int depth) {
 }
 
 // ---- queue / submit ---------------------------------------------------------------------------------------------------
+static std::vector<QueueImpl*> g_queues;       // live queues (guarded by the API lock): QueueScrub walks them
+
+// A pool, program or texture is being finalized: forget it in every queue's saved GPU state.
+void QueueScrub(const void* o) {
+  for (QueueImpl* q : g_queues) {
+    RS* h = q->hw; if (!h) continue;
+    if ((void*)h->texPool == o) h->texPool = nullptr;
+    if ((void*)h->sampPool == o) h->sampPool = nullptr;
+    if ((void*)h->prog == o) h->prog = nullptr;
+    for (uint32_t i = 0; i < 8; i++) if (h->color[i].tex && (void*)h->color[i].tex->impl == o) { h->color[i].tex = nullptr; h->rtDirty = true; }
+    if (h->depth.tex && (void*)h->depth.tex->impl == o) { h->depth.tex = nullptr; h->rtDirty = true; }
+  }
+}
+
 bool QueueCreate(QueueImpl* q) {
+  g_queues.push_back(q);
   VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT; pi.queueFamilyIndex = g_vk.family;
   return g_vk.f.vkCreateCommandPool(g_vk.dev, &pi, nullptr, &q->pool) == VK_SUCCESS;
 }
 void QueueDestroy(QueueImpl* q) {
   QueueFinish(q);
+  g_queues.erase(std::remove(g_queues.begin(), g_queues.end(), q), g_queues.end());
+  delete q->hw; q->hw = nullptr;
   if (q->pool) g_vk.f.vkDestroyCommandPool(g_vk.dev, q->pool, nullptr);
   q->pool = VK_NULL_HANDLE;
 }
@@ -990,17 +1069,19 @@ void QueueSubmit(QueueImpl* q, uint32_t n, const uint64_t* handles) {
   auto sc = std::make_shared<Scratch>(); auto dp = std::make_shared<DescPools>();
   auto keep = std::make_shared<std::vector<std::shared_ptr<CmdList>>>();
   uint64_t value = NextTimeline();
+  if (!q->hw) q->hw = new RS;
+  RS& s = *q->hw;                       // GPU state carries over from the previous command buffer, as on the hardware
+  s.cb = cb; s.value = value; s.scratch = sc.get(); s.dpools = dp.get(); s.keep = keep.get(); s.q = q; s.dev = q->dev;
+  if (q->dev) { s.depthMode = q->dev->depthMode; s.originMode = q->dev->originMode; }
+  s.rendering = false; s.rtDirty = true; s.pipeDirty = true; s.curPipe = VK_NULL_HANDLE;    // the Vulkan side starts empty in every submission
   for (uint32_t i = 0; i < n; i++) {
     auto l = FindList(handles[i]);
     if (!l) { LogOnce("badh", "SubmitCommands with an unknown command handle 0x%llx", (unsigned long long)handles[i]); continue; }
     keep->push_back(l);
-    RS s; s.cb = cb; s.value = value; s.scratch = sc.get(); s.dpools = dp.get(); s.keep = keep.get(); s.q = q; s.dev = q->dev;
-    if (q->dev) { s.depthMode = q->dev->depthMode; s.originMode = q->dev->originMode; }
-    s.texPool = q->texPool; s.sampPool = q->sampPool;       // Unity binds the pools once and draws from later command buffers
     Exec(s, *l, 0);
-    q->texPool = s.texPool; q->sampPool = s.sampPool;
-    EndRendering(s);
   }
+  EndRendering(s);
+  s.cb = VK_NULL_HANDLE; s.scratch = nullptr; s.dpools = nullptr; s.keep = nullptr; s.rendering = false; s.rtDirty = true; s.pipeDirty = true;
   F.vkEndCommandBuffer(cb);
   VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}; cbi.commandBuffer = cb;
   VkSemaphoreSubmitInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}; sig.semaphore = g_vk.timeline; sig.value = value; sig.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -1087,6 +1168,7 @@ static bool EnsureSwapchain(WindowImpl* w, VkFormat want, uint32_t width, uint32
 
 void QueuePresent(QueueImpl* q, WindowImpl* w, uint32_t idx) {
   w->presents++;
+  if (w->presents % 120 == 0) Log("stats: %llu presents, %llu draws, %llu skipped (%llu no program, %llu incomplete program), %llu pipelines (%llu failed), %llu submits", (unsigned long long)w->presents, (unsigned long long)g_stats.draws, (unsigned long long)g_stats.skippedDraws, (unsigned long long)g_stats.noProgNull, (unsigned long long)g_stats.noProgIncomplete, (unsigned long long)g_stats.pipelines, (unsigned long long)g_stats.pipelineFails, (unsigned long long)g_stats.submits);
   if (!w->useSwapchain || idx >= w->textures.size() || !w->textures[idx] || !w->textures[idx]->impl) return;
   std::lock_guard<std::recursive_mutex> lk(g_vk.lock);
   auto& F = g_vk.f;

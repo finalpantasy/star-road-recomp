@@ -13,8 +13,9 @@ static_assert(sizeof(TextureBuilderG) <= kSizeTextureBuilder, "texture builder s
 static_assert(sizeof(ObjHdr) <= kSizeTexturePool && sizeof(ObjHdr) <= kSizeSamplerPool && sizeof(ObjHdr) <= kSizeBuffer, "object header fits");
 
 static void DirtyRange(Pool* p, uint64_t off, uint64_t size) {
-  if (!p) return;
+  if (!p || p->dead) return;
   for (TextureImpl* t : p->textures) {
+    if (!t) continue;
     uint64_t a = t->poolOffset, b = a + std::max<uint64_t>(t->storageSize, 1);
     if (off < b && off + size > a) t->uploaded = false;       // the guest rewrote texel memory: upload again at the next sample
   }
@@ -37,9 +38,10 @@ NVN_API(nvnMemoryPoolInitialize, bool, (void* pool, const MemPoolBuilderG* b)) {
   SetHdr(pool, kMagicPool, p);
   return true;
 }
-NVN_API(nvnMemoryPoolFinalize, void, (void* pool)) { Pool* p = ImplOf<Pool>(pool); if (!p) return; PoolDestroy(p); delete p; ClearHdr(pool); }
+// The Pool struct is kept (empty, `dead`): textures and buffers the game finalizes later still point at it.
+NVN_API(nvnMemoryPoolFinalize, void, (void* pool)) { Pool* p = ImplOf<Pool>(pool); if (!p) return; PoolDestroy(p); ClearHdr(pool); }
 NVN_API(nvnMemoryPoolSetDebugLabel, void, (void* pool, const char* l)) { if (Pool* p = ImplOf<Pool>(pool)) p->label = l ? l : ""; }
-NVN_API(nvnMemoryPoolMap, void*, (const void* pool)) { const Pool* p = ImplOf<Pool>(pool); return p ? p->memory : nullptr; }
+NVN_API(nvnMemoryPoolMap, void*, (const void* pool)) { const Pool* p = ImplOf<Pool>(pool); return p && !p->dead ? p->memory : nullptr; }
 NVN_API(nvnMemoryPoolFlushMappedRange, void, (const void* pool, int64_t off, size_t size)) { DirtyRange(ImplOf<Pool>(pool), (uint64_t)off, size); }
 NVN_API(nvnMemoryPoolInvalidateMappedRange, void, (const void* pool, int64_t off, size_t size)) { (void)pool; (void)off; (void)size; }   // host memory is imported: always coherent
 NVN_API(nvnMemoryPoolGetBufferAddress, uint64_t, (const void* pool)) { const Pool* p = ImplOf<Pool>(pool); return p ? p->va : 0; }
@@ -57,7 +59,7 @@ NVN_API(nvnBufferBuilderGetSize, int64_t, (const BufferBuilderG* b)) { return (i
 
 NVN_API(nvnBufferInitialize, bool, (void* buffer, const BufferBuilderG* b)) {
   Pool* p = ImplOf<Pool>(b->pool);
-  if (!p) { Err("BufferInitialize: builder has no memory pool"); return false; }
+  if (!p || p->dead) { Err("BufferInitialize: builder has no live memory pool"); return false; }
   if (b->offset + b->size > p->size) { Err("BufferInitialize: range 0x%llx+0x%llx is outside the pool (size 0x%llx)", (unsigned long long)b->offset, (unsigned long long)b->size, (unsigned long long)p->size); return false; }
   BufImpl* i = new BufImpl; i->pool = p; i->guestPool = b->pool; i->offset = b->offset; i->size = b->size;
   SetHdr(buffer, kMagicBuffer, i);
@@ -65,7 +67,7 @@ NVN_API(nvnBufferInitialize, bool, (void* buffer, const BufferBuilderG* b)) {
 }
 NVN_API(nvnBufferFinalize, void, (void* buffer)) { delete ImplOf<BufImpl>(buffer); ClearHdr(buffer); }
 NVN_API(nvnBufferSetDebugLabel, void, (void* buffer, const char* l)) { (void)buffer; (void)l; }
-NVN_API(nvnBufferMap, void*, (const void* buffer)) { const BufImpl* i = ImplOf<BufImpl>(buffer); return i && i->pool ? i->pool->memory + i->offset : nullptr; }
+NVN_API(nvnBufferMap, void*, (const void* buffer)) { const BufImpl* i = ImplOf<BufImpl>(buffer); return i && i->pool && !i->pool->dead && i->pool->memory ? i->pool->memory + i->offset : nullptr; }
 NVN_API(nvnBufferGetAddress, uint64_t, (const void* buffer)) { const BufImpl* i = ImplOf<BufImpl>(buffer); return i && i->pool ? i->pool->va + i->offset : 0; }
 NVN_API(nvnBufferGetSize, int64_t, (const void* buffer)) { const BufImpl* i = ImplOf<BufImpl>(buffer); return i ? (int64_t)i->size : 0; }
 NVN_API(nvnBufferGetMemoryOffset, int64_t, (const void* buffer)) { const BufImpl* i = ImplOf<BufImpl>(buffer); return i ? (int64_t)i->offset : 0; }
@@ -159,7 +161,7 @@ NVN_API(nvnTextureBuilderGetSwizzle, void, (const TextureBuilderG* b, int* r, in
 NVN_API(nvnTextureInitialize, bool, (void* tex, const TextureBuilderG* b)) {
   TextureG* g = (TextureG*)tex;
   Pool* p = ImplOf<Pool>(b->pool);
-  if (!p) { Err("TextureInitialize: builder has no memory pool"); return false; }
+  if (!p || p->dead) { Err("TextureInitialize: builder has no live memory pool"); return false; }
   memset(g, 0, kSizeTexture);
   g->magic = kMagicTexture; g->target = b->target; g->format = b->format; g->width = b->width; g->height = b->height; g->depth = b->depth;
   g->levels = std::max(1u, b->levels); g->samples = b->samples; g->flags = b->flags; g->dsMode = b->dsMode;
@@ -178,6 +180,9 @@ NVN_API(nvnTextureFinalize, void, (void* tex)) {
   if (!g || !g->impl) return;
   TextureImpl* t = g->impl;
   if (t->pool) { auto& v = t->pool->textures; v.erase(std::remove(v.begin(), v.end(), t), v.end()); }
+  // Texture pool slots that still name it must not keep the pointer: the game frees the texture while the slot stays in the pool.
+  for (auto& r : t->poolRefs) if (IsLive(r.first) && r.second < r.first->ents.size() && r.first->ents[r.second].tex == t) r.first->ents[r.second] = TexPool::Ent{};
+  QueueScrub(t);
   TextureDestroy(t);
   g->impl = nullptr; g->magic = 0;
   // The impl struct is released with the deferred destroy of its Vulkan objects (it keeps no references afterwards).
@@ -309,7 +314,11 @@ NVN_API(nvnSamplerInitialize, bool, (void* samp, const SamplerBuilderG* b)) {
   SetHdr(samp, kMagicSampler, s);
   return true;
 }
-NVN_API(nvnSamplerFinalize, void, (void* samp)) { SamplerImpl* s = ImplOf<SamplerImpl>(samp); if (!s) return; SamplerDestroy(s); delete s; ClearHdr(samp); }
+NVN_API(nvnSamplerFinalize, void, (void* samp)) {
+  SamplerImpl* s = ImplOf<SamplerImpl>(samp); if (!s) return;
+  for (auto& r : s->poolRefs) if (IsLive(r.first) && r.second < r.first->ents.size() && r.first->ents[r.second] == s) r.first->ents[r.second] = nullptr;
+  SamplerDestroy(s); delete s; ClearHdr(samp);
+}
 NVN_API(nvnSamplerSetDebugLabel, void, (void* samp, const char* l)) { (void)samp; (void)l; }
 NVN_API(nvnSamplerGetDebugID, uint64_t, (const void* samp)) { return (uint64_t)(uintptr_t)ImplOf<SamplerImpl>(samp); }
 NVN_API(nvnSamplerCompare, bool, (const void* a, const void* b)) { return ImplOf<SamplerImpl>(a) == ImplOf<SamplerImpl>(b); }
@@ -330,10 +339,18 @@ static std::unordered_map<const void*, PoolBacking>& Backings() { static std::un
 
 NVN_API(nvnTexturePoolInitialize, bool, (void* pool, void* memPool, int64_t off, int n)) {
   TexPool* p = new TexPool; p->size = (uint32_t)std::max(0, n); p->ents.resize(p->size);
-  SetHdr(pool, kMagicTexPool, p); Backings()[pool] = {memPool, off};
+  SetHdr(pool, kMagicTexPool, p); Backings()[pool] = {memPool, off}; LiveAdd(p);
   return true;
 }
-NVN_API(nvnTexturePoolFinalize, void, (void* pool)) { delete ImplOf<TexPool>(pool); Backings().erase(pool); ClearHdr(pool); }
+NVN_API(nvnTexturePoolFinalize, void, (void* pool)) {
+  TexPool* p = ImplOf<TexPool>(pool);
+  if (p) {
+    for (size_t i = 0; i < p->ents.size(); i++)           // textures forget this pool's slots
+      if (TextureImpl* t = p->ents[i].tex) t->poolRefs.erase(std::remove_if(t->poolRefs.begin(), t->poolRefs.end(), [&](const std::pair<TexPool*, uint32_t>& r) { return r.first == p; }), t->poolRefs.end());
+    QueueScrub(p); LiveDel(p); delete p;
+  }
+  Backings().erase(pool); ClearHdr(pool);
+}
 NVN_API(nvnTexturePoolSetDebugLabel, void, (void* pool, const char* l)) { (void)pool; (void)l; }
 NVN_API(nvnTexturePoolGetSize, int, (const void* pool)) { const TexPool* p = ImplOf<TexPool>(pool); return p ? (int)p->size : 0; }
 NVN_API(nvnTexturePoolGetMemoryPool, void*, (const void* pool)) { auto it = Backings().find(pool); return it == Backings().end() ? nullptr : it->second.guestPool; }
@@ -344,9 +361,13 @@ static void RegisterTex(void* pool, int id, void* tex, const TextureView* v, boo
   if (!p || id < 0) return;
   if ((uint32_t)id >= p->ents.size()) { LogOnce("texpoolgrow", "texture pool id %d beyond its size %u: growing", id, p->size); p->ents.resize((size_t)id + 1); }
   TexPool::Ent e;
-  e.texG = (TextureG*)tex; e.tex = e.texG ? e.texG->impl : nullptr; e.isImage = image;
+  e.texG = (TextureG*)tex; e.tex = e.texG && e.texG->magic == kMagicTexture ? e.texG->impl : nullptr; e.isImage = image;
+  if (!e.tex) e.texG = nullptr;
   if (v) { e.view = *v; e.hasView = v->flags != 0; }
+  if (TextureImpl* old = p->ents[(size_t)id].tex)         // the slot's previous texture no longer points here
+    old->poolRefs.erase(std::remove_if(old->poolRefs.begin(), old->poolRefs.end(), [&](const std::pair<TexPool*, uint32_t>& r) { return r.first == p && r.second == (uint32_t)id; }), old->poolRefs.end());
   p->ents[(size_t)id] = e;
+  if (e.tex) e.tex->poolRefs.push_back({p, (uint32_t)id});
 }
 NVN_API(nvnTexturePoolRegisterTexture, void, (void* pool, int id, void* tex, const TextureView* v)) { RegisterTex(pool, id, tex, v, false); }
 NVN_API(nvnTexturePoolRegisterImage, void, (void* pool, int id, void* tex, const TextureView* v)) { RegisterTex(pool, id, tex, v, true); }
@@ -354,12 +375,16 @@ NVN_API(nvnTexturePoolRegisterImage, void, (void* pool, int id, void* tex, const
 // ---- sampler pool --------------------------------------------------------------------------------------------------------------
 NVN_API(nvnSamplerPoolInitialize, bool, (void* pool, void* memPool, int64_t off, int n)) {
   SampPool* p = new SampPool; p->size = (uint32_t)std::max(0, n); p->ents.assign(p->size, nullptr); p->owned.assign(p->size, nullptr);
-  SetHdr(pool, kMagicSampPool, p); Backings()[pool] = {memPool, off};
+  SetHdr(pool, kMagicSampPool, p); Backings()[pool] = {memPool, off}; LiveAdd(p);
   return true;
 }
 NVN_API(nvnSamplerPoolFinalize, void, (void* pool)) {
   SampPool* p = ImplOf<SampPool>(pool);
-  if (p) for (SamplerImpl* s : p->owned) if (s) { SamplerDestroy(s); delete s; }
+  if (p) {
+    for (SamplerImpl* s : p->ents) if (s) s->poolRefs.erase(std::remove_if(s->poolRefs.begin(), s->poolRefs.end(), [&](const std::pair<SampPool*, uint32_t>& r) { return r.first == p; }), s->poolRefs.end());
+    for (SamplerImpl* s : p->owned) if (s) { SamplerDestroy(s); delete s; }
+    QueueScrub(p); LiveDel(p);
+  }
   delete p; Backings().erase(pool); ClearHdr(pool);
 }
 NVN_API(nvnSamplerPoolSetDebugLabel, void, (void* pool, const char* l)) { (void)pool; (void)l; }
@@ -374,7 +399,10 @@ NVN_API(nvnSamplerPoolRegisterSampler, void, (void* pool, int id, const void* sa
   SampPool* p = ImplOf<SampPool>(pool);
   if (!p || id < 0) return;
   GrowSamp(p, id);
-  p->ents[(size_t)id] = ImplOf<SamplerImpl>(samp);
+  SamplerImpl* ns = ImplOf<SamplerImpl>(samp);
+  if (SamplerImpl* old = p->ents[(size_t)id]) old->poolRefs.erase(std::remove_if(old->poolRefs.begin(), old->poolRefs.end(), [&](const std::pair<SampPool*, uint32_t>& r) { return r.first == p && r.second == (uint32_t)id; }), old->poolRefs.end());
+  p->ents[(size_t)id] = ns;
+  if (ns) ns->poolRefs.push_back({p, (uint32_t)id});
 }
 NVN_API(nvnSamplerPoolRegisterSamplerBuilder, void, (void* pool, int id, const SamplerBuilderG* b)) {
   SampPool* p = ImplOf<SampPool>(pool);
@@ -383,6 +411,7 @@ NVN_API(nvnSamplerPoolRegisterSamplerBuilder, void, (void* pool, int id, const S
   SamplerImpl* s = new SamplerImpl; s->desc = *b;
   if (!SamplerCreate(s)) { delete s; return; }
   if (SamplerImpl* old = p->owned[(size_t)id]) { SamplerDestroy(old); delete old; }
+  else if (SamplerImpl* prev = p->ents[(size_t)id]) prev->poolRefs.erase(std::remove_if(prev->poolRefs.begin(), prev->poolRefs.end(), [&](const std::pair<SampPool*, uint32_t>& r) { return r.first == p && r.second == (uint32_t)id; }), prev->poolRefs.end());
   p->owned[(size_t)id] = s; p->ents[(size_t)id] = s;
 }
 

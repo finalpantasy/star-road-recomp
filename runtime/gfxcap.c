@@ -26,16 +26,6 @@ static int g_nframes;
 static unsigned g_every;
 
 
-static HleFn g_orig_gi;
-/* NVN_DEVICE_INFO_SEPARATE_TEXTURE_BINDINGS_PER_STAGE (0x5E): nvn_api_device.cpp InfoValue does not know it and answers 0, and a zero limit
- * leaves the game's per-program binding tables unallocated (host crash at the first draw, root cause found in task-13). Until task-12
- * handles it, answer 128 here. SMRPG_DEVINFO_5E=n overrides, 0 disables this shim. */
-static int g_devinfo_5e = 128;
-static void gi_hook(Ctx *c) {
-    uint32_t info = (uint32_t)c->x[1]; uint64_t out = c->x[2];
-    g_orig_gi(c);
-    if (info == 0x5E && out && g_devinfo_5e) *(int32_t *)(uintptr_t)out = g_devinfo_5e;
-}
 static int want(unsigned n) {
     for (int i = 0; i < g_nframes; i++) if (g_frames[i] == n) return 1;
     return g_every && n % g_every == 0;
@@ -61,12 +51,6 @@ void gfxcap_init(void) {
     const char *root = getenv("SMRPG_SHADER_CACHE");
     if (!root || !*root) root = "A:/AI/Recomps/smrpg-work/shaders/cache/v1";
     if (strcmp(root, "off") != 0) rt_log("shader cache %s: %s", root, nvn_host_cache_load(root) ? "loaded" : "NOT LOADED");
-    const char *di = getenv("SMRPG_DEVINFO_5E");
-    if (di && *di) g_devinfo_5e = atoi(di);
-    if (g_devinfo_5e) {
-        HleSlot *gs = hle_slot("nvnDeviceGetInteger", SLOT_HLE, NULL, 0);
-        g_orig_gi = gs->fn; gs->fn = gi_hook;
-    }
     g_capdir = getenv("SMRPG_CAPTURE_DIR");
     if (g_capdir && !*g_capdir) g_capdir = NULL;
     if (!g_capdir) return;

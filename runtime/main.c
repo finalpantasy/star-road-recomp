@@ -89,10 +89,70 @@ static DWORD WINAPI boot_thread(LPVOID unused) {
     return 0;
 }
 
+/* SMRPG_PROF=<ms>: sampling profiler (debug aid). Every <ms> each running guest thread is suspended and its host RIP recorded (image offset, resolve with
+ * llvm-symbolizer on smrpg.exe) together with its last guest call-out lr. Group 0 is the guest main thread, 1 every other thread. A RIP outside the image
+ * (ntdll waits and the like) is counted as "outside". The table is dumped by prof_dump at exit and at the watchdog. */
+#define PROF_CAP 8192
+typedef struct { uint64_t key; uint32_t n; } ProfEnt;
+static ProfEnt g_prof_rip[2][PROF_CAP], g_prof_lr[2][PROF_CAP];
+static uint64_t g_prof_out[2], g_prof_samples;
+static volatile LONG g_prof_on;
+static HANDLE g_boot_host;   /* the guest main thread has no RtThread host handle; this is its host thread */
+static void prof_add(ProfEnt *t, uint64_t key) {
+    uint32_t h = (uint32_t)((key >> 2) * 2654435761u) & (PROF_CAP - 1);
+    for (int i = 0; i < PROF_CAP; i++, h = (h + 1) & (PROF_CAP - 1)) {
+        if (t[h].key == key) { t[h].n++; return; }
+        if (!t[h].key) { t[h].key = key; t[h].n = 1; return; }
+    }
+}
+static DWORD WINAPI prof_main(LPVOID p) {
+    DWORD ms = (DWORD)(uintptr_t)p;
+    uint64_t base = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    for (;;) {
+        Sleep(ms);
+        RtThread *th[64];
+        int n = svc_thread_registry(th, 64);
+        for (int i = 0; i < n; i++) {
+            int g = strcmp(th[i]->name, "main") == 0 ? 0 : 1;
+            HANDLE hh = g == 0 && !th[i]->host ? g_boot_host : th[i]->host;
+            if (!hh || th[i]->exited || hh == GetCurrentThread() || (g && g_prof_samples % 10)) continue;   /* the other threads are sampled every 10th round */
+            if (SuspendThread(hh) == (DWORD)-1) continue;
+            CONTEXT cx; memset(&cx, 0, sizeof cx); cx.ContextFlags = CONTEXT_CONTROL;
+            uint64_t rip = GetThreadContext(hh, &cx) ? cx.Rip : 0, lr = th[i]->ctx ? th[i]->ctx->x[30] : 0;
+            ResumeThread(hh);
+            if (!rip) continue;
+            if (rip >= base && rip < base + 0x20000000ull) { prof_add(g_prof_rip[g], rip - base); prof_add(g_prof_lr[g], lr); }
+            else g_prof_out[g]++;
+        }
+        g_prof_samples++;
+        g_prof_on = 1;
+    }
+}
+static int prof_cmp(const void *a, const void *b) { return (int)((const ProfEnt *)b)->n - (int)((const ProfEnt *)a)->n; }
+void prof_dump(void) {
+    static volatile LONG once;
+    if (!g_prof_on || InterlockedExchange(&once, 1)) return;
+    rt_log("PROF: %llu sample rounds", (unsigned long long)g_prof_samples);
+    static const char *gn[2] = {"main thread", "other threads"};
+    for (int g = 0; g < 2; g++) {
+        for (int k = 0; k < 2; k++) {
+            ProfEnt *t = k ? g_prof_lr[g] : g_prof_rip[g];
+            qsort(t, PROF_CAP, sizeof(ProfEnt), prof_cmp);
+            uint64_t tot = g_prof_out[g];
+            for (int i = 0; i < PROF_CAP && t[i].n; i++) tot += t[i].n;
+            rt_log("PROF %s, %s: %llu samples in image, %llu outside (waiting)", gn[g], k ? "last guest call-out lr" : "host rip (image offset)",
+                   (unsigned long long)(tot - g_prof_out[g]), (unsigned long long)g_prof_out[g]);
+            for (int i = 0; i < 40 && t[i].n; i++) rt_log("PROF   %s %#llx x%u", k ? "lr" : "rip", (unsigned long long)t[i].key, t[i].n);
+        }
+    }
+}
+
 static DWORD WINAPI watchdog_main(LPVOID p) {
     DWORD ms = (DWORD)(uintptr_t)p;
     Sleep(ms);
     rt_log("WATCHDOG: no result after %lu s, stopping", (unsigned long)(ms / 1000));
+    prof_dump();
     /* where is every guest thread? host RIP minus the image base resolves with llvm-symbolizer on the unstripped smrpg.exe */
     {
         RtThread *th[64];
@@ -176,8 +236,10 @@ int main(int argc, char **argv) {
     else for (uint32_t i = 0; i < g_reg_nchunks; i++) g_reg_chunks[i]();
     rt_log("registered %u generated chunks", g_reg_nchunks);
 
+    if (getenv("SMRPG_PROF")) CreateThread(NULL, 0, prof_main, (LPVOID)(uintptr_t)(DWORD)atoi(getenv("SMRPG_PROF")), 0, NULL);
     CreateThread(NULL, 0, watchdog_main, (LPVOID)(uintptr_t)((DWORD)g_max_seconds * 1000), 0, NULL);
     HANDLE bt = CreateThread(NULL, 64u << 20, boot_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    g_boot_host = bt;
     if (!bt) rt_exit(10, "cannot create boot thread");
     WaitForSingleObject(bt, INFINITE);
     rt_exit(g_first_service ? 0 : 1, g_first_service ? "boot thread ended after the first service request" : "boot thread ended before any nn service request");

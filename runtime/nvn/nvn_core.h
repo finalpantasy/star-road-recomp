@@ -1,5 +1,7 @@
 // Star Road Recomp: NVN on Vulkan, core runtime pieces shared by the API files (task-12). Our own code (D-008).
 #pragma once
+#include <mutex>
+
 #include "nvn_internal.h"
 
 namespace nvn {
@@ -35,8 +37,8 @@ struct QueueImpl {
   VkCommandPool pool = VK_NULL_HANDLE;
   uint64_t lastSignal = 0;
   uint32_t flags = 0;
-  struct TexPool* texPool = nullptr;      // SetTexturePool / SetSamplerPool state: owned by the queue, it outlives one command buffer
-  struct SampPool* sampPool = nullptr;
+  struct RS* hw = nullptr;                // the queue's GPU state (bound program, pools, targets, render state): like the hardware it carries over from one
+                                          // command buffer to the next. Created at the first submit, freed with the queue.
 };
 
 // ---- registries ----------------------------------------------------------------------------------------------
@@ -58,6 +60,23 @@ bool SamplerCreate(SamplerImpl* s);
 void SamplerDestroy(SamplerImpl* s);
 bool ProgramSetShadersImpl(ProgramImpl* p, uint32_t n, const uint64_t* dataAddr, const void* const* control);
 
+// ---- thread safety ------------------------------------------------------------------------------------------------
+// The game calls NVN from several threads (main, render, loading). Every proc thunk takes this one lock, so the registries, pools and
+// pool tables need no locks of their own. A call that blocks on the GPU releases it for the wait (ApiUnlock) so other threads go on.
+// Direct calls from the tests do not go through a thunk and are single threaded.
+std::mutex& ApiMutex();
+bool& ApiHeld();                                       // true on a thread that is inside a thunk
+struct ApiGuard {
+  bool took = false;
+  ApiGuard() { if (!ApiHeld()) { ApiMutex().lock(); ApiHeld() = true; took = true; } }
+  ~ApiGuard() { if (took) { ApiHeld() = false; ApiMutex().unlock(); } }
+};
+struct ApiUnlock {
+  bool had = false;
+  ApiUnlock() { if (ApiHeld()) { had = true; ApiHeld() = false; ApiMutex().unlock(); } }
+  ~ApiUnlock() { if (had) { ApiMutex().lock(); ApiHeld() = true; } }
+};
+
 // ---- queue ------------------------------------------------------------------------------------------------------
 bool QueueCreate(QueueImpl* q);
 void QueueDestroy(QueueImpl* q);
@@ -65,6 +84,12 @@ void QueueSubmit(QueueImpl* q, uint32_t n, const uint64_t* handles);
 void QueueFinish(QueueImpl* q);
 void QueueFence(QueueImpl* q, Sync* s);
 void QueuePresent(QueueImpl* q, WindowImpl* w, uint32_t idx);
+// Object lifetime: finalizing a pool, texture, sampler or program clears every queue and command list slot that still points at it,
+// so a later submit never touches freed memory. A recorded command that names a pool or program checks IsLive when it replays.
+void QueueScrub(const void* object);
+void LiveAdd(const void* object);
+void LiveDel(const void* object);
+bool IsLive(const void* object);
 bool WindowCreate(WindowImpl* w);
 void WindowDestroy(WindowImpl* w);
 
@@ -79,7 +104,7 @@ void LinkAnchorMem();
 void LinkAnchorCmd();
 
 // ---- debug / test hooks ---------------------------------------------------------------------------------------
-struct Stats { uint64_t draws = 0, skippedDraws = 0, pipelines = 0, submits = 0, uploads = 0, clears = 0, copies = 0, dispatches = 0, pipelineFails = 0; };
+struct Stats { uint64_t draws = 0, skippedDraws = 0, pipelines = 0, submits = 0, uploads = 0, clears = 0, copies = 0, dispatches = 0, pipelineFails = 0, noProgNull = 0, noProgIncomplete = 0; };
 Stats& GetStats();
 // Read back a texture subresource into `out` (tightly packed texels of the GPU format). For tests and captures.
 bool ReadbackTexture(TextureImpl* t, uint32_t level, uint32_t layer, std::vector<uint8_t>* out, uint32_t* w, uint32_t* h);

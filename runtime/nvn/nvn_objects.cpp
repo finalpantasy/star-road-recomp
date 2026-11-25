@@ -2,7 +2,10 @@
 // Our own code (D-008).
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <mutex>
+#include <unordered_set>
 
 #include "nvn_core.h"
 
@@ -121,8 +124,17 @@ bool PoolCreate(Pool* p) {
   return true;
 }
 
+static std::unordered_set<const void*> g_live;          // pools and programs the guest has initialized and not finalized (guarded by the API lock)
+void LiveAdd(const void* o) { g_live.insert(o); }
+void LiveDel(const void* o) { g_live.erase(o); }
+bool IsLive(const void* o) { return g_live.count(o) != 0; }
+
 void PoolDestroy(Pool* p) {
   UnregisterPool(p);
+  // Textures and buffers may outlive the pool they were made from (the game finalizes a pool first, then its objects). They keep a
+  // pointer to this struct, which is never freed: it stays behind as an empty `dead` shell.
+  for (TextureImpl* t : p->textures) if (t) t->pool = nullptr;
+  p->textures.clear(); p->textures.shrink_to_fit(); p->memory = nullptr; p->dead = true;
   if (p->buffer) { VkBuffer b = p->buffer; VkDeviceMemory m = p->mem.mem; bool imp = p->imported;
     DeferUntil(TimelineLast(), [b, m, imp]() { (void)imp; g_vk.f.vkDestroyBuffer(g_vk.dev, b, nullptr); if (m) g_vk.f.vkFreeMemory(g_vk.dev, m, nullptr); });
   }
@@ -298,7 +310,22 @@ bool ProgramSetShadersImpl(ProgramImpl* p, uint32_t n, const uint64_t* data, con
     std::string key = Sha256Hex(bytes, dsz);
     StageProgram* sp = ShaderCacheGet(key);
     p->stages.push_back(sp);
-    if (!sp->ok) { ok = false; continue; }
+    if (!sp->ok) {
+      ok = false;
+      // NVN_DUMP_MISSING=<dir>: write every stage that is not in the cache as <key>.data and <key>.ctrl, the corpus layout tools/shaderxlate reads.
+      static const char* dumpDir = getenv("NVN_DUMP_MISSING");
+      if (dumpDir && *dumpDir && sp->reason == "not in shader cache") {
+        static std::unordered_set<std::string> dumped;
+        if (dumped.insert(key).second) {
+          for (int k = 0; k < 2; k++) {
+            std::string path = std::string(dumpDir) + "/" + key + (k ? ".ctrl" : ".data");
+            if (FILE* f = fopen(path.c_str(), "wb")) { fwrite(k ? (const void*)ctl : (const void*)bytes, 1, k ? 0x880 : dsz, f); fclose(f); }
+          }
+          LogOnce(("dump" + key).c_str(), "ProgramSetShaders: stage %s not in the cache, dumped to %s", key.c_str(), dumpDir);
+        }
+      }
+      continue;
+    }
     if (sp->man.stage >= 0 && sp->man.stage < 6) p->byStage[sp->man.stage] = sp;
   }
   p->isCompute = p->byStage[NVN_SHADER_STAGE_COMPUTE] != nullptr;

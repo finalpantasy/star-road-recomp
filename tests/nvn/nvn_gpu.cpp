@@ -495,6 +495,101 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- 2c. primitives Vulkan has no topology for, and the device info the game sizes its binding tables from ---------------
+  {
+    int v5e = 0, v5f = 0;
+    nvnDeviceGetInteger(dev, NVN_DEVICE_INFO_SEPARATE_TEXTURE_BINDINGS_PER_STAGE, &v5e);
+    nvnDeviceGetInteger(dev, NVN_DEVICE_INFO_SEPARATE_SAMPLER_BINDINGS_PER_STAGE, &v5f);
+    CHECK(v5e == 128 && v5f == 32, "separate texture / sampler bindings per stage %d / %d (a zero leaves the game's binding tables unallocated)", v5e, v5f);
+    // QUAD_STRIP: the strip quad (v0, v1, v2, v3) is the same four corners as the triangle strip above, so the picture must match it.
+    // QUADS: the same corners in perimeter order (v0, v1, v3, v2).
+    Vtx* q = vtx + 20;
+    q[0] = vtx[0]; q[1] = vtx[1]; q[2] = vtx[3]; q[3] = vtx[2];
+    nvnBufferFlushMappedRange(vbuf, 0, 0x1000);
+    for (int mode = 0; mode < 2; mode++) {
+      uint64_t h = Record([&]() {
+        Targets(color, true); State();
+        float col[4] = {0, 0, 0, 0};
+        nvnCommandBufferClearColor(cb, 0, col, NVN_CLEAR_COLOR_MASK_RGBA); nvnCommandBufferClearDepthStencil(cb, 1.0f, true, 0, 0);
+        nvnCommandBufferBindProgram(cb, progTex, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        nvnCommandBufferBindSeparateTexture(cb, NVN_SHADER_STAGE_FRAGMENT, 0, nvnDeviceGetSeparateTextureHandle(dev, kTexSrc));
+        nvnCommandBufferBindSeparateSampler(cb, NVN_SHADER_STAGE_FRAGMENT, 0, hSampler);
+        nvnCommandBufferBindUniformBuffer(cb, NVN_SHADER_STAGE_FRAGMENT, 0, ubAddr + 0, 16);
+        nvnCommandBufferBindVertexBuffer(cb, 0, vbAddr + (mode ? 20 * sizeof(Vtx) : 0), 4 * sizeof(Vtx));
+        nvnCommandBufferDrawArrays(cb, mode ? NVN_DRAW_PRIMITIVE_QUADS : NVN_DRAW_PRIMITIVE_QUAD_STRIP, 0, 4);
+      });
+      SubmitWait(h);
+      std::vector<uint8_t> img; Read(color, &img);
+      if (img.size() == 64 * 64 * 4) {
+        const char* nm = mode ? "QUADS" : "QUAD_STRIP";
+        Px tl = At(img, 64, 16, 16), tr = At(img, 64, 48, 16), bl = At(img, 64, 16, 48), br = At(img, 64, 48, 48);
+        CHECK(Near(tl, {255, 0, 0, 255}) && Near(tr, {0, 255, 0, 255}) && Near(bl, {0, 0, 255, 255}) && Near(br, {255, 255, 255, 255}),
+              "%s drawn as two triangles: corners %s %s %s %s", nm, S(tl), S(tr), S(bl), S(br));
+      }
+    }
+  }
+
+  // ---- 2d. object lifetime: the queue keeps its pools and program across command buffers, and objects die in the game's order ---
+  {
+    // A pool and a program the queue still points at are finalized: a later draw must not touch them (hardware state would be stale; ours
+    // must be empty). The draw has no program, so it is skipped and the target keeps its clear color.
+    alignas(16) static uint8_t progTmp[0xC0 + 0x40], texPool2[0x20 + 0x40], sampPool2[0x20 + 0x40];
+    uint64_t tp2 = Bump(&data, 0x8000), sp2 = Bump(&data, 0x2000);
+    CHECK(nvnTexturePoolInitialize(texPool2, data.blob, (int64_t)tp2, 512), "second texture pool");
+    CHECK(nvnSamplerPoolInitialize(sampPool2, data.blob, (int64_t)sp2, 512), "second sampler pool");
+    nvnTexturePoolRegisterTexture(texPool2, kTexSrc, src.blob, nullptr);
+    nvnSamplerPoolRegisterSampler(sampPool2, kSamp, samp);
+    ShaderData d[2] = {{shaderPool.va + sb[0].off, sb[0].ctl}, {shaderPool.va + sb[2].off, sb[2].ctl}};
+    CHECK(nvnProgramInitialize(progTmp, dev) && nvnProgramSetShaders(progTmp, 2, d), "temporary program");
+    uint64_t hb = Record([&]() {
+      nvnCommandBufferSetTexturePool(cb, texPool2); nvnCommandBufferSetSamplerPool(cb, sampPool2);
+      nvnCommandBufferBindProgram(cb, progTmp, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    });
+    SubmitWait(hb);
+    nvnTexturePoolFinalize(texPool2); nvnSamplerPoolFinalize(sampPool2); nvnProgramFinalize(progTmp);
+    uint64_t skippedBefore = GetStats().noProgNull;
+    uint64_t h = Record([&]() {
+      Targets(color, true); State();
+      float col[4] = {0.5f, 0.5f, 0.5f, 1};
+      nvnCommandBufferClearColor(cb, 0, col, NVN_CLEAR_COLOR_MASK_RGBA); nvnCommandBufferClearDepthStencil(cb, 1.0f, true, 0, 0);
+      nvnCommandBufferBindVertexBuffer(cb, 0, vbAddr + 0, 4 * sizeof(Vtx));
+      nvnCommandBufferDrawArrays(cb, NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP, 0, 4);
+    });
+    SubmitWait(h);
+    CHECK(GetStats().noProgNull == skippedBefore + 1, "a draw after the bound program was finalized is skipped as 'no program bound' (%llu -> %llu)",
+          (unsigned long long)skippedBefore, (unsigned long long)GetStats().noProgNull);
+    std::vector<uint8_t> img; Read(color, &img);
+    if (img.size() == 64 * 64 * 4) { Px p = At(img, 64, 32, 32); CHECK(Near(p, {128, 128, 128, 255}, 1), "skipped draw left the clear color, got %s", S(p)); }
+    // put the real pools back for the tests below
+    uint64_t hp = Record([&]() { nvnCommandBufferSetTexturePool(cb, texPool); nvnCommandBufferSetSamplerPool(cb, sampPool); });
+    SubmitWait(hp);
+
+    // A clear under a scissor larger than the target (the game uses 16384 x 16384): the clear rectangle is clipped to the render area.
+    {
+      uint64_t hc = Record([&]() {
+        Targets(color, true);
+        nvnCommandBufferSetScissor(cb, 0, 0, 16384, 16384);
+        float col[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+        nvnCommandBufferClearColor(cb, 0, col, NVN_CLEAR_COLOR_MASK_RGBA); nvnCommandBufferClearDepthStencil(cb, 1.0f, true, 0, 0);
+      });
+      SubmitWait(hc);
+      std::vector<uint8_t> im; Read(color, &im);
+      if (im.size() == 64 * 64 * 4) { Px p = At(im, 64, 63, 63); CHECK(Near(p, {64, 128, 191, 255}, 1), "clear under an oversized scissor reached the corner, got %s", S(p)); }
+    }
+
+    // A pool is finalized before the texture and buffer that live in it (the game does this at scene changes): both finalizes must be harmless.
+    GuestPool tmp;
+    CHECK(MakePool(&tmp, dev, 0x20000, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED), "temporary memory pool");
+    GuestTex tt; CHECK(MakeTex(&tt, &tmp, dev, NVN_FORMAT_RGBA8, 4, 4, 0), "texture in the temporary pool");
+    alignas(16) static uint8_t tb[0x30 + 0x40];
+    { uint64_t off = Bump(&tmp, 256, 256); nvnBufferBuilderSetDefaults(bB); nvnBufferBuilderSetDevice(bB, dev); nvnBufferBuilderSetStorage(bB, tmp.blob, (int64_t)off, 256); CHECK(nvnBufferInitialize(tb, bB), "buffer in the temporary pool"); }
+    nvnMemoryPoolFlushMappedRange(tmp.blob, 0, 256);
+    nvnMemoryPoolFinalize(tmp.blob);
+    nvnMemoryPoolFlushMappedRange(tmp.blob, 0, 256);          // the game flushes ranges of pools it already finalized
+    nvnTextureFinalize(tt.blob); nvnBufferFinalize(tb);
+    CHECK(true, "finalizing a texture and a buffer after their pool did not crash");
+  }
+
   // ---- 3. RGBA4 component order ------------------------------------------------------------------------------------
   {
     uint64_t h = Record([&]() {

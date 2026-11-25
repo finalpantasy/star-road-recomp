@@ -323,7 +323,11 @@ static LONG WINAPI rt_veh(EXCEPTION_POINTERS *ep) {
            (unsigned long long)(er->NumberParameters > 1 ? er->ExceptionInformation[1] : 0),
            er->NumberParameters > 1 ? (er->ExceptionInformation[0] == 0 ? "read" : er->ExceptionInformation[0] == 1 ? "write" : "exec") : "n/a");
     rt_log("  host rsp=%#llx rbp=%#llx", (unsigned long long)ep->ContextRecord->Rsp, (unsigned long long)ep->ContextRecord->Rbp);
-    if (tl_ctx) dump_ctx(tl_ctx);
+    if (tl_ctx) {
+        dump_ctx(tl_ctx);
+        HleSlot *hs = hle_slot_at(tl_ctx->pc);
+        if (hs) rt_log("  guest pc is HLE slot %s", hs->name);
+    }
     dump_addrs();
     rt_ring_dump();
     rt_exit(5, "host crash");
@@ -358,6 +362,7 @@ void rt_summary(void) {
 
 void rt_exit(int code, const char *why) {
     rt_log("EXIT code=%d (%s)", code, why ? why : "");
+    { extern void prof_dump(void) __attribute__((weak)); if (prof_dump) prof_dump(); }   /* main.c's sampling profiler; absent in the unit-test builds */
     if (code == 4) dump_addrs();   /* watchdog: lets a passing run be compared with a crashing one */
     rt_summary();
     rt_log_flush();
