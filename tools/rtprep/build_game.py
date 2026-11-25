@@ -27,6 +27,17 @@ def run(cmd):
 
 
 def main():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # python -I does not add the script directory
+    from heavy_lock import heavy_slot, HeavyLockTimeout, EX_TEMPFAIL
+    try:
+        with heavy_slot("build_game.py"):                            # one heavy process at a time across both leads (task-27)
+            return build()
+    except HeavyLockTimeout as e:
+        print("[heavy-lock]", e)
+        return EX_TEMPFAIL
+
+
+def build():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--clean", action="store_true")
@@ -53,7 +64,7 @@ def main():
     print("installed", dst, os.path.getsize(dst))
     # task-22: the platform layer links SDL3 (MSYS2 ucrt64); SDL3.dll and the libiconv it needs sit beside the exe. Never committed.
     sdl_bin = os.path.join(os.environ.get("SMRPG_SDL3_DIR", r"A:\msys64\ucrt64"), "bin")
-    for dll in ("SDL3.dll", "libiconv-2.dll"):
+    for dll in ("SDL3.dll", "libiconv-2.dll", "libopus-0.dll"):      # libopus-0.dll: hwopus decoding (task-27), loaded at run time by runtime/audio/hwopus_dec.h
         src = os.path.join(sdl_bin, dll)
         if os.path.exists(src):
             shutil.copyfile(src, os.path.join(BUILD, "bin", dll))

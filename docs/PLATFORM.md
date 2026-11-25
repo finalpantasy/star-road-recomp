@@ -116,7 +116,7 @@ Two leads share this PC and the owner rule is one heavy process at a time. `tool
 - A waiter prints `[heavy-lock] <script> waiting ... held by ...` every 5 s and gives up after 15 minutes (exit 75).
 - A lock whose pid is dead, or alive but a different process (creation time differs), is stale and is replaced. Released in a `finally`, only if the file still names this process.
 - Nested calls: the holder exports `SMRPG_HEAVY_HELD=<pid>`, so a child (for example `run_game.py` started by a test runner that holds the slot) does not wait on its ancestor. `SMRPG_HEAVY_LOCK=0` skips the lock outright; use it only for such nested calls.
-- One-off command: `python -I tools/rtprep/heavy_lock.py run <name> -- <command...>`.
+- One-off command, for any heavy test or check (test_sync, game_check, nvn, rthard, platform tests), without editing the script: `python -I tools/rtprep/heavy_lock.py -- <command...>` (the lock record is named after the command's script, the exit code is the command's) or `python -I tools/rtprep/heavy_lock.py run <name> -- <command...>`.
 - Test: `python -I tests/rtprep/test_heavy_lock.py` (two real processes, stale pid, pid reuse, timeout, nested, skip, release on exception; private lock file in a temp dir).
 
 ## Known limits

@@ -5,8 +5,11 @@
  * host timer signals the system event once per render frame, which is what the guest audio thread waits on. Layout facts
  * (field offsets and section sizes) come from the public Horizon audio renderer documentation and from checking the
  * guest's own sizes against them at run time. No Windows audio device is opened here; --audio is a later step. */
+#include <math.h>
 #include "hle.h"
 #include "../platform/plat.h"
+#include "../audio/hwopus_dec.h"
+#include "../audio/pcm_dump.h"
 
 /* "Auto" commands send both the map-alias and the pointer form of a buffer; the unused one is empty. Pick the one with data. */
 static int real_in(IpcCtx *x) {
@@ -228,6 +231,10 @@ typedef struct {
     uint64_t pend[AO_Q]; uint32_t pend_n;
     uint64_t rel[AO_Q];  uint32_t rel_n;
     uint64_t played;
+    PcmDump dump;                        /* task-27: SMRPG_AUDIO_DUMP=<file.wav> writes what the guest appended (works without --audio) */
+    PcmStats st;
+    int sink_wanted;
+    uint64_t next_stat_frames;
 #ifdef SMRPG_PLATFORM
     PlatAudioSink *sink;                 /* task-22: a real device (--audio) or NULL: the null sink that consumes everything at once */
     uint64_t wr_total;                   /* bytes handed to the sink so far */
@@ -266,8 +273,13 @@ static void am_open(IpcCtx *x) {               /* 1 OpenAudioOut, 3 ...Auto */
     a->channels = in_u32(x, 4) & 0xFFFF; if (!a->channels) a->channels = 2;
     a->ev = k_event_named("audout_buffer", 0);
     a->tick = tick_new(0, 10, ao_tick, a);
+    {
+        const char *dp = getenv("SMRPG_AUDIO_DUMP");
+        if (dp && dp[0]) rt_log("[hle] audout: PCM capture %s -> %s\n", pcm_dump_open(&a->dump, dp, a->rate, a->channels) > 0 ? "on" : "FAILED", dp);
+    }
 #ifdef SMRPG_PLATFORM
     a->sink = plat_audio_open(a->rate, a->channels);        /* NULL unless --audio: the default run opens no audio device */
+    a->sink_wanted = a->sink != 0;
 #endif
     char name[0x100] = {0};
     memcpy(name, "DeviceOut", 10);
@@ -299,16 +311,32 @@ static void ao_append(IpcCtx *x) {             /* 3, 7: AppendAudioOutBuffer(u64
     uint64_t bytes = 0;
     if (b && b->size >= 0x20) memcpy(&bytes, (const uint8_t *)(uintptr_t)b->addr + 0x18, 8);
     EnterCriticalSection(&g_alock);
-#ifdef SMRPG_PLATFORM
-    if (a->sink && b && b->size >= 0x28 && bytes) {        /* AudioOutBuffer: data pointer @8, size @0x18, data offset @0x20 */
+    const void *pcm = 0;                                   /* AudioOutBuffer: data pointer @8, size @0x18, data offset @0x20 */
+    if (b && b->size >= 0x28 && bytes && (a->dump.f || a->sink_wanted)) {
         uint64_t data = 0, off = 0;
         memcpy(&data, (const uint8_t *)(uintptr_t)b->addr + 8, 8);
         memcpy(&off, (const uint8_t *)(uintptr_t)b->addr + 0x20, 8);
-        if (data > 0x10000 && bytes <= (1u << 24) && !IsBadReadPtr((void *)(uintptr_t)(data + off), (size_t)bytes)) {
-            plat_audio_write(a->sink, (const void *)(uintptr_t)(data + off), (uint32_t)bytes);
-            a->wr_total += bytes;
-        }
+        if (data > 0x10000 && bytes <= (1u << 24) && !IsBadReadPtr((void *)(uintptr_t)(data + off), (size_t)bytes)) pcm = (const void *)(uintptr_t)(data + off);
     }
+    if (pcm) {
+        uint64_t fr = a->channels ? bytes / (2ull * a->channels) : 0;
+        if (a->dump.f) {
+            pcm_dump_write(&a->dump, pcm, bytes);
+            pcm_stats_add(&a->st, (const int16_t *)pcm, fr, a->channels);
+            if (a->st.window_frames >= (uint64_t)a->rate * 5) {       /* one measurement line per 5 s of audio */
+                rt_log("[hle] audout: %llu frames (%.1f s) appended, last 5 s: peak=%d rms=%.1f; total nonzero frames %llu of %llu\n",
+                       (unsigned long long)a->st.frames, (double)a->st.frames / a->rate, a->st.peak,
+                       sqrt(a->st.sumsq / ((double)a->st.window_frames * a->channels)), (unsigned long long)a->st.nonzero_frames,
+                       (unsigned long long)a->st.frames);
+                a->st.window_frames = 0; a->st.sumsq = 0; a->st.peak = 0;
+                pcm_dump_patch(&a->dump);
+            }
+        }
+#ifdef SMRPG_PLATFORM
+        if (a->sink) { plat_audio_write(a->sink, pcm, (uint32_t)bytes); a->wr_total += bytes; }
+#endif
+    }
+#ifdef SMRPG_PLATFORM
     if (a->pend_n < AO_Q) a->pend_end[a->pend_n] = a->wr_total;
 #endif
     if (a->pend_n < AO_Q) a->pend[a->pend_n++] = tag;
@@ -364,34 +392,84 @@ CMD_TABLE(g_audioout_cmds) = {CMD(0, ao_state), CMD(1, ao_start), CMD(2, ao_stop
                               CMD(11, ao_flush), CMD(12, ao_set_vol), CMD(13, ao_get_vol)};
 const SvcIface g_audioout_iface = {"nn::audio::detail::IAudioOut", g_audioout_cmds, (int)(sizeof g_audioout_cmds / sizeof g_audioout_cmds[0]), 0};
 
-/* ------------------------------------------------------------------ hwopus : IHardwareOpusDecoderManager (null decoder: silence) */
-typedef struct { uint32_t rate, channels; } OpusDec;
+/* ------------------------------------------------------------------ hwopus : IHardwareOpusDecoderManager (task-27: real Opus through libopus)
+ * The game's audio engine decodes every Opus stream here (about 42,000 DecodeInterleavedForMultiStream calls in 130 s of play), then mixes the PCM
+ * into audout. The old null decoder returned silence for all of it. A missing libopus DLL keeps that silent behavior. */
+typedef struct {
+    uint32_t rate, channels;
+    HwOpusDec d;
+    uint64_t packets, samples, errors, bytes_in;
+    int logged;
+} OpusDec;
 extern const SvcIface g_opusdec_iface;
-static void om_open(IpcCtx *x) {               /* 0 OpenHardwareOpusDecoder(rate, channels, work size) */
+static char g_exe_dir[MAX_PATH];
+static void om_open(IpcCtx *x) {               /* 0 OpenHardwareOpusDecoder, 2 ...ForMultiStream, 4 ...Ex, 6 ...ForMultiStreamEx */
     OpusDec *d = (OpusDec *)calloc(1, sizeof *d);
-    d->rate = in_u32(x, 0); d->channels = in_u32(x, 4);
+    int multi = x->cmd == 2 || x->cmd == 6;
+    uint32_t streams = 1, coupled = 0;
+    uint8_t map[256]; memset(map, 0, sizeof map);
+    int have_map = 0;
+    if (multi) {                               /* parameters travel in a buffer: rate, channels, total streams, stereo streams, [flags], u8 mapping[0x100] */
+        IpcBuf *pb = ipc_in_buf(x, real_in(x));
+        if (pb && pb->size >= 16) {
+            const uint32_t *w = (const uint32_t *)(uintptr_t)pb->addr;
+            d->rate = w[0]; d->channels = w[1]; streams = w[2]; coupled = w[3];
+            uint64_t moff = pb->size >= 0x110 ? pb->size - 0x100 : 16;
+            if (moff + d->channels <= pb->size && d->channels <= 255) { memcpy(map, (const uint8_t *)(uintptr_t)pb->addr + moff, d->channels); have_map = 1; }
+            rt_log("[hle] hwopus: multistream params size=%u rate=%u ch=%u streams=%u stereo=%u map@0x%x\n", (unsigned)pb->size, d->rate, d->channels, streams, coupled, (unsigned)moff);
+        }
+    } else {
+        d->rate = in_u32(x, 0); d->channels = in_u32(x, 4);
+        coupled = d->channels == 2 ? 1 : 0;
+    }
     if (!d->rate) d->rate = 48000;
     if (!d->channels) d->channels = 2;
+    if (!g_exe_dir[0]) { DWORD n = GetModuleFileNameA(0, g_exe_dir, sizeof g_exe_dir); while (n && g_exe_dir[n - 1] != '\\') n--; if (n) g_exe_dir[n - 1] = 0; }
+    int ok = hwopus_lib_load(g_exe_dir) ? hwopus_dec_open(&d->d, (int)d->rate, (int)d->channels, (int)streams, (int)coupled, have_map ? map : 0) : -9;
+    rt_log("[hle] hwopus: open cmd=%u rate=%u ch=%u streams=%u stereo=%u -> %s\n", x->cmd, d->rate, d->channels, streams, coupled,
+           ok == 0 ? "libopus decoder" : (ok == -9 ? "SILENT (libopus-0.dll not found)" : "SILENT (decoder create failed)"));
     out_obj(x, &g_opusdec_iface, d);
 }
-static void om_work_size(IpcCtx *x) { out_u32(x, 0, 0x4000); }   /* 1 GetWorkBufferSize */
+static void om_work_size(IpcCtx *x) { out_u32(x, 0, 0x4000); }   /* GetWorkBufferSize*: our decoder keeps its state on the host heap */
 CMD_TABLE(g_hwopus_cmds) = {CMD(0, om_open), CMD(1, om_work_size), CMD(2, om_open), CMD(3, om_work_size), CMD(4, om_open), CMD(5, om_work_size),
                             CMD(6, om_open), CMD(7, om_work_size), CMD(8, om_work_size), CMD(9, om_work_size)};
 IFACE(g_hwopus_iface, "nn::codec::detail::IHardwareOpusDecoderManager", g_hwopus_cmds);
 
-static void od_decode(IpcCtx *x) {             /* DecodeInterleaved*: out u32 consumed, u32 samples (and a u64 perf time on the WithPerf forms) */
+/* DecodeInterleaved*: in u8 reset (the *AndReset and 8/9 forms), A buffer = framed packet, B buffer = s16 PCM; out u32 consumed, u32 samples per
+ * channel and (the WithPerf forms, 4 to 9) u64 time taken. */
+static void od_decode(IpcCtx *x) {
     OpusDec *d = (OpusDec *)x->self->state;
-    IpcBuf *in = ipc_in_buf(x, 0);
-    uint32_t consumed = in ? (uint32_t)in->size : 0, samples = d->rate / 50;
-    IpcBuf *o = ipc_out_buf(x, 0);
-    if (o) {
+    IpcBuf *in = ipc_in_buf(x, real_in(x));
+    IpcBuf *o = ipc_out_buf(x, real_out(x));
+    uint32_t consumed = 0, samples = 0;
+    int reset = (x->cmd >= 6 && x->cmd <= 9) ? (x->in_size ? x->in[0] & 1 : 0) : 0;
+    if (d->d.dec && in && o) {
+        int n = hwopus_dec_decode(&d->d, (const uint8_t *)(uintptr_t)in->addr, in->size, o->size, reset, &consumed);
+        if (n >= 0) {
+            samples = (uint32_t)n;
+            ipc_write_out(x, real_out(x), d->d.tmp, (uint64_t)n * d->channels * 2);
+            d->packets++; d->samples += (uint64_t)n; d->bytes_in += consumed;
+        } else {
+            d->errors++;
+            if (d->errors <= 3) rt_log("[hle] hwopus: decode error %d (in=%llu out=%llu reset=%d, %llu packets so far)\n", n, (unsigned long long)in->size,
+                                       (unsigned long long)o->size, reset, (unsigned long long)d->packets);
+            consumed = in->size >= 8 ? (uint32_t)in->size : 0;
+        }
+    } else if (in && o) {                      /* no libopus: silence, one 20 ms frame per call as before */
+        consumed = (uint32_t)in->size;
+        samples = d->rate / 50;
         uint64_t bytes = (uint64_t)samples * d->channels * 2;
         if (bytes > o->size) { bytes = o->size; samples = (uint32_t)(bytes / (d->channels * 2)); }
         memset((void *)(uintptr_t)o->addr, 0, (size_t)bytes);
-        ipc_write_out(x, 0, (void *)(uintptr_t)o->addr, bytes);
+        ipc_write_out(x, real_out(x), (void *)(uintptr_t)o->addr, bytes);
+    }
+    if (!d->logged && in) {
+        d->logged = 1;
+        rt_log("[hle] hwopus: first decode cmd=%u in=%llu out=%llu reset=%d -> consumed=%u samples=%u\n", x->cmd, (unsigned long long)in->size,
+               o ? (unsigned long long)o->size : 0ull, reset, consumed, samples);
     }
     out_u32(x, 0, consumed); out_u32(x, 4, samples);
-    if (x->cmd == 4 || x->cmd == 5 || x->cmd == 6 || x->cmd == 7 || x->cmd == 8 || x->cmd == 9 || x->cmd == 10) out_u64(x, 8, 0);
+    if (x->cmd >= 4 && x->cmd <= 9) out_u64(x, 8, 0);
 }
 static void od_set_ctx(IpcCtx *x) { (void)x; }
 CMD_TABLE(g_opusdec_cmds) = {CMD(0, od_decode), CMD(1, od_set_ctx), CMD(2, od_decode), CMD(3, od_set_ctx), CMD(4, od_decode), CMD(5, od_decode),
