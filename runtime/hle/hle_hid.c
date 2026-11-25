@@ -2,6 +2,8 @@
  * block stays zero (no controller connected) until the input task fills it. Commands answer with success and neutral values so the
  * sdk's nn::hid initialization runs through. Command ids are interface facts (switchbrew "HID services"). Our own code. */
 #include "hle.h"
+#include "../platform/hidshm.h"
+#include "../platform/plat.h"
 
 static void nop(IpcCtx *x) { (void)x; }
 static void ret_u32_0(IpcCtx *x) { out_u32(x, 0, 0); }
@@ -11,8 +13,40 @@ static void ret_u8_0(IpcCtx *x) { uint8_t b = 0; out_bytes(x, 0, &b, 1); }
 /* IAppletResource */
 #define HID_SHMEM_SIZE 0x40000
 static KObj *g_hid_shmem;
+
+/* Pad state (task-22): the platform layer calls hle_hid_publish every 5 ms from the main thread; the block is written through k_shmem_ptr
+ * each time (the guest may map it later than the first write, and then reads the mapped copy). The last state is kept so the service can
+ * fill the block at creation too. */
+static struct { HidShmWriter w; PadState pads[PAD_MAX_PLAYERS]; uint32_t mask; volatile LONG lock; } g_pad = {.mask = 1};
+static void pad_lock(void) { while (InterlockedCompareExchange(&g_pad.lock, 1, 0)) YieldProcessor(); }
+static void pad_unlock(void) { InterlockedExchange(&g_pad.lock, 0); }
+static uint64_t hid_ticks(void) {                                    /* 19.2 MHz, the Switch system tick */
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 19200000.0 / (double)f.QuadPart);
+}
+static void hid_write_locked(void) {
+    if (!g_hid_shmem) return;
+    void *shm = k_shmem_ptr(g_hid_shmem);
+    if (shm) hidshm_publish(&g_pad.w, shm, g_pad.pads, g_pad.mask, hid_ticks());
+}
+void hle_hid_publish(const PadState pads[PAD_MAX_PLAYERS], uint32_t connected_mask) {
+    pad_lock();
+    memcpy(g_pad.pads, pads, sizeof g_pad.pads);
+    g_pad.mask = connected_mask;
+    hid_write_locked();
+    pad_unlock();
+}
+
 static void ar_shmem(IpcCtx *x) {
-    if (!g_hid_shmem) g_hid_shmem = k_shmem_new(HID_SHMEM_SIZE);
+    if (!g_hid_shmem) {
+        g_hid_shmem = k_shmem_new(HID_SHMEM_SIZE);
+        pad_lock();
+        hidshm_writer_init(&g_pad.w);
+        hid_write_locked();
+        pad_unlock();
+    }
     out_copy_handle(x, k_handle_for(g_hid_shmem, 0));
 }
 CMD_TABLE(g_ares_cmds) = {CMD(0, ar_shmem)};

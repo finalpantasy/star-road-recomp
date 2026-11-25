@@ -103,6 +103,27 @@ void hle_thunk(Ctx *c) {
             c->x[1] > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)c->x[1], 8))
             rt_log("fslog %s \"%.160s\"", s->name, (const char *)(uintptr_t)c->x[1]);
     }
+    if (s->kind == SLOT_WRAP && s->name && strstr(s->name, "3hid13GetNpadState")) {
+        /* task-22 evidence: what the game's own sdk code read from the hid shared memory. GetNpadState(out, id) / GetNpadStates(out, n, id)
+         * both start with the newest NpadXState entry: u64 sampling, u64 buttons, s32 lx, ly, rx, ry. Logged when the buttons change, and for the first few calls. */
+        uint64_t out = c->x[0];
+        rt_icall(c, s->real);
+        static struct { HleSlot *s; uint64_t buttons; int calls; } seen[8];
+        int k = 0;
+        while (k < 8 && seen[k].s && seen[k].s != s) k++;
+        if (k < 8 && out > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)out, 0x28)) {
+            if (!seen[k].s) { seen[k].s = s; seen[k].buttons = ~0ull; }
+            const uint64_t *e = (const uint64_t *)(uintptr_t)out;
+            const int32_t *st = (const int32_t *)(uintptr_t)(out + 16);
+            seen[k].calls++;
+            if (e[1] != seen[k].buttons || seen[k].calls <= 2) {
+                rt_log("hid read: %s call #%d newest entry sampling=%llu buttons=%#llx lstick=(%d,%d) rstick=(%d,%d)", s->name, seen[k].calls,
+                       (unsigned long long)e[0], (unsigned long long)e[1], st[0], st[1], st[2], st[3]);
+                seen[k].buttons = e[1];
+            }
+        }
+        return;
+    }
     switch (s->kind) {
     case SLOT_STUB: c->x[0] = 0; break;
     case SLOT_WRAP: rt_icall(c, s->real); break;

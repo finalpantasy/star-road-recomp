@@ -51,6 +51,16 @@ def main():
     dst = os.path.join(BUILD, "bin", "smrpg.exe")
     shutil.copyfile(exe, dst)
     print("installed", dst, os.path.getsize(dst))
+    # task-22: the platform layer links SDL3 (MSYS2 ucrt64); SDL3.dll and the libiconv it needs sit beside the exe. Never committed.
+    sdl_bin = os.path.join(os.environ.get("SMRPG_SDL3_DIR", r"A:\msys64\ucrt64"), "bin")
+    for dll in ("SDL3.dll", "libiconv-2.dll"):
+        src = os.path.join(sdl_bin, dll)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(BUILD, "bin", dll))
+            print("installed", os.path.join(BUILD, "bin", dll))
+        else:
+            print("note: no", src, "(a build without the platform layer does not need it)")
+    shutil.copyfile(os.path.join(ROOT, "config", "input.default.ini"), os.path.join(BUILD, "bin", "input.default.ini"))   # the default keyboard map
     return 0
 
 

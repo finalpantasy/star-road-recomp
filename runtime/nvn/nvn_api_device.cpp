@@ -15,7 +15,7 @@ const VkInitOptions& CurrentOptions() {
     g_optSet = true;
     const char* v = getenv("NVN_VALIDATION"); g_opt.validation = v && *v == '1';
     const char* lp = getenv("NVN_LAYER_PATH"); if (lp) g_opt.layerPath = lp;
-    const char* pr = getenv("NVN_PRESENT"); g_opt.surfaceExtensions = pr && *pr == '1';
+    const char* pr = getenv("NVN_PRESENT"); g_opt.surfaceExtensions = (pr && *pr == '1') || (HasWindowProvider() && !(pr && *pr == '0'));   // task-22: the platform window presents unless NVN_PRESENT=0
     const char* lg = getenv("NVN_LOG"); if (lg) g_logLevel = atoi(lg);
   }
   return g_opt;

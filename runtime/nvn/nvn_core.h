@@ -17,7 +17,9 @@ struct CbImpl {
 
 struct WindowImpl {
   void* native = nullptr;                  // guest value, ignored
-  HWND hwnd = nullptr;                     // our own hidden window (never shown)
+  HWND hwnd = nullptr;                     // fallback only (no window provider): our own hidden Win32 window (never shown)
+  bool providerSurface = false;            // the surface came from the window provider (task-22), not from hwnd
+  bool swapHidden = false;                 // present mode the swapchain was made with (hidden window: IMMEDIATE)
   VkSurfaceKHR surface = VK_NULL_HANDLE;
   VkSwapchainKHR swap = VK_NULL_HANDLE;
   std::vector<VkImage> swapImages;
@@ -92,6 +94,17 @@ void LiveDel(const void* object);
 bool IsLive(const void* object);
 bool WindowCreate(WindowImpl* w);
 void WindowDestroy(WindowImpl* w);
+// Window provider (task-22): the host platform layer (SDL3, runtime/platform/) owns the OS window and makes the Vulkan surface. Without a
+// provider WindowCreate falls back to the hidden Win32 window the unit tests use. All callbacks are optional except create_surface.
+struct WindowProvider {
+  void* user = nullptr;
+  bool (*create_surface)(void* user, VkInstance inst, VkSurfaceKHR* out) = nullptr;
+  void (*destroy_surface)(void* user, VkInstance inst, VkSurfaceKHR surface) = nullptr;
+  bool (*is_visible)(void* user) = nullptr;     // on screen: present with vsync (FIFO); hidden: IMMEDIATE when the surface offers it
+  void (*on_present)(void* user) = nullptr;     // once per QueuePresentTexture (the scripted input clock counts these)
+};
+void SetWindowProvider(const WindowProvider* p);   // null clears it
+bool HasWindowProvider();
 
 // ---- configuration and proc resolution ------------------------------------------------------------------------
 void Configure(const VkInitOptions& opt);              // before the first DeviceInitialize (tests); env NVN_VALIDATION / NVN_LAYER_PATH otherwise

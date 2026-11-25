@@ -6,6 +6,7 @@
  * (field offsets and section sizes) come from the public Horizon audio renderer documentation and from checking the
  * guest's own sizes against them at run time. No Windows audio device is opened here; --audio is a later step. */
 #include "hle.h"
+#include "../platform/plat.h"
 
 /* "Auto" commands send both the map-alias and the pointer form of a buffer; the unused one is empty. Pick the one with data. */
 static int real_in(IpcCtx *x) {
@@ -227,12 +228,24 @@ typedef struct {
     uint64_t pend[AO_Q]; uint32_t pend_n;
     uint64_t rel[AO_Q];  uint32_t rel_n;
     uint64_t played;
+#ifdef SMRPG_PLATFORM
+    PlatAudioSink *sink;                 /* task-22: a real device (--audio) or NULL: the null sink that consumes everything at once */
+    uint64_t wr_total;                   /* bytes handed to the sink so far */
+    uint64_t pend_end[AO_Q];             /* wr_total after each pending buffer: it is released once the device has played that far */
+#endif
 } AudioOut;
 
 static void ao_tick(void *user) {              /* under the audio lock: pretend the DSP consumed every appended buffer */
     AudioOut *a = (AudioOut *)user;
     int any = 0;
+#ifdef SMRPG_PLATFORM
+    uint64_t consumed = a->sink ? a->wr_total - plat_audio_queued(a->sink) : 0;
+#endif
     while (a->pend_n && a->rel_n < AO_Q) {
+#ifdef SMRPG_PLATFORM
+        if (a->sink && a->pend_end[0] > consumed) break;      /* the device is still playing it: hand it back at the speed it really plays */
+        memmove(a->pend_end, a->pend_end + 1, (a->pend_n - 1) * sizeof a->pend_end[0]);
+#endif
         a->rel[a->rel_n++] = a->pend[0];
         memmove(a->pend, a->pend + 1, (a->pend_n - 1) * sizeof a->pend[0]);
         a->pend_n--;
@@ -253,6 +266,9 @@ static void am_open(IpcCtx *x) {               /* 1 OpenAudioOut, 3 ...Auto */
     a->channels = in_u32(x, 4) & 0xFFFF; if (!a->channels) a->channels = 2;
     a->ev = k_event_named("audout_buffer", 0);
     a->tick = tick_new(0, 10, ao_tick, a);
+#ifdef SMRPG_PLATFORM
+    a->sink = plat_audio_open(a->rate, a->channels);        /* NULL unless --audio: the default run opens no audio device */
+#endif
     char name[0x100] = {0};
     memcpy(name, "DeviceOut", 10);
     ipc_write_out(x, 0, name, sizeof name);
@@ -264,8 +280,18 @@ CMD_TABLE(g_audout_cmds) = {CMD(0, am_list), CMD(1, am_open), CMD(2, am_list), C
 IFACE(g_audout_iface, "nn::audio::detail::IAudioOutManager", g_audout_cmds);
 
 static void ao_state(IpcCtx *x)  { AudioOut *a = (AudioOut *)x->self->state; out_u32(x, 0, a->started ? 0 : 1); }
-static void ao_start(IpcCtx *x)  { AudioOut *a = (AudioOut *)x->self->state; a->started = 1; tick_set(a->tick, 1); }
-static void ao_stop(IpcCtx *x)   { AudioOut *a = (AudioOut *)x->self->state; a->started = 0; tick_set(a->tick, 0); }
+static void ao_start(IpcCtx *x)  {
+    AudioOut *a = (AudioOut *)x->self->state; a->started = 1; tick_set(a->tick, 1);
+#ifdef SMRPG_PLATFORM
+    plat_audio_pause(a->sink, 0);
+#endif
+}
+static void ao_stop(IpcCtx *x)   {
+    AudioOut *a = (AudioOut *)x->self->state; a->started = 0; tick_set(a->tick, 0);
+#ifdef SMRPG_PLATFORM
+    plat_audio_pause(a->sink, 1);
+#endif
+}
 static void ao_append(IpcCtx *x) {             /* 3, 7: AppendAudioOutBuffer(u64 tag, buffer) */
     AudioOut *a = (AudioOut *)x->self->state;
     uint64_t tag = in_u64(x, 0);
@@ -273,6 +299,18 @@ static void ao_append(IpcCtx *x) {             /* 3, 7: AppendAudioOutBuffer(u64
     uint64_t bytes = 0;
     if (b && b->size >= 0x20) memcpy(&bytes, (const uint8_t *)(uintptr_t)b->addr + 0x18, 8);
     EnterCriticalSection(&g_alock);
+#ifdef SMRPG_PLATFORM
+    if (a->sink && b && b->size >= 0x28 && bytes) {        /* AudioOutBuffer: data pointer @8, size @0x18, data offset @0x20 */
+        uint64_t data = 0, off = 0;
+        memcpy(&data, (const uint8_t *)(uintptr_t)b->addr + 8, 8);
+        memcpy(&off, (const uint8_t *)(uintptr_t)b->addr + 0x20, 8);
+        if (data > 0x10000 && bytes <= (1u << 24) && !IsBadReadPtr((void *)(uintptr_t)(data + off), (size_t)bytes)) {
+            plat_audio_write(a->sink, (const void *)(uintptr_t)(data + off), (uint32_t)bytes);
+            a->wr_total += bytes;
+        }
+    }
+    if (a->pend_n < AO_Q) a->pend_end[a->pend_n] = a->wr_total;
+#endif
     if (a->pend_n < AO_Q) a->pend[a->pend_n++] = tag;
     a->played += a->channels ? bytes / (2ull * a->channels) : 0;
     LeaveCriticalSection(&g_alock);
@@ -310,7 +348,12 @@ static void ao_flush(IpcCtx *x) {
     uint8_t any;
     EnterCriticalSection(&g_alock);
     any = a->pend_n != 0;
-    while (a->pend_n && a->rel_n < AO_Q) { a->rel[a->rel_n++] = a->pend[0]; memmove(a->pend, a->pend + 1, (a->pend_n - 1) * 8); a->pend_n--; }
+    while (a->pend_n && a->rel_n < AO_Q) {
+#ifdef SMRPG_PLATFORM
+        memmove(a->pend_end, a->pend_end + 1, (a->pend_n - 1) * 8);
+#endif
+        a->rel[a->rel_n++] = a->pend[0]; memmove(a->pend, a->pend + 1, (a->pend_n - 1) * 8); a->pend_n--;
+    }
     LeaveCriticalSection(&g_alock);
     out_bytes(x, 0, &any, 1);
 }

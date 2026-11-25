@@ -16,7 +16,7 @@ nvn_unit: 2177 checks, 0 failed
 ```
 
 ## nvn_gpu (clear, textured quad, RGBA4, depth range, sync, copies, hidden window, validation)
-Result: PASS (exit 0, 1.1 s)
+Result: PASS (exit 0, 2.7 s)
 
 ```
 [nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=1 validation=1
@@ -32,7 +32,7 @@ nvn_gpu: 101 checks, 0 failed
 ```
 
 ## nvn_cache pipelines (support buffer and c[1] pixel check, 600 real variants built and drawn, validation on)
-Result: PASS (exit 0, 3.8 s)
+Result: PASS (exit 0, 9.8 s)
 
 ```
 [nvn] stage vs storage buffer 0 is not bound
@@ -62,7 +62,7 @@ nvn_cache: 38 checks, 0 failed
 ```
 
 ## nvn_cache sweep (every stage program: capability check, shader module, descriptor set layout; vs/fs pairing)
-Result: PASS (exit 0, 8.0 s)
+Result: PASS (exit 0, 52.5 s)
 
 ```
   stage vs       1306
@@ -73,13 +73,13 @@ static sample: 614 stage programs, 614 with SPIR-V magic, 0 with a support buffe
 [nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=0 validation=0
 [nvn] device initialized on NVIDIA GeForce RTX 4090
 device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=off subgroupSize=32
-sweep progress: 4000 of 25763 stage programs after 1 s (load 1 s of which file reads 1 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 8000 of 25763 stage programs after 2 s (load 2 s of which file reads 2 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 12000 of 25763 stage programs after 3 s (load 3 s of which file reads 3 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 16000 of 25763 stage programs after 4 s (load 4 s of which file reads 4 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 20000 of 25763 stage programs after 6 s (load 5 s of which file reads 5 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 24000 of 25763 stage programs after 7 s (load 6 s of which file reads 6 s and manifest parse 1 s, device check 0 s, module and layout 1 s)
-sweep time: 7.4 s (load 6.7 s, device check 0.0 s, module and layout 0.6 s)
+sweep progress: 4000 of 25763 stage programs after 2 s (load 2 s of which file reads 2 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 8000 of 25763 stage programs after 3 s (load 3 s of which file reads 3 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 12000 of 25763 stage programs after 5 s (load 5 s of which file reads 5 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 16000 of 25763 stage programs after 7 s (load 6 s of which file reads 6 s and manifest parse 1 s, device check 0 s, module and layout 0 s)
+sweep progress: 20000 of 25763 stage programs after 8 s (load 8 s of which file reads 7 s and manifest parse 1 s, device check 0 s, module and layout 1 s)
+sweep progress: 24000 of 25763 stage programs after 34 s (load 33 s of which file reads 32 s and manifest parse 1 s, device check 0 s, module and layout 1 s)
+sweep time: 51.2 s (load 50.3 s, device check 0.0 s, module and layout 0.7 s)
 sweep: 25763 stage programs: 25763 ready (module and set layout built), 0 rejected by the device check, 0 not loaded, 0 module or layout failures
   ready vs       1306
   ready fs       24452

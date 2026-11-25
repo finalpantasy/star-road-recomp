@@ -20,6 +20,9 @@ a = ap.parse_args()
 log = os.path.join(BUILD, "logs", a.log + ".log")
 exe = os.path.join(BUILD, "bin", "smrpg.exe")
 env = dict(os.environ)
+if "--audio" not in a.rest:     # task-22: every background run is muted (owner rule): SDL audio driver dummy, and the runtime's audout stays a null sink
+    env.setdefault("SDL_AUDIO_DRIVER", "dummy")
+    env.setdefault("SDL_AUDIODRIVER", "dummy")
 for kv in a.env:
     k, v = kv.split("=", 1)
     env[k] = v

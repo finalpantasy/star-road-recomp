@@ -418,4 +418,27 @@ NVN_API(nvnSamplerPoolRegisterSamplerBuilder, void, (void* pool, int id, const S
 
 void LinkAnchorMem() {}
 
+// ---- movie output (task-21) ------------------------------------------------------------------------------------------
+// The HLE of nn::movie::Decoder in texture mode (hle/hle_movie.c) gets an NVNtexture from the game and fills its texels. CRIWARE creates these as
+// pitch-linear RGBA8 (stride 0x1e00 for 1920 wide) in a CPU-mapped pool; they are written here as plain rows and the texture is marked for the next upload.
+struct MovieTexTarget { uint8_t* data; uint32_t width, height, format, flags; uint64_t stride, size; };
+extern "C" int nvn_movie_texture_target(const void* tex, MovieTexTarget* out) {
+  const TextureG* g = (const TextureG*)tex;
+  if (!g || g->magic != kMagicTexture) return 0;
+  TextureImpl* t = g->impl;
+  if (!t || !IsLive(t) || !t->pool || t->pool->dead || !t->pool->memory) return 0;
+  uint64_t off = t->poolOffset;
+  if (off >= t->pool->size) return 0;
+  out->data = t->pool->memory + off;
+  out->width = g->width; out->height = g->height; out->format = g->format; out->flags = g->flags;
+  out->stride = g->stride; out->size = t->pool->size - off;
+  return 1;
+}
+extern "C" void nvn_movie_texture_dirty(const void* tex) {
+  const TextureG* g = (const TextureG*)tex;
+  if (!g || g->magic != kMagicTexture) return;
+  TextureImpl* t = g->impl;
+  if (t && IsLive(t)) t->uploaded = false;
+}
+
 }  // namespace nvn

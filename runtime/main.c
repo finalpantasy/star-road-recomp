@@ -4,6 +4,7 @@
  * guest the way rtld does: nn::init::Start(thread handle, rtld end, flag fn, run-init fn, run-fini fn).
  * Stops with a clear log line once the first nn service request is logged. Our own code. */
 #include "rt_internal.h"
+#include "platform/plat.h"
 int svc_thread_registry(RtThread **out, int max);   /* svc.c */
 
 static int g_no_init;
@@ -203,6 +204,9 @@ static DWORD WINAPI watchdog_main(LPVOID p) {
 }
 
 void gfxcap_init(void);   /* gfxcap.c */
+/* task-22: --window shows the window, --audio opens a real audio device, both off by default. The options parse in every build; they act
+ * only when the platform layer (SDL3) is linked. */
+static PlatOptions g_plat;
 
 int main(int argc, char **argv) {
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
@@ -220,7 +224,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--continue")) g_continue = 1;
         else if (!strcmp(argv[i], "--no-init")) g_no_init = 1;
         else if (!strcmp(argv[i], "--trace")) g_trace = 1;
-        else { fprintf(stderr, "usage: smrpg_boot [--max-seconds N] [--log path] [--img dir] [--entry start|nnmain|addr:HEX] [--continue] [--no-init] [--trace]\n"); return 2; }
+        else if (!strcmp(argv[i], "--window")) g_plat.show_window = 1;
+        else if (!strcmp(argv[i], "--audio")) g_plat.audio = 1;
+        else if (!strcmp(argv[i], "--fullscreen")) g_plat.fullscreen = 1;
+        else if (!strcmp(argv[i], "--input-config") && i + 1 < argc) { g_plat.input_config = argv[++i]; _putenv_s("SMRPG_INPUT_CONFIG", argv[i]); }
+        else { fprintf(stderr, "usage: smrpg_boot [--max-seconds N] [--log path] [--img dir] [--entry start|nnmain|addr:HEX] [--continue] [--no-init] [--trace] [--window [--fullscreen]] [--audio] [--input-config ini]\n"); return 2; }
     }
     rt_log_open(logp);
     rt_log("smrpg_boot: img=%s entry=%s max-seconds=%d trace=%d", img, g_entry, g_max_seconds, g_trace);
@@ -228,6 +236,12 @@ int main(int argc, char **argv) {
     rt_fn_tables_init();
     rt_reg(RT_SENTINEL, sentinel_fn);
     svc_init();
+#ifdef SMRPG_PLATFORM
+    if (plat_init(&g_plat)) rt_exit(10, "platform layer failed to start");
+    plat_register_nvn();      /* the SDL window becomes NVN's present surface (before the first NVN device exists) */
+#else
+    if (g_plat.show_window || g_plat.audio) rt_log("this build has no platform layer (SDL3 not found): --window and --audio are ignored");
+#endif
     gfxcap_init();
     rt_reserve_regions();
     if (ld_load_all(img)) rt_exit(10, "load failed");
@@ -242,7 +256,11 @@ int main(int argc, char **argv) {
     HANDLE bt = CreateThread(NULL, 64u << 20, boot_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     g_boot_host = bt;
     if (!bt) rt_exit(10, "cannot create boot thread");
+#ifdef SMRPG_PLATFORM
+    plat_run(bt);             /* main thread: SDL events, pad state into the hid block every 5 ms, until the boot thread ends */
+#else
     WaitForSingleObject(bt, INFINITE);
+#endif
     rt_exit(g_first_service ? 0 : 1, g_first_service ? "boot thread ended after the first service request" : "boot thread ended before any nn service request");
     return 0;
 }

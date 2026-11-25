@@ -282,6 +282,34 @@ static void UploadTexture(RS& s, TextureImpl* t, TextureG* g) {
   if (IsDepthFormat(t->vkFormat)) return;
   sr_tex_format fmt;
   if (sr_tex_format_from_nvn(g->format, &fmt) != SR_TEX_OK) { LogOnce("upfmt", "texture upload: format 0x%x not handled by task-11", g->format); return; }
+  if (((g->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || ((g->flags & NVN_TEXTURE_FLAGS_VIDEO_DECODE) && g->stride)) && !t->is3D && t->layers == 1 && t->levels == 1) {
+    // Pitch-linear storage (task-21: the CRIWARE movie texture has VIDEO_DECODE | COMPRESSIBLE flags and a stride of 0x1e00, no LINEAR flag): rows are `stride` bytes apart, no GOB swizzle. One level, one layer.
+    const sr_tex_format_info* fi = sr_tex_format_info_get(fmt.fmt);
+    if (!fi || fi->block_w != 1 || fi->block_h != 1 || !fi->bytes_per_block) { LogOnce("uplin", "linear texture upload: format 0x%x is not a raw format", g->format); return; }
+    uint64_t rowBytes = (uint64_t)t->width * fi->bytes_per_block;
+    uint64_t pitch = g->stride ? g->stride : rowBytes;
+    uint64_t need = pitch * (t->height - 1) + rowBytes;
+    if (pitch < rowBytes || pitch % fi->bytes_per_block || need > (pool->size > t->poolOffset ? pool->size - t->poolOffset : 0)) {
+      LogOnce("uplin2", "linear texture upload: stride %llu does not fit %ux%u fmt 0x%x (pool %llu bytes past offset %llu)", (unsigned long long)pitch, t->width, t->height, g->format,
+              (unsigned long long)pool->size, (unsigned long long)t->poolOffset);
+      return;
+    }
+    VkBuffer sb; VkDeviceSize so; void* sp;
+    if (!s.scratch->Alloc(need, 16, &sb, &so, &sp)) return;
+    memcpy(sp, pool->memory + t->poolOffset, (size_t)need);
+    VkBufferImageCopy cp{};
+    cp.bufferOffset = so; cp.bufferRowLength = (uint32_t)(pitch / fi->bytes_per_block); cp.bufferImageHeight = t->height;
+    cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.imageExtent = {t->width, t->height, 1};
+    ToGeneral(s, t);
+    EndRendering(s);
+    GlobalBarrier(s.cb);
+    g_vk.f.vkCmdCopyBufferToImage(s.cb, sb, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    GlobalBarrier(s.cb);
+    g_stats.uploads++;
+    LogOnce("uplin3", "linear texture upload: %ux%u fmt 0x%x stride %llu", t->width, t->height, g->format, (unsigned long long)pitch);
+    return;
+  }
   sr_tex_surface_desc d{};
   d.format = fmt; d.width = t->width; d.height = t->height; d.depth = t->is3D ? t->depth : 1;
   d.layers = t->is3D ? 1 : t->layers; d.levels = t->levels; d.block_height_log2 = SR_TEX_BH_AUTO; d.block_depth_log2 = SR_TEX_BH_AUTO;
@@ -1160,17 +1188,32 @@ void QueueFence(QueueImpl* q, Sync* s) {
 // ---- window ---------------------------------------------------------------------------------------------------------
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
 
+static WindowProvider g_provider;
+void SetWindowProvider(const WindowProvider* p) { g_provider = p ? *p : WindowProvider{}; }
+bool HasWindowProvider() { return g_provider.create_surface != nullptr; }
+
 bool WindowCreate(WindowImpl* w) {
-  if (!g_vk.hasSwapchain || !g_vk.f.vkCreateWin32SurfaceKHR) return true;     // offscreen: the game's textures are the target
-  WNDCLASSA wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleA(nullptr); wc.lpszClassName = "SrNvnHidden";
-  RegisterClassA(&wc);
-  // A real window handle for the surface. Never shown: no ShowWindow, no WS_VISIBLE, created as a tool window off screen.
-  w->hwnd = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "SrNvnHidden", "nvn-hidden", WS_POPUP, -32000, -32000, 64, 64, nullptr, nullptr, wc.hInstance, nullptr);
-  if (!w->hwnd) return true;
-  VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR}; si.hinstance = wc.hInstance; si.hwnd = w->hwnd;
-  if (g_vk.f.vkCreateWin32SurfaceKHR(g_vk.inst, &si, nullptr, &w->surface) != VK_SUCCESS) { w->surface = VK_NULL_HANDLE; return true; }
+  if (!g_vk.hasSwapchain) return true;                                          // offscreen: the game's textures are the target
+  if (g_provider.create_surface) {
+    // task-22: the platform layer (SDL3) owns the window; hidden unless the user asked for --window
+    if (!g_provider.create_surface(g_provider.user, g_vk.inst, &w->surface) || !w->surface) { w->surface = VK_NULL_HANDLE; Log("window provider made no surface; presenting offscreen only"); return true; }
+    w->providerSurface = true;
+  } else {
+    if (!g_vk.f.vkCreateWin32SurfaceKHR) return true;
+    WNDCLASSA wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleA(nullptr); wc.lpszClassName = "SrNvnHidden";
+    RegisterClassA(&wc);
+    // A real window handle for the surface. Never shown: no ShowWindow, no WS_VISIBLE, created as a tool window off screen.
+    w->hwnd = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "SrNvnHidden", "nvn-hidden", WS_POPUP, -32000, -32000, 64, 64, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!w->hwnd) return true;
+    VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR}; si.hinstance = wc.hInstance; si.hwnd = w->hwnd;
+    if (g_vk.f.vkCreateWin32SurfaceKHR(g_vk.inst, &si, nullptr, &w->surface) != VK_SUCCESS) { w->surface = VK_NULL_HANDLE; return true; }
+  }
   VkBool32 sup = VK_FALSE; g_vk.f.vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, g_vk.family, w->surface, &sup);
-  if (!sup) { g_vk.f.vkDestroySurfaceKHR(g_vk.inst, w->surface, nullptr); w->surface = VK_NULL_HANDLE; return true; }
+  if (!sup) {
+    if (w->providerSurface) { if (g_provider.destroy_surface) g_provider.destroy_surface(g_provider.user, g_vk.inst, w->surface); }
+    else g_vk.f.vkDestroySurfaceKHR(g_vk.inst, w->surface, nullptr);
+    w->surface = VK_NULL_HANDLE; w->providerSurface = false; return true;
+  }
   VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
   g_vk.f.vkCreateSemaphore(g_vk.dev, &sc, nullptr, &w->acquireSem);
   w->useSwapchain = true;
@@ -1183,32 +1226,45 @@ void WindowDestroy(WindowImpl* w) {
   if (w->swap) g_vk.f.vkDestroySwapchainKHR(g_vk.dev, w->swap, nullptr);
   if (w->acquireSem) g_vk.f.vkDestroySemaphore(g_vk.dev, w->acquireSem, nullptr);
   for (VkSemaphore s : w->presentSems) g_vk.f.vkDestroySemaphore(g_vk.dev, s, nullptr);
-  if (w->surface) g_vk.f.vkDestroySurfaceKHR(g_vk.inst, w->surface, nullptr);
+  if (w->surface) {
+    if (w->providerSurface) { if (g_provider.destroy_surface) g_provider.destroy_surface(g_provider.user, g_vk.inst, w->surface); }
+    else g_vk.f.vkDestroySurfaceKHR(g_vk.inst, w->surface, nullptr);
+  }
   if (w->hwnd) DestroyWindow(w->hwnd);
   *w = WindowImpl{};
 }
 
-static bool EnsureSwapchain(WindowImpl* w, VkFormat want, uint32_t width, uint32_t height) {
+// Makes (or remakes) the swapchain for the current surface size. false: nothing to present to right now (minimized, or creation failed).
+// `force` rebuilds it even when nothing looks different (after VK_ERROR_OUT_OF_DATE_KHR).
+static bool EnsureSwapchain(WindowImpl* w, VkFormat want, uint32_t width, uint32_t height, bool force = false) {
   auto& F = g_vk.f;
-  if (w->swap && w->swapFormat == want && w->swapExtent.width == width && w->swapExtent.height == height) return true;
-  F.vkDeviceWaitIdle(g_vk.dev);
   VkSurfaceCapabilitiesKHR caps; F.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, w->surface, &caps);
+  VkExtent2D ext = caps.currentExtent;
+  if (ext.width == 0xFFFFFFFFu) ext = {width, height};
+  if (ext.width == 0 || ext.height == 0) return false;                          // minimized: skip the present, keep the swapchain
+  ext.width = std::max(caps.minImageExtent.width, std::min(ext.width, caps.maxImageExtent.width));
+  ext.height = std::max(caps.minImageExtent.height, std::min(ext.height, caps.maxImageExtent.height));
+  bool hidden = g_provider.is_visible ? !g_provider.is_visible(g_provider.user) : false;
+  if (!force && w->swap && w->swapFormat == want && w->swapExtent.width == ext.width && w->swapExtent.height == ext.height && w->swapHidden == hidden) return true;
+  F.vkDeviceWaitIdle(g_vk.dev);
   uint32_t nf = 0; F.vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, w->surface, &nf, nullptr);
   std::vector<VkSurfaceFormatKHR> fm(nf); F.vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, w->surface, &nf, fm.data());
   VkSurfaceFormatKHR pick = fm.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR} : fm[0];
   for (auto& f : fm) if (f.format == want) pick = f;
-  VkExtent2D ext = caps.currentExtent;
-  if (ext.width == 0xFFFFFFFFu) ext = {width, height};
-  ext.width = std::max(caps.minImageExtent.width, std::min(ext.width, caps.maxImageExtent.width));
-  ext.height = std::max(caps.minImageExtent.height, std::min(ext.height, caps.maxImageExtent.height));
+  VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;                              // on screen: vsync
+  if (hidden) {                                                                  // nobody sees a hidden window: do not let vsync pace the game
+    uint32_t nm = 0; F.vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, w->surface, &nm, nullptr);
+    std::vector<VkPresentModeKHR> pm(nm); F.vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, w->surface, &nm, pm.data());
+    for (auto m : pm) if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+  }
   VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
   ci.surface = w->surface; ci.minImageCount = std::max(2u, caps.minImageCount); ci.imageFormat = pick.format; ci.imageColorSpace = pick.colorSpace; ci.imageExtent = ext;
   ci.imageArrayLayers = 1; ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  ci.preTransform = caps.currentTransform; ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; ci.presentMode = VK_PRESENT_MODE_FIFO_KHR; ci.clipped = VK_TRUE; ci.oldSwapchain = w->swap;
+  ci.preTransform = caps.currentTransform; ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; ci.presentMode = mode; ci.clipped = VK_TRUE; ci.oldSwapchain = w->swap;
   VkSwapchainKHR ns = VK_NULL_HANDLE;
   if (F.vkCreateSwapchainKHR(g_vk.dev, &ci, nullptr, &ns) != VK_SUCCESS) { LogOnce("swapfail", "swapchain creation failed; presenting offscreen only"); w->useSwapchain = false; return false; }
   if (w->swap) F.vkDestroySwapchainKHR(g_vk.dev, w->swap, nullptr);
-  w->swap = ns; w->swapFormat = pick.format; w->swapExtent = ext;
+  w->swap = ns; w->swapFormat = pick.format; w->swapExtent = ext; w->swapHidden = hidden;
   uint32_t ni = 0; F.vkGetSwapchainImagesKHR(g_vk.dev, ns, &ni, nullptr); w->swapImages.resize(ni); F.vkGetSwapchainImagesKHR(g_vk.dev, ns, &ni, w->swapImages.data());
   for (VkSemaphore s : w->presentSems) F.vkDestroySemaphore(g_vk.dev, s, nullptr);      // the device is idle (waited above)
   w->presentSems.assign(ni, VK_NULL_HANDLE);
@@ -1219,15 +1275,21 @@ static bool EnsureSwapchain(WindowImpl* w, VkFormat want, uint32_t width, uint32
 
 void QueuePresent(QueueImpl* q, WindowImpl* w, uint32_t idx) {
   w->presents++;
+  if (g_provider.on_present) g_provider.on_present(g_provider.user);
   if (w->presents % 120 == 0) Log("stats: %llu presents, %llu draws, %llu skipped (%llu no program, %llu incomplete program), %llu pipelines (%llu failed), %llu submits", (unsigned long long)w->presents, (unsigned long long)g_stats.draws, (unsigned long long)g_stats.skippedDraws, (unsigned long long)g_stats.noProgNull, (unsigned long long)g_stats.noProgIncomplete, (unsigned long long)g_stats.pipelines, (unsigned long long)g_stats.pipelineFails, (unsigned long long)g_stats.submits);
   if (!w->useSwapchain || idx >= w->textures.size() || !w->textures[idx] || !w->textures[idx]->impl) return;
   std::lock_guard<std::recursive_mutex> lk(g_vk.lock);
   auto& F = g_vk.f;
   TextureImpl* t = w->textures[idx]->impl;
   bool srgb = t->vkFormat == VK_FORMAT_R8G8B8A8_SRGB || t->vkFormat == VK_FORMAT_B8G8R8A8_SRGB;
-  if (!EnsureSwapchain(w, srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM, t->width, t->height)) return;
+  VkFormat swapWant = srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+  if (!EnsureSwapchain(w, swapWant, t->width, t->height)) return;
   uint32_t img = 0;
   VkResult r = F.vkAcquireNextImageKHR(g_vk.dev, w->swap, UINT64_MAX, w->acquireSem, VK_NULL_HANDLE, &img);
+  if (r == VK_ERROR_OUT_OF_DATE_KHR) {                                           // the window changed under the swapchain: rebuild once and retry
+    if (!EnsureSwapchain(w, swapWant, t->width, t->height, true)) return;
+    r = F.vkAcquireNextImageKHR(g_vk.dev, w->swap, UINT64_MAX, w->acquireSem, VK_NULL_HANDLE, &img);
+  }
   if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LogOnce("acq", "vkAcquireNextImageKHR failed (%d)", r); return; }
   VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ai.commandPool = q->pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
   VkCommandBuffer cb; F.vkAllocateCommandBuffers(g_vk.dev, &ai, &cb);
