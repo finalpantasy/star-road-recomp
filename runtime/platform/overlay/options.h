@@ -28,6 +28,11 @@ enum {
     OPT_VOLUME,            /* audio: 0 .. 100                                       live */
     OPT_INPUT_MAP,         /* controls: keyboard map ini ("" = input.ini, else input.default.ini)   live */
     OPT_UNLOCK_POSTGAME,   /* gameplay: off | on (task-24, post-game boss rematches)  on save load or new game */
+    OPT_DIFFICULTY_PLUS,   /* gameplay: off | hard (task-25, monster table overlay)  restart */
+    OPT_DIFFICULTY_PLUS_HP_PERCENT,
+    OPT_DIFFICULTY_PLUS_DAMAGE_PERCENT,
+    OPT_DIFFICULTY_PLUS_BOSS_HP_PERCENT,
+    OPT_DIFFICULTY_PLUS_BOSS_DAMAGE_PERCENT,
     OPT_COUNT
 };
 
@@ -42,6 +47,7 @@ typedef struct OptDesc {
 } OptDesc;
 
 #define OPT_PATH_MAX 260
+#define OPT_FILE_LINE_MAX 4096
 typedef struct Options {
     int v[OPT_COUNT];                      /* BOOL, ENUM, INT values (PATH entries stay 0) */
     char path[OPT_COUNT][OPT_PATH_MAX];    /* PATH values */

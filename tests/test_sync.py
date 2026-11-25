@@ -27,7 +27,7 @@ def main():
     if not clang:
         raise SystemExit("clang not on PATH")
     exe = WORK / "test_sync.exe"
-    srcs = [SRC / f for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "rt_weak.c")] + sorted((SRC / "hle").glob("*.c")) + sorted((SRC / "eh").glob("*.c")) + sorted((SRC / "gc").glob("*.c")) + sorted((SRC / "mods").glob("*.c"))
+    srcs = [SRC / f for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "rt_weak.c")] + sorted((SRC / "hle").glob("*.c")) + sorted((SRC / "eh").glob("*.c")) + sorted((SRC / "gc").glob("*.c")) + sorted((SRC / "mods").glob("*.c")) + [SRC / "platform" / "overlay" / "options.c", ROOT / "tools" / "datatbl" / "nrbf.c"]
     cmd = [clang, "-std=gnu11", "-O2", "-g", "-march=x86-64-v3", "-ffp-contract=off", "-fno-strict-aliasing", "-w", "-D_WIN32_WINNT=0x0A00",
            "-I", str(SRC), "-I", str(GEN)] + [str(s) for s in srcs] + [str(ROOT / "tests" / "runtime" / "test_sync.c"), "-o", str(exe)]
     r = subprocess.run(cmd, capture_output=True, text=True)

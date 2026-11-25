@@ -26,6 +26,12 @@ The owner approves look and feel (docs/ART_DIRECTION.md); technical PASS does no
 Return once at done or blocked. Runs hidden and muted.
 ## Approach and commands
 Study the baseline recomp's options menu and the game's own settings screens (captures on A:) first. Our own code; D-009 for anything reused.
+
+Round 2 starts from task-26's verified gameplay route. Confirm controller navigation, expose the existing runtime options through a Settings entry, and test that closing it returns focus to the guest menu. Keep the standalone hotkey available. Record a controller-only capture from Settings through an option change and back. Codex worker `/root/settings_integration` is mapping the existing hook points and evidence needed. The lead owns changes and runs.
+
+`codex_t16_r2_01` loaded a copy of the opening autosave. Menu inputs in the first two probes missed the intended gameplay window. The third probe used an incomplete input script and was stopped. In `codex_t16_r2_04`, a corrected script loaded the same save and reached the main menu with Plus. Present 6184 shows the System entry. The guest log confirms both the save load and controller input.
+
+The discovery worker identified candidate guest System menu methods in the local IL2CPP analysis. The runtime's existing overlay hook receives frame and input data, with no guest menu identity. Confirm the Settings state and selection action in a runtime trace before wiring a one-shot open request. The controlled `codex_t16_r2_05` probe loaded the room late and reached its watchdog before the scheduled navigation. AC6 still needs the guest Settings route and overlay handoff.
 ## Log and handoff
 Record measured numbers and screenshots on A:.
 

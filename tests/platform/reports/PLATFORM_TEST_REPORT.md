@@ -20,7 +20,7 @@ Exit code 0.
 ## Options store (test_options.c, task-16)
 
 ```
-options: 144 checks, 0 failed
+options: 201 checks, 0 failed
 ```
 
 Exit code 0.

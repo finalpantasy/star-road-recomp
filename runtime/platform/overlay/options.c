@@ -13,6 +13,7 @@ static const char *const N_TARGET[] = {"window", "1080p", "1440p", "2160p"};
 static const char *const N_SHARP[] = {"off", "sharpest", "strong", "default", "mild", "soft"};
 static const char *const N_FPS[] = {"game", "30", "60", "90", "120", "144", "240"};
 static const char *const N_OFFON[] = {"off", "on"};
+static const char *const N_DIFFICULTY_PLUS[] = {"off", "hard"};
 #define NN(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 /* The table. Order = page order in the menu and order in the ini. `page` groups items on one menu page. */
@@ -44,6 +45,21 @@ static const OptDesc T[OPT_COUNT] = {
     [OPT_UNLOCK_POSTGAME] = {"gameplay", "unlock_postgame", "Gameplay", "Unlock post-game",
         "off is the game as shipped. on unlocks the post-game boss rematches without playing through. Applies on save load or new game.",
         OPT_BOOL, OPT_ON_LOAD, 0, 0, 1, 1, N_OFFON, NN(N_OFFON), 0},
+    [OPT_DIFFICULTY_PLUS] = {"gameplay", "difficulty_plus", "Gameplay", "Difficulty Plus",
+        "off is faithful. hard raises monster stats from the data table. Applies after restarting the game.",
+        OPT_ENUM, OPT_RESTART, 0, 0, 1, 1, N_DIFFICULTY_PLUS, NN(N_DIFFICULTY_PLUS), 0},
+    [OPT_DIFFICULTY_PLUS_HP_PERCENT] = {"gameplay", "difficulty_plus_hp_percent", "Gameplay", "Enemy HP scale (%)",
+        "hard mode HP multiplier, from 100% to 400%. Default 150%. Applies after restarting the game.",
+        OPT_INT, OPT_RESTART, 150, 100, 400, 5, NULL, 0, 0},
+    [OPT_DIFFICULTY_PLUS_DAMAGE_PERCENT] = {"gameplay", "difficulty_plus_damage_percent", "Gameplay", "Enemy stat scale (%)",
+        "hard mode attack, defense, magic attack and magic defense multiplier. Default 125%. Applies after restarting the game.",
+        OPT_INT, OPT_RESTART, 125, 100, 400, 5, NULL, 0, 0},
+    [OPT_DIFFICULTY_PLUS_BOSS_HP_PERCENT] = {"gameplay", "difficulty_plus_boss_hp_percent", "Gameplay", "Boss HP scale (%)",
+        "HP multiplier for monster IDs listed in difficulty_plus_boss_ids in options.ini. Default 150%. Applies after restarting the game.",
+        OPT_INT, OPT_RESTART, 150, 100, 400, 5, NULL, 0, 0},
+    [OPT_DIFFICULTY_PLUS_BOSS_DAMAGE_PERCENT] = {"gameplay", "difficulty_plus_boss_damage_percent", "Gameplay", "Boss stat scale (%)",
+        "Attack, defense, magic attack and magic defense multiplier for IDs in difficulty_plus_boss_ids. Default 125%. Applies after restarting the game.",
+        OPT_INT, OPT_RESTART, 125, 100, 400, 5, NULL, 0, 0},
 };
 
 const OptDesc *opt_desc(int id) { return (id >= 0 && id < OPT_COUNT) ? &T[id] : NULL; }
@@ -188,9 +204,14 @@ int opts_load(Options *o, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     opts_defaults(o);                                   /* initialises the struct: free an earlier one with opts_free first */
-    char line[1024], section[64] = "";
+    char line[OPT_FILE_LINE_MAX], section[64] = "";
     int n = 0;
     while (fgets(line, sizeof line, f)) {
+        if (!strchr(line, '\n') && strlen(line) == sizeof line - 1) {
+            int ch;
+            while ((ch = fgetc(f)) != '\n' && ch != EOF) {}
+            continue;
+        }
         char *s = trim(line);
         if (!*s || *s == ';' || *s == '#') continue;
         if (*s == '[') {
@@ -241,6 +262,7 @@ static size_t render(const Options *o, char *buf, size_t cap, int with_extra) {
         else snprintf(val, sizeof val, "%s", d->names[clampi(o->v[i], 0, d->n_names - 1)]);
         PUT("%s = %s\n", d->key, val);
     }
+    PUT("; Optional boss-specific factors use an explicit comma-separated monster ID list: difficulty_plus_boss_ids = 12, 18\n");
     if (with_extra && o->extra && *o->extra) { PUT("\n; keys this build does not know (kept as they were)\n"); PUT("%s", o->extra); }
 #undef PUT
     return len;

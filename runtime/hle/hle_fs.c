@@ -7,6 +7,7 @@
  * Layouts (RomFS header, entry formats, DirectoryEntry) are the documented Horizon formats (switchbrew "RomFS"). */
 #include "hle.h"
 #include "mods/postgame.h"   /* task-24: unlock_postgame patches the save as the game reads it */
+#include "mods/datatbl_overlay.h" /* task-25: bounded monster table cache */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +45,7 @@ static void mkdirs_w(wchar_t *w) {
 }
 
 /* ------------------------------------------------------------------ RomFS virtual image */
-typedef struct RfFile { char *rel; wchar_t *wpath; uint64_t size; uint64_t data_off; int parent; uint32_t meta_off; uint32_t sibling_idx; HANDLE h; int is_level0; } RfFile;
+typedef struct RfFile { char *rel; wchar_t *wpath; uint64_t size; uint64_t data_off; int parent; uint32_t meta_off; uint32_t sibling_idx; HANDLE h; int is_level0; uint8_t *overlay; } RfFile;
 typedef struct RfDir { char *name; int parent; int *dirs, ndirs; int *files, nfiles; uint32_t meta_off; } RfDir;
 typedef struct RomFs {
     RfDir *dirs; int ndirs, capd;
@@ -56,6 +57,8 @@ typedef struct RomFs {
 static RomFs g_rom;
 static CRITICAL_SECTION g_rom_cs;
 static INIT_ONCE g_rom_once = INIT_ONCE_STATIC_INIT;
+static INIT_ONCE g_monster_overlay_once = INIT_ONCE_STATIC_INIT;
+#define MONSTER_OVERLAY_CACHE_MAX (16u * 1024u * 1024u)
 static BOOL CALLBACK rom_once_cb(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; InitializeCriticalSection(&g_rom_cs); return TRUE; }
 
 static int cmp_dir_idx(const void *a, const void *b);
@@ -219,6 +222,50 @@ static RomFs *rom_get(void) {
     LeaveCriticalSection(&g_rom_cs);
     return &g_rom;
 }
+static BOOL CALLBACK monster_overlay_once_cb(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once; (void)context;
+    RfFile *f = (RfFile *)parameter;
+    DatatblSettings settings;
+    DatatblReport report;
+    uint8_t *source = NULL, *overlay = NULL;
+    size_t overlay_size = 0;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    size_t got = 0;
+
+    datatbl_settings_load_options(&settings);
+    if (!settings.hard) return TRUE;
+    if (!f->size || f->size > MONSTER_OVERLAY_CACHE_MAX) {
+        rt_log("hle fs: difficulty_plus skipped monster.tbl cache, size %llu exceeds limit %u", (unsigned long long)f->size, MONSTER_OVERLAY_CACHE_MAX);
+        return TRUE;
+    }
+    source = (uint8_t *)malloc((size_t)f->size);
+    if (!source) goto fallback;
+    h = CreateFileW(f->wpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) goto fallback;
+    while (got < (size_t)f->size) {
+        DWORD want = (DWORD)(((size_t)f->size - got) > 0x100000 ? 0x100000 : (size_t)f->size - got);
+        DWORD rd = 0;
+        if (!ReadFile(h, source + got, want, &rd, 0) || !rd) goto fallback;
+        got += rd;
+    }
+    CloseHandle(h);
+    h = INVALID_HANDLE_VALUE;
+    if (!datatbl_overlay_prepare_cache(source, (size_t)f->size, &settings, MONSTER_OVERLAY_CACHE_MAX,
+                                       &overlay, &overlay_size, &report)) goto fallback;
+    free(source);
+    f->overlay = overlay;
+    rt_log("hle fs: difficulty_plus serving modified monster.tbl (%llu bytes, %llu monsters, %llu stats changed, %llu saturated)",
+           (unsigned long long)overlay_size, (unsigned long long)report.monster_count,
+           (unsigned long long)report.changed_stats, (unsigned long long)report.saturated_stats);
+    return TRUE;
+
+fallback:
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    free(source);
+    free(overlay);
+    rt_log("hle fs: difficulty_plus could not prepare monster.tbl; serving original bytes");
+    return TRUE;
+}
 /* read len bytes at off of the virtual image into dst; returns bytes produced (the image end clamps) */
 static uint64_t rom_read(RomFs *r, uint64_t off, void *dst, uint64_t len) {
     if (off >= r->total) return 0;
@@ -249,23 +296,29 @@ static uint64_t rom_read(RomFs *r, uint64_t off, void *dst, uint64_t len) {
         uint64_t real = fo < f->size ? (f->size - fo < n ? f->size - fo : n) : 0;
         if (real) {
             if (f->is_level0 && !g_level0_reached) hle_boot_marker("level0 read (first read of Data/level0)");
-            if (f->h == INVALID_HANDLE_VALUE) {
-                HANDLE h = CreateFileW(f->wpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-                HANDLE prev = InterlockedCompareExchangePointer(&f->h, h, INVALID_HANDLE_VALUE);
-                if (prev != INVALID_HANDLE_VALUE) { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+            if (_stricmp(f->rel, "Data/StreamingAssets/data_tbl/monster.tbl") == 0) {
+                InitOnceExecuteOnce(&g_monster_overlay_once, monster_overlay_once_cb, f, 0);
             }
-            if (f->h == INVALID_HANDLE_VALUE) memset(o + done, 0, real);
+            if (f->overlay) memcpy(o + done, f->overlay + fo, (size_t)real);
             else {
-                uint64_t got = 0;
-                while (got < real) {
-                    OVERLAPPED ov;
-                    memset(&ov, 0, sizeof ov);
-                    uint64_t at = fo + got;
-                    ov.Offset = (DWORD)at;
-                    ov.OffsetHigh = (DWORD)(at >> 32);
-                    DWORD want = (DWORD)(real - got > 0x4000000 ? 0x4000000 : real - got), rd = 0;
-                    if (!ReadFile(f->h, o + done + got, want, &rd, &ov) || !rd) { memset(o + done + got, 0, real - got); break; }
-                    got += rd;
+                if (f->h == INVALID_HANDLE_VALUE) {
+                    HANDLE h = CreateFileW(f->wpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+                    HANDLE prev = InterlockedCompareExchangePointer(&f->h, h, INVALID_HANDLE_VALUE);
+                    if (prev != INVALID_HANDLE_VALUE) { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+                }
+                if (f->h == INVALID_HANDLE_VALUE) memset(o + done, 0, real);
+                else {
+                    uint64_t got = 0;
+                    while (got < real) {
+                        OVERLAPPED ov;
+                        memset(&ov, 0, sizeof ov);
+                        uint64_t at = fo + got;
+                        ov.Offset = (DWORD)at;
+                        ov.OffsetHigh = (DWORD)(at >> 32);
+                        DWORD want = (DWORD)(real - got > 0x4000000 ? 0x4000000 : real - got), rd = 0;
+                        if (!ReadFile(f->h, o + done + got, want, &rd, &ov) || !rd) { memset(o + done + got, 0, real - got); break; }
+                        got += rd;
+                    }
                 }
             }
         }

@@ -94,6 +94,9 @@ Open or close it with `F1`, or with L + R + MINUS held together on a controller 
 | Audio | `audio.volume` | 0 to 100, step 5 | live (`plat_audio_set_volume`) |
 | Controls | `controls.input_map` | `auto`, or an `input*.ini` file beside the exe | live (`plat_apply_keymap`) |
 | Gameplay | `gameplay.unlock_postgame` | `off`, `on` (task-24) | on save load or new game (marked "on load"); the game reads it then |
+| Gameplay | `gameplay.difficulty_plus` | `off`, `hard` (task-25) | restart |
+
+Hard uses 150% HP and 125% attack, defense, magic attack, and magic defense by default. Set the HP and damage factors on the Gameplay page or in `options.ini` and restart. To apply the separate boss factors, add `difficulty_plus_boss_ids` under `[gameplay]` with a comma-separated list of monster IDs. The same factors apply to every monster until you supply the list. The runtime serves the modified table from memory and leaves rewards at their original values.
 
 File: `options.ini` beside `smrpg.exe`, or the path in `SMRPG_OPTIONS`. `config/options.default.ini` is the committed default (build_game.py copies it beside the exe; the generated copy is checked by `tests/platform/test_options.c`). A missing file or key keeps the default; unknown keys are preserved on save; the file is written atomically a moment after the last change, and at exit. `config/options.ini` is ignored by Git. Environment variables that already existed (`SMRPG_UPSCALE*`, `SMRPG_INPUT_CONFIG`, `--audio`) win over the file at startup; the menu then takes over.
 
@@ -105,8 +108,19 @@ Build: Dear ImGui is not in the repo. `python tools/thirdparty/fetch_imgui.py` d
 
 Contract note for the hook: the ImGui Vulkan backend uploads its font texture with its own queue submit and `vkQueueWaitIdle`, once on the first open and again when a new glyph is needed. That is one short stall while the menu is open and never happens with it closed, but it is a queue submit inside `PlatOverlayDraw` (the contract says the overlay only records). Tests: `tests/platform/test_options.c` (the options store, run by `run_platform_tests.py`).
 
+## Heavy-slot lock (task-27)
+
+Two leads share this PC and the owner rule is one heavy process at a time. `tools/rtprep/heavy_lock.py` is a machine-wide lock: `build_game.py` and `run_game.py` take it first, and so should any runner that launches the game (`with heavy_slot("name"):` after `sys.path.insert(0, <tools/rtprep>)`; `python -I` does not add the script directory).
+
+- Lock file `A:\AI\Recomps\smrpg-work\heavy.lock`, JSON `{holder, pid, script, started, pid_create}`; `SMRPG_HEAVY_HOLDER` names the lead. Taken with `O_CREAT|O_EXCL`.
+- A waiter prints `[heavy-lock] <script> waiting ... held by ...` every 5 s and gives up after 15 minutes (exit 75).
+- A lock whose pid is dead, or alive but a different process (creation time differs), is stale and is replaced. Released in a `finally`, only if the file still names this process.
+- Nested calls: the holder exports `SMRPG_HEAVY_HELD=<pid>`, so a child (for example `run_game.py` started by a test runner that holds the slot) does not wait on its ancestor. `SMRPG_HEAVY_LOCK=0` skips the lock outright; use it only for such nested calls.
+- One-off command: `python -I tools/rtprep/heavy_lock.py run <name> -- <command...>`.
+- Test: `python -I tests/rtprep/test_heavy_lock.py` (two real processes, stale pid, pid reuse, timeout, nested, skip, release on exception; private lock file in a temp dir).
+
 ## Known limits
 
-- Real audio is only the audout PCM path. The game's music and effects go through audren (`hle_audio.c` has no DSP: a null renderer), so `--audio` is silent until an audren mixer exists. That is a separate task.
+- Real audio is the audout PCM path. The guest mixes its own sound and never opens an audren renderer; its Opus streams are decoded by hwopus through libopus (`runtime/audio/hwopus_dec.h`, `libopus-0.dll` beside the exe), so `--audio` carries the game's sound (task-27). The audren mixer core (`runtime/audio/audren_mix.h`) is unit-tested but not wired to RequestUpdate because no guest uses it. `SMRPG_AUDIO_DUMP=<wav>` records the audout stream offline.
 - Rumble, motion, touch, handheld/joy-con styles and more than four players are not provided.
 - Keyboard rebinding is an ini file; the Controls page of the overlay picks the map file (task-16).

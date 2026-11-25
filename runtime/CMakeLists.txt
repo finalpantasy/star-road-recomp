@@ -34,7 +34,9 @@ if(SMRPG_GAME_OBJECTS)
   list(APPEND SMRPG_RT_SOURCES interp.c crypto_a64.c eh/eh.c gc/gc.c)   # eh/ and gc/ are task-14's (exceptions, collector safepoints); interp.c calls both
 endif()
 
-list(APPEND SMRPG_RT_SOURCES mods/postgame.c)   # task-24: unlock_postgame (the save view hle/hle_fs.c serves)
+list(APPEND SMRPG_RT_SOURCES mods/postgame.c mods/datatbl_overlay.c ../tools/datatbl/nrbf.c platform/overlay/options.c)
+# task-24: save view in hle_fs.c; task-25: monster table view in hle_fs.c and its NRBF codec. The plain-C options store is shared by the
+# optional ImGui menu and the filesystem HLE, so it stays available in no-overlay builds without linking any SDL or ImGui code.
 # NVN line 2 of 3: ${SMRPG_NVN_REGISTER_SOURCE} joins the runtime sources
 add_executable(smrpg_boot ${SMRPG_RT_SOURCES} ${SMRPG_HLE_SOURCES} ${SMRPG_NVN_REGISTER_SOURCE} ${SMRPG_EXTRA_SOURCES})
 target_include_directories(smrpg_boot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SMRPG_GEN_DIR})
@@ -74,7 +76,7 @@ if(EXISTS "${SMRPG_SDL3_DIR}/include/SDL3/SDL.h" AND EXISTS "${SMRPG_IMGUI_DIR}/
   set(_ovl ${CMAKE_CURRENT_SOURCE_DIR}/platform/overlay)
   set(_imgui_srcs ${SMRPG_IMGUI_DIR}/imgui.cpp ${SMRPG_IMGUI_DIR}/imgui_draw.cpp ${SMRPG_IMGUI_DIR}/imgui_tables.cpp ${SMRPG_IMGUI_DIR}/imgui_widgets.cpp
       ${SMRPG_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp ${SMRPG_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
-  target_sources(smrpg_boot PRIVATE ${_ovl}/options.c ${_ovl}/overlay_apply.cpp ${_ovl}/overlay.cpp ${_imgui_srcs})
+  target_sources(smrpg_boot PRIVATE ${_ovl}/overlay_apply.cpp ${_ovl}/overlay.cpp ${_imgui_srcs})
   target_include_directories(smrpg_boot PRIVATE ${SMRPG_IMGUI_DIR} ${SMRPG_IMGUI_DIR}/backends "${NVN_VULKAN_SDK}/Include")
   target_compile_definitions(smrpg_boot PRIVATE SMRPG_OVERLAY=1)
   set_source_files_properties(${_imgui_srcs} ${_ovl}/overlay.cpp PROPERTIES

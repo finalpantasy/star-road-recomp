@@ -31,7 +31,7 @@ static void spit(const char *path, const char *text) {
 static void test_defaults_and_table(void) {
     Options o;
     opts_defaults(&o);
-    CHECK_EQ(OPT_COUNT, 9);
+    CHECK_EQ(OPT_COUNT, 14);
     for (int i = 0; i < OPT_COUNT; i++) {
         const OptDesc *d = opt_desc(i);
         CHECK(d && d->key && d->section && d->page && d->label && d->help);
@@ -48,6 +48,11 @@ static void test_defaults_and_table(void) {
     CHECK_EQ(opt_get(&o, OPT_WINDOW_MODE), 0);
     CHECK_STR(opt_get_path(&o, OPT_INPUT_MAP), "");
     CHECK_EQ(opt_get(&o, OPT_UNLOCK_POSTGAME), 0);   /* off: the faithful game */
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS), 0);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT), 150);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_DAMAGE_PERCENT), 125);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_BOSS_HP_PERCENT), 150);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_BOSS_DAMAGE_PERCENT), 125);
     opts_free(&o);
 }
 
@@ -93,12 +98,18 @@ static void test_parse(const char *dir) {
          "input_map = C:\\games\\my keys.ini\n"
          "[gameplay]\n"
          "unlock_postgame = on\n"
+         "difficulty_plus = HARD\n"
+         "difficulty_plus_hp_percent = 999\n"
+         "difficulty_plus_damage_percent = 110\n"
+         "difficulty_plus_boss_hp_percent = 200\n"
+         "difficulty_plus_boss_damage_percent = 175\n"
+         "difficulty_plus_boss_ids = 7, 12\n"
          "[future]\n"
          "flux = 9\n"                               /* unknown: kept */
          "garbage line without equals\n");
     Options o;
     int n = opts_load(&o, path);
-    CHECK_EQ(n, 8);                                  /* 9 known keys in the file, the bad sharpness line is skipped */
+    CHECK_EQ(n, 13);                                 /* 14 known keys in the file, the bad sharpness line is skipped */
     CHECK_EQ(opt_get(&o, OPT_UPSCALE), 2);
     CHECK_EQ(opt_get(&o, OPT_UPSCALE_TARGET), 3);
     CHECK_EQ(opt_get(&o, OPT_SHARPNESS), 3);        /* default "default" */
@@ -109,6 +120,12 @@ static void test_parse(const char *dir) {
     CHECK_STR(opt_get_path(&o, OPT_INPUT_MAP), "C:\\games\\my keys.ini");
     CHECK(o.extra && strstr(o.extra, "[future]\nflux = 9\n"));
     CHECK_EQ(opt_get(&o, OPT_UNLOCK_POSTGAME), 1);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS), 1);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT), 400);  /* factor values are bounded by the registry */
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_DAMAGE_PERCENT), 110);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_BOSS_HP_PERCENT), 200);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_BOSS_DAMAGE_PERCENT), 175);
+    CHECK(o.extra && strstr(o.extra, "[gameplay]\ndifficulty_plus_boss_ids = 7, 12\n"));
     CHECK(!opt_needs_restart(&o, OPT_UNLOCK_POSTGAME));   /* not a restart option: the game reads it at the next load */
     CHECK(!opt_needs_restart(&o, OPT_AUDIO));       /* what the file said at start is what the game started with */
     char t[64];
@@ -116,6 +133,8 @@ static void test_parse(const char *dir) {
     opt_text(&o, OPT_FPS_CAP, t, sizeof t); CHECK_STR(t, "144");
     opt_text(&o, OPT_VOLUME, t, sizeof t); CHECK_STR(t, "100");
     opt_text(&o, OPT_INPUT_MAP, t, sizeof t); CHECK_STR(t, "my keys.ini");
+    opt_text(&o, OPT_DIFFICULTY_PLUS, t, sizeof t); CHECK_STR(t, "hard");
+    opt_text(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT, t, sizeof t); CHECK_STR(t, "400");
     opts_free(&o);
     CHECK_EQ(opts_load(&o, "A:\\does\\not\\exist.ini"), -1);
 }
@@ -140,6 +159,10 @@ static void test_set_step(void) {
     CHECK_EQ(opt_get(&o, OPT_AUDIO), 1);
     CHECK_EQ(opt_step(&o, OPT_AUDIO, +1), 1);
     CHECK_EQ(opt_get(&o, OPT_AUDIO), 0);
+    CHECK_EQ(opt_step(&o, OPT_DIFFICULTY_PLUS, +1), 1);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS), 1);
+    CHECK_EQ(opt_step(&o, OPT_DIFFICULTY_PLUS, +1), 1);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS), 0);
     /* ints step and clamp */
     CHECK_EQ(opt_step(&o, OPT_VOLUME, +1), 0);       /* already 100 */
     CHECK_EQ(opt_step(&o, OPT_VOLUME, -1), 1);
@@ -147,6 +170,11 @@ static void test_set_step(void) {
     for (int i = 0; i < 40; i++) opt_step(&o, OPT_VOLUME, -1);
     CHECK_EQ(opt_get(&o, OPT_VOLUME), 0);
     CHECK_EQ(opt_step(&o, OPT_VOLUME, -1), 0);
+    CHECK_EQ(opt_set(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT, 999), 1);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT), 400);
+    CHECK_EQ(opt_step(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT, +1), 0);
+    CHECK_EQ(opt_step(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT, -1), 1);
+    CHECK_EQ(opt_get(&o, OPT_DIFFICULTY_PLUS_HP_PERCENT), 395);
     /* path */
     CHECK_EQ(opt_set_path(&o, OPT_INPUT_MAP, "x.ini"), 1);
     CHECK_EQ(opt_set_path(&o, OPT_INPUT_MAP, "x.ini"), 0);
@@ -172,6 +200,10 @@ static void test_restart_tracking(void) {
     CHECK(opts_any_restart(&o));
     opt_set(&o, OPT_AUDIO, 0);                       /* back to what the game started with */
     CHECK(!opts_any_restart(&o));
+    opt_set(&o, OPT_DIFFICULTY_PLUS, 1);
+    CHECK(opt_needs_restart(&o, OPT_DIFFICULTY_PLUS));
+    opt_set(&o, OPT_DIFFICULTY_PLUS, 0);
+    CHECK(!opt_needs_restart(&o, OPT_DIFFICULTY_PLUS));
     opts_free(&o);
 }
 
