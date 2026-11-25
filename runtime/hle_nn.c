@@ -92,12 +92,9 @@ void hle_thunk(Ctx *c) {
     if (n == 1 && s->kind != SLOT_INTERNAL) {
         rt_log("%s first call: %s (lr=%#llx x0=%#llx x1=%#llx)", s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : "WRAP", s->name,
                (unsigned long long)c->x[30], (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
-        if (s->nn_service) {
-            rt_log("FIRST NN SERVICE REQUEST: %s", s->name);
-            svc_report_first_service("nn service symbol", s->name);
-        }
+        /* wrapped nn:: symbols forward to the lifted sdk code, which talks to our IPC server (runtime/hle); nothing stops here */
     } else if (g_trace && s->kind != SLOT_INTERNAL) {
-        rt_log("%s call #%lld %s", s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : "WRAP", (long long)n, s->name);
+        rt_log("%s call #%lld %s [x19=%#llx sp=%#llx]", s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : "WRAP", (long long)n, s->name, (unsigned long long)c->x[19], (unsigned long long)c->x[31]);
     }
     switch (s->kind) {
     case SLOT_STUB: c->x[0] = 0; break;
@@ -117,82 +114,6 @@ HLE_OVR(strcmp, "strcmp") { c->x[0] = (uint32_t)strcmp((const char *)c->x[0], (c
 HLE_OVR(strncmp, "strncmp") { c->x[0] = (uint32_t)strncmp((const char *)c->x[0], (const char *)c->x[1], c->x[2]); }
 HLE_OVR(strcpy, "strcpy") { strcpy((char *)c->x[0], (const char *)c->x[1]); }
 HLE_OVR(strchr, "strchr") { c->x[0] = (uint64_t)strchr((const char *)c->x[0], (int)c->x[1]); }
-
-/* ------------------------------------------------------------------ C++ exceptions (doc 4.4: unwind by return)
- * Exception object layout: a 0x80-byte hidden header precedes the object:
- *   [0] handler count (negative = rethrown), [1] type_info, [2] destructor. */
-#define EXC_HDR 0x80
-static inline int64_t *exc_hdr(void *obj) { return (int64_t *)((char *)obj - EXC_HDR); }
-
-HLE_OVR(cxa_alloc, "__cxa_allocate_exception") {
-    char *p = calloc(1, EXC_HDR + c->x[0] + 16);
-    c->x[0] = (uint64_t)(p + EXC_HDR);
-}
-HLE_OVR(cxa_free, "__cxa_free_exception") { if (c->x[0]) free((char *)c->x[0] - EXC_HDR); }
-HLE_OVR(cxa_throw, "__cxa_throw") {
-    void *obj = (void *)c->x[0];
-    int64_t *h = exc_hdr(obj);
-    h[0] = 0; h[1] = (int64_t)c->x[1]; h[2] = (int64_t)c->x[2];
-    c->exc = obj;
-    c->exc_type = c->x[1];
-    static volatile LONG nthrow;
-    if (g_trace || InterlockedIncrement(&nthrow) <= 20) {
-        char nm[160];
-        uint64_t np = 0;
-        SIZE_T got = 0;
-        ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(c->x[1] + 8), &np, 8, &got);
-        rt_log("C++ throw: object=%p type_info=%#llx name=%s lr=%#llx", obj, (unsigned long long)c->x[1], rt_safe_str(np, nm, sizeof nm), (unsigned long long)c->x[30]);
-    }
-}
-HLE_OVR(cxa_begin_catch, "__cxa_begin_catch") {
-    void *obj = (void *)c->x[0];
-    RtThread *t = c->thr;
-    if (!obj) return;
-    int64_t *h = exc_hdr(obj);
-    h[0] = h[0] < 0 ? -h[0] + 1 : h[0] + 1;
-    if (t && (t->ncaught == 0 || t->caught[t->ncaught - 1] != obj) && t->ncaught < 16) t->caught[t->ncaught++] = obj;
-    c->exc = 0;
-}
-HLE_OVR(cxa_end_catch, "__cxa_end_catch") {
-    RtThread *t = c->thr;
-    if (!t || !t->ncaught) return;
-    void *obj = t->caught[t->ncaught - 1];
-    int64_t *h = exc_hdr(obj);
-    if (h[0] < 0) {
-        if (++h[0] == 0) t->ncaught--;
-    } else if (--h[0] == 0) {
-        t->ncaught--;
-        void *keep = c->exc;
-        uint64_t keept = c->exc_type, lr = c->x[30];
-        if (h[2]) { c->x[0] = (uint64_t)obj; rt_icall(c, (uint64_t)h[2]); }
-        c->exc = keep; c->exc_type = keept; c->x[30] = lr;
-        free(h);
-    }
-}
-HLE_OVR(cxa_rethrow, "__cxa_rethrow") {
-    RtThread *t = c->thr;
-    if (!t || !t->ncaught) rt_fatal(c, "__cxa_rethrow with no active exception", 0);
-    void *obj = t->caught[t->ncaught - 1];
-    int64_t *h = exc_hdr(obj);
-    h[0] = -h[0];
-    c->exc = obj;
-    c->exc_type = (uint64_t)h[1];
-}
-HLE_OVR(unwind_resume, "_Unwind_Resume") {
-    void *obj = (void *)c->x[0];
-    c->exc = obj;
-    c->exc_type = obj ? (uint64_t)exc_hdr(obj)[1] : 0;
-}
-HLE_OVR(cxa_get_ptr, "__cxa_get_exception_ptr") { /* x0 stays the object */ }
-HLE_OVR(cxa_cur_type, "__cxa_current_exception_type") {
-    RtThread *t = c->thr;
-    c->x[0] = (t && t->ncaught) ? (uint64_t)exc_hdr(t->caught[t->ncaught - 1])[1] : 0;
-}
-HLE_OVR(cxa_uncaught, "__cxa_uncaught_exception") { c->x[0] = 0; }
-HLE_OVR(cxa_uncaught2, "__cxa_uncaught_exceptions") { c->x[0] = 0; }
-HLE_OVR(gxx_personality, "__gxx_personality_v0") { rt_fatal(c, "__gxx_personality_v0 called: the lifter must resolve landing pads at build time", c->x[30]); }
-HLE_OVR(std_terminate, "_ZSt9terminatev") { rt_fatal(c, "std::terminate called", c->x[30]); }
-HLE_OVR(cxa_call_unexpected, "__cxa_call_unexpected") { rt_fatal(c, "__cxa_call_unexpected", c->x[0]); }
 
 /* ------------------------------------------------------------------ real implementations that are trivial */
 /* Add nn:: HLE here as the boot log shows what is needed, for example:

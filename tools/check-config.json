@@ -38,6 +38,46 @@
       "timeout_seconds": 120,
       "report": "{run_dir}/no_reuse.json",
       "format": "json"
+    },
+    {
+      "id": "rthard",
+      "argv": [
+        "{python}",
+        "-I",
+        "{root}/tests/test_rthard.py",
+        "--real",
+        "--report",
+        "{run_dir}/rthard.json"
+      ],
+      "timeout_seconds": 600,
+      "report": "{run_dir}/rthard.json",
+      "format": "json"
+    },
+    {
+      "id": "sync",
+      "argv": [
+        "{python}",
+        "-I",
+        "{root}/tests/test_sync.py",
+        "--report",
+        "{run_dir}/sync.json"
+      ],
+      "timeout_seconds": 600,
+      "report": "{run_dir}/sync.json",
+      "format": "json"
+    },
+    {
+      "id": "crypto",
+      "argv": [
+        "{python}",
+        "-I",
+        "{root}/tests/test_crypto_a64.py",
+        "--report",
+        "{run_dir}/crypto.json"
+      ],
+      "timeout_seconds": 300,
+      "report": "{run_dir}/crypto.json",
+      "format": "json"
     }
   ],
   "extra_inputs": [],

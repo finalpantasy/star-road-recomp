@@ -59,7 +59,7 @@ def build(exe):
     clang = shutil.which("clang")
     if not clang:
         raise SystemExit("clang not on PATH")
-    srcs = [SRC / f for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "main.c", "rt_weak.c")]
+    srcs = [SRC / f for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "main.c", "rt_weak.c")] + sorted((SRC / "hle").glob("*.c")) + sorted((SRC / "eh").glob("*.c")) + sorted((SRC / "gc").glob("*.c"))
     cmd = [clang, "-std=c11", "-O1", "-g", "-Wall", "-Wno-comment", "-D_WIN32_WINNT=0x0A00", "-I", str(SRC)] + [str(s) for s in srcs] + \
           [str(ROOT / "tests" / "runtime" / "mock_game.c"), "-o", str(exe)]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -98,8 +98,6 @@ def main():
         "module main    mapped at 0x7100000000",
         "relocated main",
         "STUB first call: _ZN2nn3hid10InitializeEv",
-        "FIRST NN SERVICE REQUEST: _ZN2nn3hid10InitializeEv",
-        "BOOT REACHED: nn service symbol _ZN2nn3hid10InitializeEv",
         "rtld: running init_array of main (1 entries)",
         "ctor main[0/1]",
         "svc 0x29 GetInfo",
@@ -113,12 +111,12 @@ def main():
         "STUB first call: _ZN2nn2os14SomethingOtherEv",
     ]:
         check(need in out, "missing in log: " + need + "\n" + out[-3000:])
-    check("FIRST NN SERVICE REQUEST: _ZN2nn2os" not in out, "os symbol flagged as a service")
-    check("NOT REACHED" not in out, "guest continued past the first service request")
+    # task-13: the boot no longer stops at the first nn symbol; services are answered by the HLE layer (runtime/hle/), so the mock runs to the
+    # end of its entry. No service IPC happens in the mock, hence exit code 1 ("boot thread ended before any nn service request").
+    check("mock: NOT REACHED" in out, "guest did not continue past the unresolved nn import\n" + out[-2000:])
+    check("STUB first call: _ZN2nn3hid10InitializeEv" in out, "unresolved nn import was not stubbed")
     check("FATAL" not in out, "fatal in log\n" + out[-3000:])
-    check(rc == 0, "exit code %d\n%s" % (rc, out[-3000:]))
-    rc2, out2 = run(exe, img, ["--entry", "start", "--continue"])
-    check("mock: NOT REACHED" in out2, "--continue did not continue\n" + out2[-2000:])
+    check(rc == 1, "exit code %d\n%s" % (rc, out[-3000:]))
     print("runtime boot test: PASS (%d log lines)" % out.count("\n"))
 
 

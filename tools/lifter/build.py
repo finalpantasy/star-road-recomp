@@ -89,8 +89,26 @@ def _load_mod(name):
         return int.from_bytes(img[o:o + n], "little")
 
     mod = dict(name=name, base=base, words=words, starts=starts, ends=ends, rd_mem=rd_mem)
+    # task-14: LSDA call-site tables (landing pads) and the EH ABI entry points the runtime replaces in place
+    import eh_tables
+    eh = j.get("mod0", {}).get("eh_frame_hdr")
+    if eh and eh[1] > eh[0]:
+        mod["eh"] = eh_tables.EhInfo(img, base, eh[0], eh[1])
+    mod["redirect"] = eh_redirects(name)
     m = _W[name] = (lf, lf.Lifter(mod), rows)
     return m
+
+
+def eh_redirects(name):
+    """{abs addr: symbol} for defined functions named in eh_tables.REDIRECT_NAMES (the sdk, in the game)."""
+    import inventory as inv
+    import eh_tables
+    p = os.path.join(IMG, name + ".sym")
+    if not os.path.exists(p):
+        return {}
+    want = set(eh_tables.REDIRECT_NAMES)
+    return {BASES[name] + e["value"]: e["name"] for e in inv.load_sym(p)
+            if e["defined"] and e["type"] == 2 and e["value"] and e["name"] in want}
 
 
 CALL_RE = re.compile(r"\bf_([0-9a-f]+)\(c\)")
@@ -119,7 +137,8 @@ def lift_chunk(job):
             continue
         bodies.append(text)
         lifted.append(a)
-        for key in ("insns", "calls", "tail", "mid", "jt", "jt_unresolved", "br_tail_ptr"):
+        for key in ("insns", "calls", "tail", "mid", "jt", "jt_unresolved", "br_tail_ptr", "eh_sites", "eh_pads", "eh_pads_out",
+                    "eh_nosite", "polls", "redirects"):
             tot[key] += info.get(key, 0)
         if info["mid"]:
             flags["funcs_with_mid_function_targets"] += 1
@@ -268,9 +287,15 @@ def cmd_lift(a):
     # registry
     chunks = sorted(f[:-2] for f in os.listdir(CDIR) if f.endswith(".c") and f[:-2].split("_")[0] in BASES)
     names = ["reg_" + c for c in chunks]
+    # task-14: EH ABI entry points inside the lifted modules that runtime/eh replaces at their own address. The post
+    # hook runs last (after every chunk registered), so its rt_reg calls win over the lifted bodies.
+    red = sorted((ad, nm) for m in BASES for ad, nm in eh_redirects(m).items())
     with open(os.path.join(CDIR, "regs.c"), "w") as f:
         f.write('#include "prelude.h"\n' + "".join("void %s(void);\n" % n for n in names))
-        f.write("const RegFn g_reg_chunks[] = {" + ",".join(names) + (",0" if not names else "") + "};\n")
+        f.write("static const RtRedirect g_rt_redirects[] = {" + "".join('{0x%xull, "%s"}, ' % r for r in red) + "{0, 0}};\n")
+        f.write("static void reg_zz_post(void) { eh_post_register(g_rt_redirects, %d); }\n" % len(red))
+        names.append("reg_zz_post")
+        f.write("const RegFn g_reg_chunks[] = {" + ",".join(names) + "};\n")
         f.write("const uint32_t g_reg_nchunks = %d;\n" % len(names))
     print("lift wall %.1fs" % (time.time() - t0))
 
@@ -310,12 +335,14 @@ def cmd_compile(a):
     files = sorted(os.path.join(CDIR, f) for f in os.listdir(CDIR) if f.endswith(".c"))
     todo = [(p, src_obj(p, hh)) for p in files]
     todo = [(p, o) for p, o in todo if not os.path.exists(o)]
+    todo.sort(key=lambda po: -os.path.getsize(po[0]))     # biggest first: a slow chunk never starts near the budget end
     if a.only:
         todo = [(p, o) for p, o in todo if a.only in os.path.basename(p)]
     print("chunks %d, to compile %d" % (len(files), len(todo)), flush=True)
     done = fail = skipped = 0
     errs = []
     times = []
+    slow = []
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         pending = set()
         it = iter(todo)
@@ -337,6 +364,7 @@ def cmd_compile(a):
             for fu in d:
                 p, ok, err, dt = fu.result()
                 times.append(dt)
+                slow.append((dt, os.path.basename(p)))
                 if ok:
                     done += 1
                 else:
@@ -351,11 +379,12 @@ def cmd_compile(a):
             f.write("== %s\n%s\n" % (p, e))
     print("compiled %d, failed %d, still to do %d; wall %.0fs; mean %.1fs max %.1fs" %
           (done, fail, left, time.time() - t0, sum(times) / max(1, len(times)), max(times or [0])))
+    print("slowest:", ", ".join("%s %.0fs" % (n, t) for t, n in sorted(slow, reverse=True)[:5]))
     for p, e in errs[:3]:
         print("FAIL", p, e[:600])
 
 
-RT_SRC = ["rt_core.c", "loader.c", "svc.c", "hle_nn.c", "main.c", "rt_weak.c", "interp.c"]
+RT_SRC = ["rt_core.c", "loader.c", "svc.c", "hle_nn.c", "main.c", "rt_weak.c", "interp.c", "eh/eh.c", "gc/gc.c"]
 
 
 def cmd_link(a):

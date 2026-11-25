@@ -77,7 +77,7 @@ void LinkAnchorMem();
 void LinkAnchorCmd();
 
 // ---- debug / test hooks ---------------------------------------------------------------------------------------
-struct Stats { uint64_t draws = 0, skippedDraws = 0, pipelines = 0, submits = 0, uploads = 0, clears = 0, copies = 0, dispatches = 0; };
+struct Stats { uint64_t draws = 0, skippedDraws = 0, pipelines = 0, submits = 0, uploads = 0, clears = 0, copies = 0, dispatches = 0, pipelineFails = 0; };
 Stats& GetStats();
 // Read back a texture subresource into `out` (tightly packed texels of the GPU format). For tests and captures.
 bool ReadbackTexture(TextureImpl* t, uint32_t level, uint32_t layer, std::vector<uint8_t>* out, uint32_t* w, uint32_t* h);

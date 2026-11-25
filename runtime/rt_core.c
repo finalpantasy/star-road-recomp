@@ -1,6 +1,8 @@
 /* Star Road Recomp runtime core (task-5): log, dispatch tables, indirect calls, fatal paths, crash handler.
  * Our own code. */
 #include "rt_internal.h"
+#include "eh/eh.h"
+#include "gc/gc.h"
 
 uint32_t *g_fn[RT_NMOD];
 int g_trace;
@@ -185,8 +187,9 @@ static void miss_dump(void) {
 }
 
 /* ------------------------------------------------------------------ calls */
+__thread int g_rt_pure;   /* debug aid (rt_diffcall): while set, guest calls skip lifted code and run in the interpreter */
 void rt_icall(Ctx *c, uint64_t t) {
-    GuestFn f = rt_lookup(t);
+    GuestFn f = g_rt_pure ? 0 : rt_lookup(t);
     c->pc = t;                        /* HLE thunks identify their slot from c->pc */
     if (f) { f(c); return; }
     if ((t >> 32) != 0x71 || ((t >> 28) & 0xF) >= RT_NMOD) {
@@ -194,12 +197,16 @@ void rt_icall(Ctx *c, uint64_t t) {
         return;
     }
     miss_note(t, c->x[30]);
+    if (g_trace && getenv("SMRPG_MISSREGS"))
+        rt_log("  miss regs: pc=%#llx x0=%#llx x19=%#llx x20=%#llx x23=%#llx x29=%#llx x30=%#llx sp=%#llx", (unsigned long long)t, (unsigned long long)c->x[0],
+               (unsigned long long)c->x[19], (unsigned long long)c->x[20], (unsigned long long)c->x[23], (unsigned long long)c->x[29], (unsigned long long)c->x[30],
+               (unsigned long long)c->x[31]);
     interp_run(c, t);
 }
 
 void rt_dispatch(Ctx *c) { rt_icall(c, c->pc); }
 
-void rt_poll(Ctx *c) { (void)c; }
+void rt_poll(Ctx *c) { gc_poll(c); }
 
 void rt_call_guest(Ctx *c, uint64_t addr) {
     c->x[30] = RT_SENTINEL;
@@ -236,12 +243,32 @@ static void dump_ctx(const Ctx *c) {
     if (m) rt_log("  lr is %s+%#llx", m->name, (unsigned long long)(c->x[30] - m->base));
     m = ld_module_of(c->pc);
     if (m) rt_log("  pc is %s+%#llx", m->name, (unsigned long long)(c->pc - m->base));
+    /* guest call chain through the frame pointers (the sdk and il2cpp keep them), as module+offset */
+    char bt[900]; int n = 0;
+    uint64_t fp = c->x[29];
+    for (int i = 0; i < 16 && fp > 0x10000 && !(fp & 7) && n < (int)sizeof bt - 40; i++) {
+        if (IsBadReadPtr((const void *)fp, 16)) break;
+        uint64_t lr = ((const uint64_t *)fp)[1];
+        const Module *lm = ld_module_of(lr);
+        n += snprintf(bt + n, sizeof bt - n, " %s+%#llx", lm ? lm->name : "?", (unsigned long long)(lm ? lr - lm->base : lr));
+        fp = ((const uint64_t *)fp)[0];
+    }
+    if (n) rt_log("  guest frames:%s", bt);
 }
 
 void rt_fatal(Ctx *c, const char *what, uint64_t arg) {
     if (InterlockedExchange(&g_dying, 1)) { Sleep(INFINITE); }
     rt_log("FATAL: %s (%#llx)", what, (unsigned long long)arg);
     if (c) dump_ctx(c);
+    {   /* debug aid: SMRPG_DUMPADDR=<hex addr>[,<hex addr>...] dumps 0x60 bytes of guest memory at a fatal error */
+        const char *d = getenv("SMRPG_DUMPADDR");
+        while (d && *d) {
+            char *e; uint64_t da = strtoull(d, &e, 16);
+            if (e == d) break;
+            for (int i = 0; i < 0x60; i += 8) rt_log("  dump %#llx = %#llx", (unsigned long long)(da + i), (unsigned long long)*(uint64_t *)(da + i));
+            d = (*e == ',') ? e + 1 : e;
+        }
+    }
     rt_ring_dump();
     rt_exit(3, what);
 }
@@ -268,7 +295,8 @@ static LONG WINAPI rt_veh(EXCEPTION_POINTERS *ep) {
     }
     if (InterlockedExchange(&g_dying, 1)) { Sleep(INFINITE); }
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    rt_log("HOST CRASH: code=%#lx host rip=%p fault addr=%#llx (%s)", (unsigned long)code, er->ExceptionAddress,
+    rt_log("HOST CRASH: code=%#lx host rip=%p (image+%#llx) fault addr=%#llx (%s)", (unsigned long)code, er->ExceptionAddress,
+           (unsigned long long)((uintptr_t)er->ExceptionAddress - (uintptr_t)GetModuleHandleA(NULL)),
            (unsigned long long)(er->NumberParameters > 1 ? er->ExceptionInformation[1] : 0),
            er->NumberParameters > 1 ? (er->ExceptionInformation[0] == 0 ? "read" : er->ExceptionInformation[0] == 1 ? "write" : "exec") : "n/a");
     rt_log("  host rsp=%#llx rbp=%#llx", (unsigned long long)ep->ContextRecord->Rsp, (unsigned long long)ep->ContextRecord->Rbp);
@@ -284,6 +312,8 @@ static volatile LONG g_summarized;
 
 void rt_summary(void) {
     if (InterlockedExchange(&g_summarized, 1)) return;
+    eh_summary();
+    gc_summary();
     rt_log("---- svc usage (number, name, count) ----");
     for (int i = 0; i < 0x100; i++)
         if (g_svc_count[i]) rt_log("  svc 0x%02x %-28s x%lld", i, svc_name((uint32_t)i), (long long)g_svc_count[i]);
@@ -298,6 +328,7 @@ void rt_summary(void) {
         }
     }
     rt_log("  %d symbols called of %d slots", used, nh);
+    { extern void hle_ipc_summary(void); hle_ipc_summary(); }
     miss_dump();
 }
 
@@ -314,4 +345,19 @@ void rt_boot_reached(const char *what, const char *detail) {
     rt_log("BOOT REACHED: %s %s", what, detail ? detail : "");
     rt_log("========================================================================");
     if (!g_continue) rt_exit(0, "first nn service request reached");
+}
+
+/* Debug aid for lifter bisecting: after a lifted call returned (c), replay the same call in the interpreter from the pre-call context and
+ * log any difference in x0/x1. Used by hand-edited generated C only; never called by normal builds. */
+void rt_diffcall(Ctx *c, const Ctx *pre, uint64_t addr, const char *tag) {
+    Ctx t = *pre;
+    g_rt_pure = 1;
+    interp_run(&t, addr);
+    g_rt_pure = 0;
+    if (t.x[0] != c->x[0] || t.x[1] != c->x[1] || t.x[31] != c->x[31])
+        rt_log("DIFF %s call %#llx args %#llx %#llx %#llx: lifted x0=%#llx x1=%#llx, interp x0=%#llx x1=%#llx", tag, (unsigned long long)addr,
+               (unsigned long long)pre->x[0], (unsigned long long)pre->x[1], (unsigned long long)pre->x[2], (unsigned long long)c->x[0],
+               (unsigned long long)c->x[1], (unsigned long long)t.x[0], (unsigned long long)t.x[1]);
+    else rt_log("same %s call %#llx args %#llx %#llx %#llx -> x0=%#llx x1=%#llx", tag, (unsigned long long)addr, (unsigned long long)pre->x[0],
+                (unsigned long long)pre->x[1], (unsigned long long)pre->x[2], (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
 }

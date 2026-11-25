@@ -147,7 +147,7 @@ op("mrs", "rt:Wx sysreg! +fR",
    "case SYS_NZCV: _r = ((u64)FL[0] << 31) | ((u64)FL[1] << 30) | ((u64)FL[2] << 29) | ((u64)FL[3] << 28); break; "
    "case SYS_FPCR: _r = c->fpcr; break; case SYS_FPSR: _r = c->fpsr; break; "
    "case SYS_TPIDR_EL0: _r = c->tpidr_el0; break; case SYS_TPIDRRO_EL0: _r = c->tpidrro_el0; break; "
-   "case SYS_CNTFRQ: _r = 19200000; break; case SYS_CNTVCT: _r = rt_cntvct(); break; "
+   "case SYS_CNTFRQ: _r = 19200000; break; case SYS_CNTVCT: case 0xDF01: _r = rt_cntvct(); break; "
    "case SYS_DCZID: _r = 4; break; case SYS_CTR: _r = 0x8444C004ull; break; default: rt_fatal(c, \"mrs\", sysreg); } WX(rt, _r); }")
 op("msr", "rt:Rx sysreg! +fR +fW",
    "{ u64 _v = RX(rt); switch (sysreg) { "

@@ -37,5 +37,6 @@ None yet.
 - Big outputs (extraction, generated C, build trees) go on A:, never in this repo.
 - No automatic hooks, installs, downloads, external writes, commits or pushes without the owner's yes for that action.
 - Never open a visible game window on the owner's desktop; run windowed tests hidden.
+- Every background, headless or hidden run is muted (the owner, 2026-11-24): SDL builds set `SDL_AUDIO_DRIVER=dummy` (SDL3) and `SDL_AUDIODRIVER=dummy` (SDL2); our runtime's audout uses a null sink unless `--audio` is passed.
 - No em dashes in any file, comment, commit message or user update.
 - Follow docs/ART_DIRECTION.md: upgrades must keep the original look; technical PASS does not approve appearance or feel.

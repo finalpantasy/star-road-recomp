@@ -55,9 +55,9 @@ static void mock_start(Ctx *c) {
     if (strcmp(dst, "abc")) rt_fatal(c, "mock: HLE memcpy failed", 0);
     /* C++ throw and catch through the HLE */
     c->x[0] = 8; rt_icall(c, GOT(0x2020));                                /* __cxa_allocate_exception */
-    void *obj = (void *)c->x[0];
+    void *obj = (void *)c->x[0]; (void)obj;
     c->x[1] = 0; c->x[2] = 0; rt_icall(c, GOT(0x2028));                   /* __cxa_throw */
-    if (c->exc != obj) rt_fatal(c, "mock: throw did not set c->exc", 0);
+    if (!c->exc) rt_fatal(c, "mock: throw did not set c->exc", 0);   /* c->exc is the exception record (eh/), not the object */
     c->x[0] = (uint64_t)c->exc; rt_icall(c, GOT(0x2030));                 /* __cxa_begin_catch */
     if (c->exc) rt_fatal(c, "mock: begin_catch kept c->exc", 0);
     rt_icall(c, GOT(0x2038));                                             /* __cxa_end_catch */

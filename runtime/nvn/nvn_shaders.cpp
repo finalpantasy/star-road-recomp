@@ -1,4 +1,5 @@
 // Star Road Recomp: NVN shader cache reader (task-12), consumer of docs/SHADER_CACHE.md v1. Our own code (D-008).
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -122,31 +123,65 @@ void ReadLoc(const J* h, int* cbuf, uint32_t* off) {
   *cbuf = -1; *off = 0;
   if (h && h->t == J::Obj) { *cbuf = h->geti("cbuf", -1); *off = (uint32_t)h->geti("offset", 0); }
 }
+int ResFromStr(const std::string& s) {
+  static const char* n[] = {"", "uniform_buffer", "combined_image_sampler", "sampled_image", "sampler", "uniform_texel_buffer", "storage_image", "storage_texel_buffer", "storage_buffer"};
+  for (int i = 1; i < 9; i++) if (s == n[i]) return i;
+  return RES_DEFAULT;
+}
+int SourceFromManifest(const std::string& src, int cbuf, int nvnIndex) {
+  if (src == "nvn") return UBO_NVN;
+  if (src == "driver_c0") return UBO_DRIVER_C0;
+  if (src == "handles_c2") return UBO_HANDLES_C2;
+  if (src == "program_constants") return UBO_PROGRAM_CONSTANTS;
+  if (nvnIndex >= 0) return UBO_NVN;                       // v1 manifest: classify by constant buffer slot
+  return cbuf == 0 ? UBO_DRIVER_C0 : cbuf == 2 ? UBO_HANDLES_C2 : cbuf == 1 ? UBO_PROGRAM_CONSTANTS : UBO_NVN;
+}
+int TypeFromStr(const std::string& s) { return s == "int" ? 1 : s == "uint" ? 2 : 0; }
 bool ParseManifest(const J& j, Manifest& m) {
   m.key = j.gets("key"); m.stage = StageFromStr(j.gets("stage"));
   if (auto* s = j.get("sets")) m.set = (uint32_t)s->geti("set", 0);
-  if (auto* a = j.get("ubos")) for (auto& u : a->a) m.ubos.push_back({(uint32_t)u.geti("binding"), u.geti("cbuf"), u.geti("nvn_index", -1), (uint32_t)u.geti("size")});
+  if (auto* a = j.get("ubos")) for (auto& u : a->a) {
+    ManifestUbo x{(uint32_t)u.geti("binding"), u.geti("cbuf"), u.geti("nvn_index", -1), (uint32_t)u.geti("size")};
+    x.source = SourceFromManifest(u.gets("source"), x.cbuf, x.nvnIndex);
+    if (x.source == UBO_PROGRAM_CONSTANTS) m.constFile = u.gets("file");
+    m.ubos.push_back(x);
+  }
   if (auto* a = j.get("textures")) for (auto& t : a->a) {
     ManifestTex x{}; x.binding = (uint32_t)t.geti("binding"); x.dim = DimFromStr(t.gets("dim")); x.shadow = t.getb("shadow");
     x.arrayLen = (uint32_t)t.geti("array_len", 1); ReadLoc(t.get("handle"), &x.hCbuf, &x.hOff);
     auto* sh = t.get("sampler_handle"); x.hasSampler = sh && sh->t == J::Obj; if (x.hasSampler) ReadLoc(sh, &x.sCbuf, &x.sOff);
     auto* nv = t.get("nvn"); x.kind = 0; x.index = 0; x.samplerIndex = 0;
     if (nv) { std::string k = nv->gets("kind"); x.kind = k == "combined" ? 0 : k == "separate" ? 1 : 2; x.index = nv->geti("index"); x.samplerIndex = nv->geti("sampler_index"); }
+    x.res = ResFromStr(t.gets("vk_type")); x.multisample = t.getb("multisample");
     m.texs.push_back(x);
   }
   if (auto* a = j.get("images")) for (auto& t : a->a) {
     ManifestImg x{}; x.binding = (uint32_t)t.geti("binding"); x.dim = DimFromStr(t.gets("dim")); ReadLoc(t.get("handle"), &x.hCbuf, &x.hOff);
-    if (auto* nv = t.get("nvn")) x.index = nv->geti("index"); m.imgs.push_back(x);
+    if (auto* nv = t.get("nvn")) x.index = nv->geti("index");
+    x.res = ResFromStr(t.gets("vk_type")); m.imgs.push_back(x);
   }
   if (auto* a = j.get("ssbos")) for (auto& t : a->a) {
-    ManifestSsbo x{}; x.binding = (uint32_t)t.geti("binding"); x.nvnIndex = t.geti("nvn_index", -1);
-    int cb; uint32_t off; ReadLoc(t.get("desc"), &cb, &off); x.descOff = off; m.ssbos.push_back(x);
+    ManifestSsbo x{}; x.binding = (uint32_t)t.geti("binding"); x.nvnIndex = t.geti("nvn_index", -1); x.write = t.getb("write");
+    int cb; uint32_t off; ReadLoc(t.get("desc"), &cb, &off); x.descOff = off;
+    if (x.nvnIndex < 0 && off >= 0x110) x.nvnIndex = (int)((off - 0x110) / 16);     // desc.offset is bytes into c[0]
+    m.ssbos.push_back(x);
   }
-  if (auto* a = j.get("inputs")) for (auto& t : a->a) m.inputs.push_back({(uint32_t)t.geti("location"), (uint32_t)t.geti("attr")});
+  if (auto* a = j.get("inputs")) for (auto& t : a->a) {
+    uint32_t loc = (uint32_t)t.geti("location");
+    ManifestInput x{loc, (uint32_t)t.geti("attr", (int)loc)};      // reuse-v1 fragment inputs carry no `attr`: generic attribute i is location i
+    x.type = TypeFromStr(t.gets("type")); m.inputs.push_back(x);
+  }
   if (auto* a = j.get("outputs")) for (auto& t : a->a) m.outLocs.push_back((uint32_t)t.geti("location"));
-  if (auto* f = j.get("frag")) m.rtMask = (uint32_t)f->geti("rt_mask", 1);
+  if (auto* f = j.get("frag")) { m.rtMask = (uint32_t)f->geti("rt_mask", 1); m.writesDepth = f->getb("writes_depth"); }
   if (auto* a = j.get("local_size")) for (size_t i = 0; i < 3 && i < a->a.size(); i++) m.localSize[i] = (uint32_t)a->a[i].n;
   if (auto* r = j.get("requires")) m.subgroup32 = r->getb("subgroup_size_32");
+  if (auto* sbuf = j.get("support_buffer")) if (sbuf->t == J::Obj) { m.supportBinding = sbuf->geti("binding", 0); m.supportSize = (uint32_t)sbuf->geti("size", 1600); }
+  if (auto* a = j.get("capabilities")) for (auto& c : a->a) m.caps.push_back((uint32_t)c.n);
+  if (auto* a = j.get("extensions")) for (auto& c : a->a) m.exts.push_back(c.s);
+  if (auto* a = j.get("builtins_in")) for (auto& c : a->a) m.builtinsIn.push_back(c.s);
+  if (auto* a = j.get("builtins_out")) for (auto& c : a->a) m.builtinsOut.push_back(c.s);
+  m.needsLayerOrVp = std::find(m.builtinsOut.begin(), m.builtinsOut.end(), "layer") != m.builtinsOut.end() ||
+                     std::find(m.builtinsOut.begin(), m.builtinsOut.end(), "viewport_index") != m.builtinsOut.end();
   return !m.key.empty();
 }
 }  // namespace
@@ -156,11 +191,25 @@ namespace {
 struct IndexEnt { int stage; bool ok; std::string reason, spv, meta; };
 std::string g_root;
 std::unordered_map<std::string, IndexEnt> g_index;
+std::vector<std::string> g_order;               // index.jsonl order
 std::unordered_map<std::string, std::unique_ptr<StageProgram>> g_loaded;
+
+// Program constants (c[1]): one 64 KiB zero padded slot per stage program that is drawn, carved out of 16 MiB host visible chunks.
+struct ConstChunk { Buf buf; VkDeviceSize used = 0; };
+std::vector<ConstChunk> g_constChunks;
+constexpr VkDeviceSize kConstSlot = 64 * 1024, kConstChunkSize = 16u << 20;
 }  // namespace
 
+const std::string& ShaderCacheRoot() { return g_root; }
+size_t ShaderCacheIndexSize() { return g_order.size(); }
+bool ShaderCacheIndexAt(size_t i, std::string* key, int* stage, bool* ok) {
+  if (i >= g_order.size()) return false;
+  const IndexEnt& e = g_index[g_order[i]];
+  *key = g_order[i]; *stage = e.stage; *ok = e.ok; return true;
+}
+
 bool ShaderCacheLoad(const std::string& root) {
-  g_root = root; g_index.clear();
+  g_root = root; g_index.clear(); g_order.clear();
   std::string txt = ReadFile(root + "/index.jsonl");
   if (txt.empty()) { Err("shader cache: %s/index.jsonl not found", root.c_str()); return false; }
   std::istringstream is(txt); std::string line; int ok = 0, bad = 0;
@@ -169,7 +218,9 @@ bool ShaderCacheLoad(const std::string& root) {
     J j; if (!ParseJson(line, j) || j.t != J::Obj) continue;
     IndexEnt e; e.stage = StageFromStr(j.gets("stage")); e.ok = j.gets("status") == "ok"; e.reason = j.gets("reason");
     e.spv = j.gets("spv"); e.meta = j.gets("meta");
-    g_index[j.gets("key")] = e; e.ok ? ok++ : bad++;
+    std::string key = j.gets("key");
+    if (!g_index.count(key)) g_order.push_back(key);
+    g_index[key] = e; e.ok ? ok++ : bad++;
   }
   Log("shader cache: %d ok, %d failed (%s)", ok, bad, root.c_str());
   return true;
@@ -181,44 +232,152 @@ void ShaderCacheAdd(const std::string& key, int stage, const std::vector<uint32_
   g_loaded[key] = std::move(sp);
 }
 
+// Tests: a program is keyed by the SHA-256 of its stage bytes in guest memory, which a test cannot choose. An alias makes the key of
+// made up stage bytes resolve to a real cache entry; the constants hook gives an added stage its c[1] bytes.
+static std::unordered_map<std::string, std::string> g_alias;
+void ShaderCacheAlias(const std::string& alias, const std::string& key) { g_alias[alias] = key; }
+void ShaderCacheSetConstants(const std::string& key, const std::vector<uint8_t>& bytes) {
+  auto it = g_loaded.find(key);
+  if (it != g_loaded.end()) it->second->consts = bytes;
+}
+
 // Destroy the Vulkan objects of every loaded stage (device teardown). The SPIR-V stays, so a new device rebuilds them on demand.
 void ShaderCacheReleaseVk() {
   for (auto& kv : g_loaded) {
     StageProgram* sp = kv.second.get();
     if (sp->module) g_vk.f.vkDestroyShaderModule(g_vk.dev, sp->module, nullptr);
     if (sp->setLayout) g_vk.f.vkDestroyDescriptorSetLayout(g_vk.dev, sp->setLayout, nullptr);
-    sp->module = VK_NULL_HANDLE; sp->setLayout = VK_NULL_HANDLE;
+    sp->module = VK_NULL_HANDLE; sp->setLayout = VK_NULL_HANDLE; sp->constBuf = VK_NULL_HANDLE; sp->constOff = 0;
+  }
+  for (auto& c : g_constChunks) DestroyBuf(&c.buf);
+  g_constChunks.clear();
+}
+
+void ShaderCacheDrop(const std::string& key) {
+  auto it = g_loaded.find(key);
+  if (it == g_loaded.end()) return;
+  StageProgram* sp = it->second.get();
+  if (sp->module) g_vk.f.vkDestroyShaderModule(g_vk.dev, sp->module, nullptr);
+  if (sp->setLayout) g_vk.f.vkDestroyDescriptorSetLayout(g_vk.dev, sp->setLayout, nullptr);
+  g_loaded.erase(it);
+}
+
+bool ShaderCacheConstants(StageProgram* sp, VkBuffer* buf, VkDeviceSize* off) {
+  std::lock_guard<std::recursive_mutex> lk(g_vk.lock);
+  if (!sp->constBuf) {
+    if (g_constChunks.empty() || g_constChunks.back().used + kConstSlot > kConstChunkSize) {
+      ConstChunk c;
+      if (!CreateBuf(&c.buf, kConstChunkSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, MemKind::HostVisible)) { Err("shader cache: cannot allocate the program constants buffer"); return false; }
+      g_constChunks.push_back(c);
+    }
+    ConstChunk& c = g_constChunks.back();
+    uint8_t* dst = (uint8_t*)c.buf.map + c.used;
+    memset(dst, 0, kConstSlot);
+    memcpy(dst, sp->consts.data(), std::min<size_t>(sp->consts.size(), kConstSlot));
+    sp->constBuf = c.buf.buf; sp->constOff = c.used; c.used += kConstSlot;
+  }
+  *buf = sp->constBuf; *off = sp->constOff; return true;
+}
+
+// ---- device check -------------------------------------------------------------------------------------------------
+// SPIR-V capability numbers the cache emits, and what the device must offer for each (Vulkan 1.3 core feature names).
+static bool CapSupported(uint32_t cap, int stage, std::string* why) {
+  const auto& f = g_vk.feat.features;
+  auto need = [&](bool ok, const char* what) { if (!ok) *why = what; return ok; };
+  static const VkShaderStageFlags stageBits[6] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+                                                  VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
+  switch (cap) {
+    case 0: case 1: return true;                                    // Matrix, Shader
+    case 2: return need(f.geometryShader, "geometryShader");
+    case 3: return need(f.tessellationShader, "tessellationShader");
+    case 9: return need(g_vk.f12.shaderFloat16, "shaderFloat16");
+    case 10: return need(f.shaderFloat64, "shaderFloat64");
+    case 11: return need(f.shaderInt64, "shaderInt64");
+    case 22: return need(f.shaderInt16, "shaderInt16");
+    case 23: case 24: return need(f.shaderTessellationAndGeometryPointSize, "shaderTessellationAndGeometryPointSize");
+    case 25: return need(f.shaderImageGatherExtended, "shaderImageGatherExtended");
+    case 27: case 48: return need(f.shaderStorageImageMultisample, "shaderStorageImageMultisample");
+    case 28: return need(f.shaderUniformBufferArrayDynamicIndexing, "shaderUniformBufferArrayDynamicIndexing");
+    case 29: return need(f.shaderSampledImageArrayDynamicIndexing, "shaderSampledImageArrayDynamicIndexing");
+    case 30: return need(f.shaderStorageBufferArrayDynamicIndexing, "shaderStorageBufferArrayDynamicIndexing");
+    case 31: return need(f.shaderStorageImageArrayDynamicIndexing, "shaderStorageImageArrayDynamicIndexing");
+    case 32: return need(f.shaderClipDistance, "shaderClipDistance");
+    case 33: return need(f.shaderCullDistance, "shaderCullDistance");
+    case 34: case 45: return need(f.imageCubeArray, "imageCubeArray");
+    case 35: case 52: return need(f.sampleRateShading, "sampleRateShading");
+    case 43: case 44: case 46: case 47: case 49: case 50: case 51: return true;   // 1D, buffer images, extended formats, image query, derivative control: core
+    case 55: return need(f.shaderStorageImageReadWithoutFormat, "shaderStorageImageReadWithoutFormat");
+    case 56: return need(f.shaderStorageImageWriteWithoutFormat, "shaderStorageImageWriteWithoutFormat");
+    case 57: return need(f.multiViewport, "multiViewport");
+    case 61: case 62: case 63: case 64: case 65: case 66: case 67: case 68: {   // GroupNonUniform*: subgroup operation bits
+      uint32_t bit = 1u << (cap - 61);
+      if (!need((g_vk.p11.subgroupSupportedOperations & bit) != 0, "subgroup operation")) return false;
+      return need(stage >= 0 && stage < 6 && (g_vk.p11.subgroupSupportedStages & stageBits[stage]) != 0, "subgroup operations in this shader stage");
+    }
+    case 4427: return need(g_vk.f11.shaderDrawParameters, "shaderDrawParameters");
+    case 5254: return need(g_vk.f12.shaderOutputViewportIndex && g_vk.f12.shaderOutputLayer, "shaderOutputViewportIndex and shaderOutputLayer");
+    default: { char b[48]; snprintf(b, sizeof b, "unknown SPIR-V capability %u", cap); *why = b; return false; }
   }
 }
 
-StageProgram* ShaderCacheGet(const std::string& key) {
+bool ShaderCacheCheckDevice(StageProgram* sp) {
+  if (sp->supportChecked || !sp->ok) return sp->ok;
+  sp->supportChecked = true;
+  std::string why;
+  for (uint32_t c : sp->man.caps) {
+    if (!CapSupported(c, sp->man.stage, &why)) { sp->ok = false; sp->reason = "device lacks " + why + " (capability " + std::to_string(c) + ")"; break; }
+  }
+  if (sp->ok) for (auto& e : sp->man.exts) {
+    if (e == "SPV_EXT_shader_viewport_index_layer") { if (!(g_vk.f12.shaderOutputViewportIndex && g_vk.f12.shaderOutputLayer)) { sp->ok = false; sp->reason = "device lacks shaderOutputViewportIndex/shaderOutputLayer (" + e + ")"; break; } }
+    else if (e.compare(0, 4, "SPV_") != 0) { sp->ok = false; sp->reason = "unknown SPIR-V extension " + e; break; }
+    else LogOnce(("spvext" + e).c_str(), "shader cache: SPIR-V extension %s is not checked against the device", e.c_str());
+  }
+  if (sp->ok) {
+    for (auto& t : sp->man.texs) if (t.res == RES_UNIFORM_TEXEL_BUFFER || t.res == RES_STORAGE_TEXEL_BUFFER || t.dim == 6) { sp->ok = false; sp->reason = "uses texel buffers (not supported)"; break; }
+    for (auto& i : sp->man.imgs) if (i.res == RES_STORAGE_TEXEL_BUFFER || i.dim == 6) { sp->ok = false; sp->reason = "uses texel buffer images (not supported)"; break; }
+  }
+  if (sp->ok && sp->man.subgroup32 && g_vk.p11.subgroupSize != 32 && !(g_vk.f13.subgroupSizeControl && g_vk.p13.minSubgroupSize <= 32 && g_vk.p13.maxSubgroupSize >= 32))
+    LogOnce("sg32", "shader cache: the device subgroup size is %u and cannot be forced to 32; lane based shader math may differ", g_vk.p11.subgroupSize);
+  if (!sp->ok) LogOnce(sp->key.c_str(), "shader %s: %s (draws using it are skipped)", sp->key.c_str(), sp->reason.c_str());
+  return sp->ok;
+}
+
+StageProgram* ShaderCacheGet(const std::string& keyIn) {
+  auto al = g_alias.find(keyIn);
+  const std::string& key = al != g_alias.end() ? al->second : keyIn;
   auto it = g_loaded.find(key);
   if (it != g_loaded.end()) return it->second.get();
   auto ix = g_index.find(key);
   auto sp = std::make_unique<StageProgram>();
   sp->key = key;
+  auto loadConsts = [&]() {
+    if (sp->man.constFile.empty()) return;
+    std::string c = ReadFile(g_root + "/" + sp->man.constFile);
+    if (c.empty() || c.size() > 64 * 1024) { sp->ok = false; sp->reason = "program constants file missing or unreadable: " + sp->man.constFile; return; }
+    sp->consts.assign(c.begin(), c.end());
+  };
   if (ix == g_index.end()) {
     // hand written replacement
     std::string rp = g_root + "/replace/" + key;
     std::string spvb = ReadFile(rp + ".spv"), mj = ReadFile(rp + ".json");
     if (!g_root.empty() && !spvb.empty() && !mj.empty()) {
       J j; if (ParseJson(mj, j) && ParseManifest(j, sp->man)) {
-        sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true;
+        sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true; loadConsts();
       }
     }
-    if (!sp->ok) sp->reason = "not in shader cache";
+    if (!sp->ok && sp->reason.empty()) sp->reason = "not in shader cache";
   } else if (!ix->second.ok) {
     std::string rp = g_root + "/replace/" + key;
     std::string spvb = ReadFile(rp + ".spv"), mj = ReadFile(rp + ".json");
     J j;
     if (!spvb.empty() && !mj.empty() && ParseJson(mj, j) && ParseManifest(j, sp->man)) {
-      sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true;
+      sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true; loadConsts();
     } else sp->reason = "translation failed: " + ix->second.reason;
   } else {
     std::string spvb = ReadFile(g_root + "/" + ix->second.spv), mj = ReadFile(g_root + "/" + ix->second.meta);
     J j;
     if (spvb.size() >= 20 && ParseJson(mj, j) && ParseManifest(j, sp->man)) {
-      sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true;
+      sp->spv.resize(spvb.size() / 4); memcpy(sp->spv.data(), spvb.data(), sp->spv.size() * 4); sp->ok = true; loadConsts();
     } else sp->reason = "cache files missing or unreadable";
     sp->man.stage = ix->second.stage;
   }

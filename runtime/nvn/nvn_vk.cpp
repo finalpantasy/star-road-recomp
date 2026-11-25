@@ -27,6 +27,12 @@ static void SetErr(const char* fmt, ...) {
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugCb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT,
                                               const VkDebugUtilsMessengerCallbackDataEXT* d, void*) {
+  if (sev & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)) {
+    std::lock_guard<std::mutex> lk(g_vk.valLock);
+    auto& t = g_vk.valById[d->pMessageIdName ? d->pMessageIdName : "(no id)"];
+    if (t.count++ == 0) t.first = d->pMessage ? d->pMessage : "";
+    if (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) t.error = true;
+  }
   if (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
     if (g_vk.valErrors++ == 0) g_vk.firstValError = d->pMessage ? d->pMessage : "";
     Err("VALIDATION ERROR: %s", d->pMessage ? d->pMessage : "");
@@ -129,6 +135,7 @@ bool VkBringUp(const VkInitOptions& opt) {
   want(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, &g_vk.hasCustomBorder);
 
   // features: enable every supported core feature except robustness
+  g_vk.f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
   g_vk.f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   g_vk.f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
   g_vk.depthClip.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT;
@@ -138,6 +145,7 @@ bool VkBringUp(const VkInitOptions& opt) {
   g_vk.feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   void** tail = &g_vk.feat.pNext;
   auto chain = [&](void* s) { *tail = s; tail = (void**)&((VkBaseOutStructure*)s)->pNext; *tail = nullptr; };
+  chain(&g_vk.f11);
   chain(&g_vk.f12);
   chain(&g_vk.f13);
   if (g_vk.hasDepthClipControl) chain(&g_vk.depthClip);
@@ -154,11 +162,14 @@ bool VkBringUp(const VkInitOptions& opt) {
   g_vk.hasMinMax = g_vk.f12.samplerFilterMinmax != 0;
 
   VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
-  if (g_vk.hasHostImport) {
+  {
+    g_vk.p11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
+    g_vk.p13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES;
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    p2.pNext = &hp;
+    p2.pNext = &g_vk.p11; g_vk.p11.pNext = &g_vk.p13; g_vk.p13.pNext = g_vk.hasHostImport ? (void*)&hp : nullptr;
     g_vk.f.vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
-    g_vk.hostAlign = hp.minImportedHostPointerAlignment;
+    g_vk.p11.pNext = nullptr; g_vk.p13.pNext = nullptr;
+    if (g_vk.hasHostImport) g_vk.hostAlign = hp.minImportedHostPointerAlignment;
   }
 
   uint32_t nq = 0;

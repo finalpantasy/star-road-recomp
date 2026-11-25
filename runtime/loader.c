@@ -176,7 +176,8 @@ static uint64_t resolve(int mi, uint32_t si, int verbose) {
     if (!nm[0] || s->name_off == 0) return 0;
     if (s->defined && s->bind == 0) return m->base + s->value;    /* STB_LOCAL */
     const HleDef *h = hle_find(nm);
-    if (h && (h->flags & HLE_F_OVERRIDE)) { m->n_hle++; return hle_slot(nm, SLOT_HLE, h->fn, 0)->addr; }
+    /* the sdk carries the console's real NVN driver (it talks to nvdrv), so our NVN layer must win over the sdk's own export */
+    if (h && (!strcmp(nm, "nvnBootstrapLoader") || (h->flags & HLE_F_OVERRIDE))) { m->n_hle++; return hle_slot(nm, SLOT_HLE, h->fn, 0)->addr; }
     const Exp *e = exp_find(nm);
     if (e) {
         if (mi == 0 && e->mod != 0 && e->type == 2 && hle_is_nn_service(nm)) {
@@ -220,6 +221,24 @@ static void relocate(int mi) {
     free(done);
 }
 
+/* On the console the system loader (rtld) fills a few .bss pointers the sdk's nn::ro code owns (the manual and auto load lists and the
+ * slots that hold the symbol lookup function pointers) before any module code runs; nn::ro::Initialize then stores through them. rtld is
+ * not loaded here, so point each one at its own zeroed cell, which is all the sdk needs while the game loads no NRO modules. */
+static void provide_rtld_vars(void) {
+    static const char *const names[] = {
+        "_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE", "_ZN2nn2ro6detail34g_pLookupGlobalAutoFunctionPointerE",
+        "_ZN2nn2ro6detail17g_pManualLoadListE", "_ZN2nn2ro6detail15g_pAutoLoadListE", "_ZN2nn2ro6detail14g_pRoDebugFlagE"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        const Exp *e = exp_find(names[i]);
+        if (!e || e->type != 1) continue;
+        uint64_t *slot = (uint64_t *)e->addr;
+        if (*slot) continue;
+        void *cell = VirtualAlloc(NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        *slot = (uint64_t)cell;
+        rt_log("rtld variable %s -> zeroed cell %p", names[i], cell);
+    }
+}
+
 char g_imgdir[512];
 
 int ld_load_all(const char *dir) {
@@ -235,5 +254,6 @@ int ld_load_all(const char *dir) {
     }
     rt_log("export table: %u global definitions (main %u, sdk %u, subsdk0 %u)", g_nexp, g_mod[0].n_defined, g_mod[1].n_defined, g_mod[2].n_defined);
     for (int i = 0; i < NMODULES; i++) relocate(i);
+    provide_rtld_vars();
     return 0;
 }

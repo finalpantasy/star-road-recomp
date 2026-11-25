@@ -16,14 +16,68 @@ nvn_unit: 2161 checks, 0 failed
 ```
 
 ## nvn_gpu (clear, textured quad, RGBA4, depth range, sync, copies, hidden window, validation)
-Result: PASS (exit 0, 2.7 s)
+Result: PASS (exit 0, 1.1 s)
 
 ```
-[nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=1 validation=1
+[nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=0 validation=1
 [nvn] device initialized on NVIDIA GeForce RTX 4090
-device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=on present=yes depthClipControl=1 4444=1 hostImport=1
+device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=on present=no depthClipControl=1 4444=1 hostImport=1
 depth mode NEAR_IS_ZERO: colors (255,0,0,255) (0,0,0,255) (0,0,0,255) (255,255,255,255)  depths 0.5000 1.0000 1.0000 0.2500
 depth mode NEAR_IS_MINUS_W: colors (255,0,0,255) (0,255,0,255) (0,0,0,255) (255,255,255,255)  depths 0.7500 0.2500 1.0000 0.6250
+window present: skipped (--no-present)
 validation: 0 errors, 0 warnings
-nvn_gpu: 75 checks, 0 failed
+nvn_gpu: 66 checks, 0 failed
+```
+
+## nvn_cache pipelines (support buffer and c[1] pixel check, 600 real variants built and drawn, validation on)
+Result: PASS (exit 0, 37.3 s)
+
+```
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
+The input variable is:
+  pointer to Input -> vec4 of float32
+The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding...
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
+The input variable is:
+  pointer to Input -> vec4 of float32
+The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding...
+variants: 600 sampled (6 with a geometry stage), 0 skipped (a stage failed the device check or did not translate), 0 incomplete
+variants: 600 draws recorded, replay executed 600 draws and skipped 0, built 600 pipelines, 0 pipeline failures
+variants: 647 stage programs use textures (437 shadow), 1206 have a support buffer, 639 have c[1] constants files, 2 write more than one target
+validation: 8 errors (8 known layer false positives), 0 warnings; by message id:
+  known VUID-RuntimeSpirv-OpEntryPoint-08743                       x2  # a fragment input the vertex shader does not write (61 pairs in the cache, undefined value)
+      first: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
+The input variable is:
+  pointer to Input -> vec4 of float32
+The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding...
+  known VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710    x6  # layer sums the gl_in and gl_out blocks of a geometry shader (each is 7 + 1 = 8)
+      first: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more th...
+nvn_cache: 1229 checks, 0 failed
+```
+
+## nvn_cache sweep (every stage program: capability check, shader module, descriptor set layout; vs/fs pairing)
+Result: PASS (exit 0, 16.8 s)
+
+```
+[nvn] shader cache: 25754 ok, 0 failed (A:/AI/Recomps/smrpg-work/shaders/cache/reuse-v1)
+cache A:/AI/Recomps/smrpg-work/shaders/cache/reuse-v1: 25754 index entries, 25754 ok, 0 failed in the index
+  stage vs       1304
+  stage fs       24446
+  stage gs       4
+static sample: 614 stage programs, 614 with SPIR-V magic, 614 with a support buffer, 583 with c[1] constants (583 loaded), 614 with capabilities, 614 with inputs
+[nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=0 validation=0
+[nvn] device initialized on NVIDIA GeForce RTX 4090
+device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=off subgroupSize=32
+sweep: 25754 stage programs: 25754 ready (module and set layout built), 0 rejected by the device check, 0 not loaded, 0 module or layout failures
+  ready vs       1304
+  ready fs       24446
+  ready gs       4
+pairing: 61 of 26766 distinct (vs, fs) pairs have fragment inputs the vertex shader does not write (61 locations in all); first: Universal Render Pipeline/Nature/SpeedTree7 Billboard vs 127139400b95 fs 42a79163f83c
+  61 pairs miss 1 location(s)
+validation: 0 errors (0 known layer false positives), 0 warnings; by message id:
+nvn_cache: 1203 checks, 0 failed
 ```

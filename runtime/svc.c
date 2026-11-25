@@ -2,6 +2,8 @@
  * Our own code. Small functions, real Horizon semantics for what boot needs; correctness under stress is
  * not a v0 goal (one global kernel lock and one condition variable). */
 #include "rt_internal.h"
+#include "hle/hle.h"
+#include "gc/gc.h"
 
 volatile LONG64 g_svc_count[0x100];
 volatile LONG g_first_service;
@@ -16,7 +18,7 @@ uint64_t g_main_thread_handle;
 #define SYSRES_SIZE    0x1000000ULL
 
 enum { KO_THREAD = 1, KO_EVENT, KO_SESSION, KO_TRANSFER, KO_SHMEM, KO_RESLIMIT };
-struct KObj { int type; int refs; int signaled; RtThread *thr; char name[24]; uint64_t addr, size; };
+struct KObj { int type; int refs; int signaled; RtThread *thr; char name[24]; uint64_t addr, size; void *user; void *mem; uint64_t mapped; };
 typedef struct { KObj *obj; int role; } HEnt;   /* role: events 0 = writable, 1 = readable */
 static HEnt g_h[4096];
 static uint32_t g_hgen = 1;
@@ -56,6 +58,8 @@ static RtThread *thread_of(Ctx *c, uint32_t h) {
 
 /* ---- thread id map (host thread id -> RtThread) is carried in Ctx::thr ---- */
 static volatile LONG g_tid_next = 0x10;
+static RtThread *g_tlist[1024];
+static volatile LONG g_tcount;
 
 static RtThread *thread_new(const char *name) {
     RtThread *t = calloc(1, sizeof *t);
@@ -65,7 +69,14 @@ static RtThread *thread_new(const char *name) {
     t->obj = kobj_new(KO_THREAD, name);
     t->obj->thr = t;
     t->handle = h_new(t->obj, 0);
+    LONG slot = InterlockedIncrement(&g_tcount) - 1;     /* registry for hle/hle_thread.c (enumeration, suspend) */
+    if (slot < 1024) g_tlist[slot] = t;
     return t;
+}
+int svc_thread_registry(RtThread **out, int max) {
+    int n = (int)g_tcount < 1024 ? (int)g_tcount : 1024;
+    for (int i = 0; i < n && i < max; i++) out[i] = g_tlist[i];
+    return n;
 }
 
 Ctx *rt_ctx_new(RtThread *t) {
@@ -106,8 +117,8 @@ static const char *g_svc_names[0x80] = {
     [0x2D] = "UnmapPhysicalMemory", [0x2F] = "GetLastThreadInfo", [0x30] = "GetResourceLimitLimitValue", [0x31] = "GetResourceLimitCurrentValue",
     [0x32] = "SetThreadActivity", [0x33] = "GetThreadContext3", [0x34] = "WaitForAddress", [0x35] = "SignalToAddress", [0x36] = "SynchronizePreemptionState",
     [0x37] = "GetResourceLimitPeakValue", [0x40] = "CreateSession", [0x41] = "AcceptSession", [0x43] = "ReplyAndReceive", [0x44] = "ReplyAndReceiveWithUserBuffer",
-    [0x45] = "CreateEvent", [0x48] = "MapPhysicalMemoryUnsafe", [0x49] = "UnmapPhysicalMemoryUnsafe", [0x4B] = "SetUnsafeLimit", [0x50] = "CreateCodeMemory",
-    [0x51] = "ControlCodeMemory", [0x52] = "SleepSystem", [0x70] = "CreatePort", [0x72] = "ConnectToPort",
+    [0x45] = "CreateEvent", [0x48] = "MapPhysicalMemoryUnsafe", [0x49] = "UnmapPhysicalMemoryUnsafe", [0x4A] = "SetUnsafeLimit", [0x4B] = "CreateCodeMemory",
+    [0x4C] = "ControlCodeMemory", [0x4D] = "SleepSystem", [0x50] = "CreateSharedMemory", [0x51] = "MapTransferMemory", [0x52] = "UnmapTransferMemory", [0x70] = "CreatePort", [0x72] = "ConnectToPort",
 };
 const char *svc_name(uint32_t imm) { return imm < 0x80 && g_svc_names[imm] ? g_svc_names[imm] : "?"; }
 
@@ -135,11 +146,28 @@ static void svc_set_memory_permission(Ctx *c) {
 
 static void svc_set_memory_attribute(Ctx *c) { c->x[0] = 0; }
 
+/* Commit exactly [addr, addr+sz) at a page aligned guest address that is not inside the pre-reserved regions. Windows reserves in 64 KB
+ * blocks and a MEM_RESERVE|MEM_COMMIT at an unaligned address commits the whole rounded block, which would make the neighbors of the
+ * mapping look mapped (the sdk checks its guard pages with QueryMemory). So reserve the covering blocks first, then commit only the pages. */
+static void *commit_exact(uint64_t addr, uint64_t sz) {
+    void *p = VirtualAlloc((void *)addr, sz, MEM_COMMIT, PAGE_READWRITE);
+    if (p) return p;
+    for (uint64_t b = addr & ~0xFFFFULL; b < addr + sz; b += 0x10000) VirtualAlloc((void *)b, 0x10000, MEM_RESERVE, PAGE_READWRITE);
+    /* separate 64 KiB reservations: a single commit may not span allocation bases, so commit block by block */
+    for (uint64_t a = addr; a < addr + sz;) {
+        uint64_t e = (a & ~0xFFFFULL) + 0x10000;
+        if (e > addr + sz) e = addr + sz;
+        if (!VirtualAlloc((void *)a, e - a, MEM_COMMIT, PAGE_READWRITE)) return NULL;
+        a = e;
+    }
+    return (void *)addr;
+}
+
 static void svc_map_memory(Ctx *c) {
     uint64_t dst = c->x[0], src = c->x[1], sz = c->x[2];
     DWORD old;
     if ((dst | src | sz) & 0xFFF || !sz) { c->x[0] = RES_INVALID_ADDR; return; }
-    if (!VirtualAlloc((void *)dst, sz, MEM_COMMIT, PAGE_READWRITE) && !VirtualAlloc((void *)dst, sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) { c->x[0] = RES_INVALID_ADDR; return; }
+    if (!commit_exact(dst, sz)) { c->x[0] = RES_INVALID_ADDR; return; }
     memcpy((void *)dst, (void *)src, sz);                 /* copy semantics: see runtime-handover.md */
     VirtualProtect((void *)src, sz, PAGE_NOACCESS, &old);
     c->x[0] = 0;
@@ -175,7 +203,13 @@ static void svc_query_memory(Ctx *c) {
                 if (off >= lo) { base = m->base + lo; size = hi - lo; }
             } else if (addr >= GUEST_HEAPRGN_BASE && addr < GUEST_HEAPRGN_BASE + GUEST_HEAPRGN_SIZE) type = 5;
             else if (addr >= GUEST_ALIAS_BASE && addr < GUEST_ALIAS_BASE + GUEST_ALIAS_SIZE) type = 11;
-            else if (addr >= GUEST_STACK_BASE) type = 12;
+            else if (addr >= GUEST_STACK_BASE) {
+                type = 12;
+                /* the kernel reports the main thread's stack as one mapping; neighbors that Windows merges into the same region
+                 * (the next allocation) would make the sdk's stack info end short of the real sp */
+                const RtThread *mt = svc_main_thread();
+                if (mt && mt->stack_base && addr >= mt->stack_base && addr < mt->stack_base + (16u << 20)) { base = mt->stack_base; size = 16u << 20; }
+            }
         } else {
             type = 0; perm = 0;
             /* free: extend over the whole span of reserved or free pages with the same state */
@@ -188,6 +222,7 @@ static void svc_query_memory(Ctx *c) {
             size = end - base;
         }
     }
+    if (g_trace) rt_log("  QueryMemory(%#llx) -> base=%#llx size=%#llx type=%u perm=%u", (unsigned long long)addr, (unsigned long long)base, (unsigned long long)size, type, perm);
     uint64_t *o = (uint64_t *)out;
     o[0] = base; o[1] = size;
     ((uint32_t *)o)[4] = type; ((uint32_t *)o)[5] = 0; ((uint32_t *)o)[6] = perm; ((uint32_t *)o)[7] = 0; ((uint32_t *)o)[8] = 0; ((uint32_t *)o)[9] = 0;
@@ -195,8 +230,36 @@ static void svc_query_memory(Ctx *c) {
     c->x[1] = 0;   /* page info */
 }
 
-static void svc_map_shared(Ctx *c) { c->x[0] = h_get(c, (uint32_t)c->x[0]) ? 0 : RES_INVALID_HANDLE; }
-static void svc_unmap_shared(Ctx *c) { c->x[0] = h_get(c, (uint32_t)c->x[0]) ? 0 : RES_INVALID_HANDLE; }
+/* shared memory: the object owns a host backing buffer. svcMapSharedMemory commits the pages at the guest's chosen address and
+ * records it; the service writes through k_shmem_ptr (the first guest mapping if there is one). True aliasing would need
+ * placeholder regions (docs/RECOMPILER.md 4.1); until then there is one live copy. */
+static void svc_map_shared(Ctx *c) {
+    KObj *o = h_get(c, (uint32_t)c->x[0]);
+    uint64_t addr = c->x[1], sz = c->x[2];
+    if (!o || o->type != KO_SHMEM) { c->x[0] = RES_INVALID_HANDLE; return; }
+    if ((addr | sz) & 0xFFF || sz > o->size) { c->x[0] = RES_INVALID_SIZE; return; }
+    if (!commit_exact(addr, sz)) { rt_log("svcMapSharedMemory: commit failed at %#llx size %#llx (win error %lu)", (unsigned long long)addr, (unsigned long long)sz, GetLastError()); c->x[0] = RES_INVALID_ADDR; return; }
+    memcpy((void *)addr, o->mapped ? (void *)o->mapped : o->mem, sz);
+    if (!o->mapped) o->mapped = addr;
+    rt_log("svcMapSharedMemory %#x (%s) -> %#llx size %#llx", (uint32_t)c->x[0], o->name, (unsigned long long)addr, (unsigned long long)sz);
+    c->x[0] = 0;
+}
+static void svc_unmap_shared(Ctx *c) {
+    KObj *o = h_get(c, (uint32_t)c->x[0]);
+    uint64_t addr = c->x[1], sz = c->x[2];
+    if (!o || o->type != KO_SHMEM) { c->x[0] = RES_INVALID_HANDLE; return; }
+    if (o->mapped == addr) { memcpy(o->mem, (void *)addr, sz < o->size ? sz : o->size); o->mapped = 0; }
+    VirtualFree((void *)addr, sz, MEM_DECOMMIT);
+    c->x[0] = 0;
+}
+static void svc_create_shared(Ctx *c) {            /* 0x50 CreateSharedMemory(size, local perm, remote perm) */
+    KObj *o = k_shmem_new(c->x[1]);
+    EnterCriticalSection(&g_k);
+    uint32_t h = h_new(o, 0);
+    LeaveCriticalSection(&g_k);
+    c->x[0] = h ? 0 : RES_OUT_OF_MEM;
+    c->x[1] = h;
+}
 
 static void svc_create_transfer(Ctx *c) {
     KObj *o = kobj_new(KO_TRANSFER, "transfer");
@@ -210,6 +273,18 @@ static void svc_create_transfer(Ctx *c) {
 
 static void svc_flush(Ctx *c) { c->x[0] = 0; }
 
+/* MapPhysicalMemory (0x2C, 0x48 unsafe variant): commit zeroed pages at a guest address inside the reserved alias/heap region */
+static void svc_map_physical(Ctx *c) {
+    uint64_t addr = c->x[0], sz = c->x[1];
+    if ((addr | sz) & 0xFFF || !sz) { c->x[0] = RES_INVALID_ADDR; return; }
+    c->x[0] = (commit_exact(addr, sz)) ? 0 : RES_OUT_OF_MEM;
+}
+static void svc_unmap_physical(Ctx *c) {
+    uint64_t addr = c->x[0], sz = c->x[1];
+    VirtualFree((void *)addr, sz, MEM_DECOMMIT);
+    c->x[0] = 0;
+}
+
 /* ------------------------------------------------------------------ handles, events */
 static void svc_close_handle(Ctx *c) {
     uint32_t h = (uint32_t)c->x[0];
@@ -218,7 +293,10 @@ static void svc_close_handle(Ctx *c) {
     if (!e) { LeaveCriticalSection(&g_k); c->x[0] = RES_INVALID_HANDLE; return; }
     KObj *o = e->obj;
     e->obj = 0;
-    if (--o->refs <= 0 && o->type != KO_THREAD) free(o);
+    if (--o->refs <= 0 && o->type != KO_THREAD) {
+        if (o->type == KO_SESSION && o->user) hle_session_closed(o->user);
+        free(o);
+    }
     LeaveCriticalSection(&g_k);
     c->x[0] = 0;
 }
@@ -262,6 +340,7 @@ static void svc_wait_sync(Ctx *c) {
     if (n < 0 || n > 0x40) { c->x[0] = RES_INVALID_SIZE; c->x[1] = (uint64_t)-1; return; }
     DWORD deadline = to < 0 ? INFINITE : (DWORD)((to + 999999) / 1000000);
     ULONGLONG t0 = GetTickCount64();
+    int blocked_logged = 0;
     EnterCriticalSection(&g_k);
     for (;;) {
         if (c->thr->cancel_sync) { c->thr->cancel_sync = 0; c->x[0] = RES_CANCELLED; c->x[1] = (uint64_t)-1; break; }
@@ -274,6 +353,10 @@ static void svc_wait_sync(Ctx *c) {
         if (bad) { c->x[0] = RES_INVALID_HANDLE; c->x[1] = (uint64_t)-1; break; }
         if (found >= 0) { c->x[0] = 0; c->x[1] = (uint64_t)found; break; }
         DWORD wait = INFINITE;
+        if (!blocked_logged && g_trace) {
+            blocked_logged = 1;
+            for (int i = 0; i < n; i++) rt_log("tid %u blocks in WaitSynchronization on handle %#x (%s) timeout=%lld", c->thr->tid, hs[i], h_get(c, hs[i]) ? h_get(c, hs[i])->name : "?", (long long)to);
+        }
         if (deadline != INFINITE) {
             ULONGLONG el = GetTickCount64() - t0;
             if (el >= deadline) { c->x[0] = RES_TIMEOUT; c->x[1] = (uint64_t)-1; break; }
@@ -329,6 +412,7 @@ static void svc_create_thread(Ctx *c) {
 
 static void svc_start_thread(Ctx *c) {
     RtThread *t = thread_of(c, (uint32_t)c->x[0]);
+    if (g_trace) rt_log("  StartThread(handle=%#x) -> thread %s tid %u started=%ld", (uint32_t)c->x[0], t ? t->name : "?", t ? t->tid : 0, t ? (long)t->started : -1L);
     if (!t) { c->x[0] = RES_INVALID_HANDLE; return; }
     if (InterlockedExchange(&t->started, 1)) { c->x[0] = RES_INVALID_STATE; return; }
     DWORD id;
@@ -378,12 +462,16 @@ static void svc_set_core_mask(Ctx *c) {
     c->x[0] = 0;
 }
 static void svc_cur_cpu(Ctx *c) { c->x[0] = (uint32_t)(c->thr ? (c->thr->core >= 0 ? c->thr->core : 0) : 0); }
-static void svc_set_activity(Ctx *c) { c->x[0] = thread_of(c, (uint32_t)c->x[0]) ? 0 : RES_INVALID_HANDLE; }
+static void svc_set_activity(Ctx *c) {
+    RtThread *t = thread_of(c, (uint32_t)c->x[0]);
+    c->x[0] = t ? gc_set_activity(c, t, (int)(c->x[1] & 1)) : RES_INVALID_HANDLE;
+}
 
 static void svc_get_thread_context3(Ctx *c) {
     RtThread *t = thread_of(c, (uint32_t)c->x[1]);
     uint64_t *o = (uint64_t *)c->x[0];
     if (!t) { c->x[0] = RES_INVALID_HANDLE; return; }
+    if (!gc_thread_stopped(t)) { c->x[0] = RES_INVALID_STATE; return; }
     memset(o, 0, 0x320);
     Ctx *s = t->ctx;
     if (s) {
@@ -477,10 +565,14 @@ static void svc_wait_pwk(Ctx *c) {
     DWORD deadline = to < 0 ? INFINITE : (DWORD)((to + 999999) / 1000000);
     ULONGLONG t0 = GetTickCount64();
     int timed_out = 0;
+    if (g_trace) rt_log("  WaitProcessWideKeyAtomic mutex=%#llx key=%#llx tag=%#x timeout=%lld", (unsigned long long)addr, (unsigned long long)key, tag, (long long)to);
     EnterCriticalSection(&g_k);
     mutex_unlock_locked(addr);
     Waiter *w = w_add(1, addr, key, tag);
     if (!w) { LeaveCriticalSection(&g_k); c->x[0] = RES_OUT_OF_MEM; return; }
+    /* The kernel keeps the condition variable word in user memory at 1 while anyone waits on it: nn::os (and libnx) Signal/Broadcast read
+     * it first and skip the svc when it is 0 (found at the thread start handshake: ReleaseSemaphore never woke the waiter). */
+    st32(key, 1);
     while (!w->woken) {
         DWORD wait = INFINITE;
         if (deadline != INFINITE) {
@@ -491,14 +583,23 @@ static void svc_wait_pwk(Ctx *c) {
         SleepConditionVariableCS(&g_kcv, &g_k, wait);
     }
     w->used = 0;
+    if (timed_out) { int left; w_first(1, 0, key, &left); if (!left) st32(key, 0); }
+    /* a timed out wait returns without the mutex: the kernel does not reacquire it on a timeout and the caller (nn::os, libnx)
+     * locks it itself (found by tests/runtime/test_sync.c; reacquiring here made the caller lock twice) */
+    if (timed_out) { LeaveCriticalSection(&g_k); c->x[0] = RES_TIMEOUT; return; }
     /* reacquire the mutex like the kernel does after a wakeup */
-    uint32_t v = ld32(addr);
-    if (v == 0) {
-        st32(addr, tag);
-    } else {
-        __atomic_fetch_or((uint32_t *)addr, WAIT_MASK, __ATOMIC_ACQ_REL);
+    for (;;) {
+        /* user mode code takes and releases the word with plain compare-exchanges, so every step here must be one too (a load then a
+         * store let a second thread take the mutex in between: found by tests/runtime/test_sync.c, a consumed item count above produced) */
+        uint32_t v = ld32(addr);
+        if (v == 0) {
+            if (__atomic_compare_exchange_n((uint32_t *)addr, &v, tag, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+            continue;
+        }
+        if (!(v & WAIT_MASK) && !__atomic_compare_exchange_n((uint32_t *)addr, &v, v | WAIT_MASK, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         Waiter *lw = w_add(0, addr, 0, tag);
         if (lw) lock_wait_locked(lw);
+        break;
     }
     LeaveCriticalSection(&g_k);
     c->x[0] = timed_out ? RES_TIMEOUT : 0;
@@ -507,12 +608,14 @@ static void svc_wait_pwk(Ctx *c) {
 static void svc_signal_pwk(Ctx *c) {
     uint64_t key = c->x[0];
     int32_t count = (int32_t)c->x[1];
+    if (g_trace) rt_log("  SignalProcessWideKey key=%#llx count=%d", (unsigned long long)key, count);
     EnterCriticalSection(&g_k);
     for (int k = 0; count <= 0 || k < count; k++) {
         Waiter *w = w_first(1, 0, key, 0);
         if (!w) break;
         w->woken = 1;
     }
+    { int left; w_first(1, 0, key, &left); if (!left) st32(key, 0); }   /* no waiters left: clear the user mode flag */
     WakeAllConditionVariable(&g_kcv);
     LeaveCriticalSection(&g_k);
     c->x[0] = 0;
@@ -588,6 +691,19 @@ static void svc_break(Ctx *c) {
     uint32_t reason = (uint32_t)c->x[0];
     rt_log("svcBreak reason=%#x (%s)%s info=%#llx size=%#llx lr=%#llx", reason, break_name(reason), (reason & 0x80000000u) ? " [notification only]" : "",
            (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[30]);
+    if (c->x[2] == 4 && c->x[1] > 0x10000) {                 /* a Panic with a 4 byte payload carries a result code (nn::diag abort) */
+        uint32_t r = *(uint32_t *)c->x[1];
+        rt_log("svcBreak payload: result %#x (module %u, description %u)", r, r & 0x1FF, r >> 9);
+    }
+    if (getenv("SMRPG_DUMPADDR")) {                            /* debug aid: SMRPG_DUMPADDR=<hex addr> dumps 0x40 bytes of guest memory at a break */
+        uint64_t da = strtoull(getenv("SMRPG_DUMPADDR"), NULL, 16);
+        for (int i = 0; i < 0x40; i += 8) rt_log("  dump %#llx = %#llx", (unsigned long long)(da + i), (unsigned long long)*(uint64_t *)(da + i));
+    }
+    if (getenv("SMRPG_BREAKDBG") && c->tpidrro_el0) {          /* debug aid: the nn::os ThreadType of the breaking thread */
+        uint64_t tt = *(uint64_t *)(c->tpidrro_el0 + 0x1f8);
+        rt_log("  break dbg: sp=%#llx tls=%#llx ThreadType=%#llx", (unsigned long long)c->x[31], (unsigned long long)c->tpidrro_el0, (unsigned long long)tt);
+        if (tt > 0x10000) for (int i = 0x40; i < 0x80; i += 8) rt_log("    tt+%#x = %#llx", i, (unsigned long long)*(uint64_t *)(tt + i));
+    }
     if (reason & 0x80000000u) return;
     rt_fatal(c, "guest called svcBreak (assert, panic or uncaught exception)", reason);
 }
@@ -676,44 +792,70 @@ static void svc_reslimit_cur(Ctx *c) {
     c->x[0] = 0; c->x[1] = cur[res];
 }
 
-/* ------------------------------------------------------------------ IPC (nn service requests) */
+/* ------------------------------------------------------------------ IPC: served by runtime/hle/hle_ipc.c */
 static void svc_connect_named_port(Ctx *c) {
-    char nm[24];
+    char nm[16];
     rt_safe_str(c->x[1], nm, 13);
-    KObj *o = kobj_new(KO_SESSION, nm);
+    hle_ipc_connect_named_port(c, nm);
+}
+
+static void svc_send_sync_request(Ctx *c) { hle_ipc_send_sync(c, (uint32_t)c->x[0]); }
+
+void svc_report_first_service(const char *what, const char *detail) {
+    /* v0 stopped the boot here. The service layer answers requests now; keep the marker for the log. */
+    if (InterlockedCompareExchange(&g_first_service, 1, 0) == 0) rt_log("first nn service request: %s %s", what, detail);
+}
+
+/* ------------------------------------------------------------------ kernel object API for runtime/hle (hle.h) */
+uint32_t k_session_new(const char *name, void *user) {
+    KObj *o = kobj_new(KO_SESSION, name);
+    o->user = user;
     EnterCriticalSection(&g_k);
     uint32_t h = h_new(o, 0);
     LeaveCriticalSection(&g_k);
-    rt_log("FIRST NN SERVICE REQUEST candidate: svcConnectToNamedPort(\"%s\") -> handle %#x lr=%#llx", nm, h, (unsigned long long)c->x[30]);
-    c->x[0] = 0;
-    c->x[1] = h;
-    svc_report_first_service("svcConnectToNamedPort", nm);
+    if (!h) { free(o); }
+    return h;
 }
-
-static void ipc_describe(Ctx *c, char *out, size_t n) {
-    uint32_t *m = (uint32_t *)c->tpidrro_el0;
-    uint32_t w0 = m[0], w1 = m[1];
-    uint32_t type = w0 & 0xFFFF;
-    uint32_t cmd = 0xFFFFFFFFu;
-    for (int i = 0; i < 0x40; i++)
-        if (m[i] == 0x49434653u) { cmd = m[i + 2]; break; }   /* 'SFCI' then version, command id */
-    snprintf(out, n, "msgtype=%u hdr=%08x %08x cmif_cmd=%d", type, w0, w1, (int)cmd);
+void *k_session_user(uint32_t h) {
+    EnterCriticalSection(&g_k);
+    HEnt *e = h_ent(h);
+    void *u = (e && e->obj->type == KO_SESSION) ? e->obj->user : 0;
+    LeaveCriticalSection(&g_k);
+    return u;
 }
-
-static void svc_send_sync_request(Ctx *c) {
-    uint32_t h = (uint32_t)c->x[0];
-    KObj *o = h_get(c, h);
-    char d[160], what[200];
-    ipc_describe(c, d, sizeof d);
-    snprintf(what, sizeof what, "session '%s' handle %#x %s", o ? o->name : "?", h, d);
-    rt_log("FIRST NN SERVICE REQUEST candidate: svcSendSyncRequest(%s) lr=%#llx", what, (unsigned long long)c->x[30]);
-    c->x[0] = o ? 0xF601 : RES_INVALID_HANDLE;    /* SessionClosed: we do not emulate services */
-    svc_report_first_service("svcSendSyncRequest", what);
+KObj *k_obj_of(uint32_t h) {
+    EnterCriticalSection(&g_k);
+    HEnt *e = h_ent(h);
+    KObj *o = e ? e->obj : 0;
+    LeaveCriticalSection(&g_k);
+    return o;
 }
-
-void svc_report_first_service(const char *what, const char *detail) {
-    if (InterlockedCompareExchange(&g_first_service, 1, 0) == 0) rt_boot_reached(what, detail);
+int k_obj_type(KObj *o) { return o ? o->type : 0; }
+KObj *k_event_named(const char *name, int signaled) { KObj *o = kobj_new(KO_EVENT, name); o->signaled = signaled; return o; }
+KObj *k_event_new(int signaled) { KObj *o = kobj_new(KO_EVENT, "event"); o->signaled = signaled; return o; }
+uint32_t k_handle_for(KObj *o, int role) {
+    EnterCriticalSection(&g_k);
+    uint32_t h = h_new(o, role);
+    LeaveCriticalSection(&g_k);
+    return h;
 }
+void k_event_set(KObj *o, int v) {
+    EnterCriticalSection(&g_k);
+    o->signaled = v;
+    if (v) WakeAllConditionVariable(&g_kcv);
+    LeaveCriticalSection(&g_k);
+}
+int k_event_get(KObj *o) { return o->signaled; }
+KObj *k_shmem_new(uint64_t size) {
+    KObj *o = kobj_new(KO_SHMEM, "shmem");
+    o->size = (size + 0xFFF) & ~0xFFFULL;
+    o->mem = VirtualAlloc(NULL, o->size ? o->size : 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    return o;
+}
+void *k_shmem_ptr(KObj *o) { return o->mapped ? (void *)o->mapped : o->mem; }
+uint64_t k_shmem_size(KObj *o) { return o->size; }
+uint64_t k_transfer_addr(KObj *o) { return o->addr; }
+uint64_t k_transfer_size(KObj *o) { return o->size; }
 
 /* ------------------------------------------------------------------ dispatch */
 typedef void (*SvcFn)(Ctx *);
@@ -733,7 +875,7 @@ void svc_init(void) {
     S(0x24, svc_get_process_id); S(0x25, svc_get_thread_id); S(0x26, svc_break); S(0x27, svc_output_debug); S(0x28, svc_return_from_exception);
     S(0x29, svc_get_info); S(0x2A, svc_flush); S(0x2B, svc_flush); S(0x30, svc_reslimit); S(0x31, svc_reslimit_cur); S(0x32, svc_set_activity);
     S(0x33, svc_get_thread_context3); S(0x34, svc_wait_for_address); S(0x35, svc_signal_to_address); S(0x36, svc_sync_preempt);
-    S(0x37, svc_reslimit_cur); S(0x45, svc_create_event);
+    S(0x37, svc_reslimit_cur); S(0x45, svc_create_event); S(0x50, svc_create_shared); S(0x2C, svc_map_physical); S(0x2D, svc_unmap_physical); S(0x48, svc_map_physical); S(0x49, svc_unmap_physical);
 #undef S
 }
 
@@ -754,9 +896,11 @@ void rt_svc(Ctx *c, uint32_t imm) {
         c->x[0] = RES_NOT_IMPL;
         return;
     }
+    gc_safe_enter(c);
     f(c);
+    gc_safe_leave(c);
     if (log)
-        rt_log("svc 0x%02x %s(x0=%#llx x1=%#llx x2=%#llx x3=%#llx) -> w0=%#x x1=%#llx x2=%#llx", imm, svc_name(imm), (unsigned long long)a0,
+        rt_log("svc 0x%02x %s(x0=%#llx x1=%#llx x2=%#llx x3=%#llx) -> w0=%#x x1=%#llx x2=%#llx [x19=%#llx x29=%#llx sp=%#llx]", imm, svc_name(imm), (unsigned long long)a0,
                (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (uint32_t)c->x[0], (unsigned long long)c->x[1],
-               (unsigned long long)c->x[2]);
+               (unsigned long long)c->x[2], (unsigned long long)c->x[19], (unsigned long long)c->x[29], (unsigned long long)c->x[31]);
 }

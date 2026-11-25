@@ -54,10 +54,11 @@ struct DescPools {
         VkDescriptorSet s;
         if (g_vk.f.vkAllocateDescriptorSets(g_vk.dev, &ai, &s) == VK_SUCCESS) return s;
       }
-      VkDescriptorPoolSize sz[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
-                                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}};
+      VkDescriptorPoolSize sz[6] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8192}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512},
+                                    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}};
       VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-      pi.maxSets = 1024; pi.poolSizeCount = 4; pi.pPoolSizes = sz;
+      pi.maxSets = 1024; pi.poolSizeCount = 6; pi.pPoolSizes = sz;
       VkDescriptorPool dp;
       if (g_vk.f.vkCreateDescriptorPool(g_vk.dev, &pi, nullptr, &dp) != VK_SUCCESS) return VK_NULL_HANDLE;
       pools.push_back(dp);
@@ -119,13 +120,29 @@ static void EnsureGlobals() {
   g_vk.f.vkCreatePipelineCache(g_vk.dev, &pc, nullptr, &g_pcache);
   VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
   g_vk.f.vkCreateDescriptorSetLayout(g_vk.dev, &li, nullptr, &g_emptySet);
-  CreateBuf(&g_nullVbBuf, 256, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, MemKind::HostVisible);
+  // stands in for every unbound vertex, uniform and storage buffer, so it carries all three usages
+  CreateBuf(&g_nullVbBuf, 256, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemKind::HostVisible);
   float* f = (float*)g_nullVbBuf.map; for (int i = 0; i < 64; i++) f[i] = (i & 3) == 3 ? 1.0f : 0.0f;
   g_nullVb = g_nullVbBuf.buf;
 }
 
+static VkDescriptorType TexDescType(const ManifestTex& t) {
+  switch (t.res) {
+    case RES_SAMPLED_IMAGE: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    case RES_SAMPLER: return VK_DESCRIPTOR_TYPE_SAMPLER;
+    default: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     // texel buffers were refused by ShaderCacheCheckDevice
+  }
+}
+
+// Phase A modules ask for subgroup size 32 (Maxwell warps). Devices that run another size need VK_EXT_subgroup_size_control.
+static bool WantSubgroup32(const StageProgram* sp, VkShaderStageFlagBits bit) {
+  return sp->man.subgroup32 && g_vk.p11.subgroupSize != 32 && g_vk.f13.subgroupSizeControl && g_vk.p13.minSubgroupSize <= 32 &&
+         g_vk.p13.maxSubgroupSize >= 32 && (g_vk.p13.requiredSubgroupSizeStages & bit) != 0;
+}
+
 static bool EnsureStage(StageProgram* sp) {
   if (!sp->ok) return false;
+  if (!ShaderCacheCheckDevice(sp)) return false;
   if (sp->module && sp->setLayout) return true;
   auto& F = g_vk.f;
   if (!sp->module) {
@@ -135,8 +152,9 @@ static bool EnsureStage(StageProgram* sp) {
   }
   std::vector<VkDescriptorSetLayoutBinding> b;
   VkShaderStageFlags st = StageBit(sp->man.stage);
+  if (sp->man.supportBinding >= 0) b.push_back({(uint32_t)sp->man.supportBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, st, nullptr});
   for (auto& u : sp->man.ubos) b.push_back({u.binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, st, nullptr});
-  for (auto& t : sp->man.texs) b.push_back({t.binding, t.dim == 6 ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, std::max(1u, t.arrayLen), st, nullptr});
+  for (auto& t : sp->man.texs) b.push_back({t.binding, TexDescType(t), std::max(1u, t.arrayLen), st, nullptr});
   for (auto& i : sp->man.imgs) b.push_back({i.binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, st, nullptr});
   for (auto& s : sp->man.ssbos) b.push_back({s.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, st, nullptr});
   VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -144,6 +162,8 @@ static bool EnsureStage(StageProgram* sp) {
   if (F.vkCreateDescriptorSetLayout(g_vk.dev, &li, nullptr, &sp->setLayout) != VK_SUCCESS) { sp->ok = false; return false; }
   return true;
 }
+
+bool ShaderStageReady(StageProgram* sp) { return EnsureStage(sp); }
 
 static VkPipelineLayout GetLayout(ProgramImpl* p) {
   uint32_t nsets = 0;
@@ -396,11 +416,13 @@ static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
   if (it != g_pipes.end()) return it->second;
 
   std::vector<VkPipelineShaderStageCreateInfo> stages;
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg[5];
   for (int st = 0; st < 5; st++) {
     StageProgram* sp = p->byStage[st];
     if (!sp) continue;
     VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     si.stage = StageBit(st); si.module = sp->module; si.pName = "main";
+    if (WantSubgroup32(sp, si.stage)) { sg[st] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, nullptr, 32}; si.pNext = &sg[st]; }
     stages.push_back(si);
   }
   // vertex input
@@ -409,12 +431,15 @@ static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
   for (auto& in : vs->man.inputs) {
     uint32_t a = in.attr & 15; VkVertexInputAttributeDescription d{};
     d.location = in.location;
+    // The shader declares the numeric class of the input (manifest type: 0 float, 1 int, 2 uint). A vertex format of another class
+    // would make the pipeline invalid, so such an attribute reads the default value of the class the shader wants.
+    const VkFormat defFmt = in.type == 2 ? VK_FORMAT_R32G32B32A32_UINT : in.type == 1 ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT;
     if (s.attrSet[a] && s.attr[a].format != 0) {
       bool isInt = false; d.format = VertexFormatFromNvn(s.attr[a].format, &isInt);
       d.offset = s.attr[a].offset; d.binding = s.attr[a].stream & 15;
-      if (isInt) LogOnce("vtxint", "vertex attribute %u uses an integer format (0x%x) but translated shaders read float vec4", a, s.attr[a].format);
-      if (d.format == VK_FORMAT_UNDEFINED) { LogOnce("vtxfmt", "vertex format 0x%x not supported (attribute %u reads defaults)", s.attr[a].format, a); d.format = VK_FORMAT_R32G32B32A32_SFLOAT; d.binding = 16; d.offset = 0; }
-    } else { d.format = VK_FORMAT_R32G32B32A32_SFLOAT; d.binding = 16; d.offset = 0; }
+      if (d.format == VK_FORMAT_UNDEFINED) { LogOnce("vtxfmt", "vertex format 0x%x not supported (attribute %u reads defaults)", s.attr[a].format, a); d.format = defFmt; d.binding = 16; d.offset = 0; }
+      else if (isInt != (in.type != 0)) { LogOnce("vtxkind", "vertex attribute %u: format 0x%x and the shader input disagree on integer or float (attribute reads defaults)", a, s.attr[a].format); d.format = defFmt; d.binding = 16; d.offset = 0; }
+    } else { d.format = defFmt; d.binding = 16; d.offset = 0; }
     used[d.binding] = true; attrs.push_back(d);
   }
   for (uint32_t b = 0; b < 17; b++) {
@@ -479,7 +504,7 @@ static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
   gi.layout = GetLayout(p);
   VkPipeline out = VK_NULL_HANDLE;
   VkResult r = F.vkCreateGraphicsPipelines(g_vk.dev, g_pcache, 1, &gi, nullptr, &out);
-  if (r != VK_SUCCESS) { Err("vkCreateGraphicsPipelines failed (%d) program %llu", r, (unsigned long long)p->id); out = VK_NULL_HANDLE; }
+  if (r != VK_SUCCESS) { Err("vkCreateGraphicsPipelines failed (%d) program %llu", r, (unsigned long long)p->id); out = VK_NULL_HANDLE; g_stats.pipelineFails++; }
   g_pipes[key] = out; g_stats.pipelines++;
   return out;
 }
@@ -493,7 +518,8 @@ static VkPipeline BuildCompute(RS& s) {
   uint32_t ls[3] = {cs->man.localSize[0], cs->man.localSize[1], cs->man.localSize[2]};
   VkSpecializationInfo sp{3, me, 12, ls};
   VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-  ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs->module, "main", &sp};
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, nullptr, 32};
+  ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, WantSubgroup32(cs, VK_SHADER_STAGE_COMPUTE_BIT) ? &sg : nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs->module, "main", &sp};
   ci.layout = GetLayout(p);
   VkPipeline out = VK_NULL_HANDLE;
   if (g_vk.f.vkCreateComputePipelines(g_vk.dev, g_pcache, 1, &ci, nullptr, &out) != VK_SUCCESS) out = VK_NULL_HANDLE;
@@ -502,6 +528,17 @@ static VkPipeline BuildCompute(RS& s) {
 }
 
 // ---- descriptors for a draw/dispatch ----------------------------------------------------------------------------------
+// The Ryujinx style support buffer (docs/SHADER_CACHE.md section 5): zeros except the viewport inverse and size vectors and a
+// render scale of 1.0 in every scale slot. Alpha test 0 (always pass) and is_bgra 0 (RGBA targets) are the zero defaults.
+static void FillSupportBuffer(const RS& s, uint8_t* p, uint32_t size) {
+  memset(p, 0, size);
+  float w = s.vpSet ? (float)s.viewport[2] : (float)s.area.width, h = s.vpSet ? (float)s.viewport[3] : (float)s.area.height;
+  float inv[4] = {w > 0 ? 2.0f / w : 0.0f, h > 0 ? 2.0f / h : 0.0f, 1.0f, 1.0f}, sz[4] = {w, h, 1.0f, 1.0f};
+  if (size >= 176) { memcpy(p + 144, inv, 16); memcpy(p + 160, sz, 16); }
+  const float one = 1.0f;
+  for (uint32_t i = 0; i < 73 && 192 + 16 * i + 4 <= size; i++) memcpy(p + 192 + 16 * i, &one, 4);
+}
+
 static bool BindDescriptors(RS& s, bool compute) {
   auto& F = g_vk.f;
   ProgramImpl* p = s.prog;
@@ -515,25 +552,41 @@ static bool BindDescriptors(RS& s, bool compute) {
     VkDescriptorSet set = s.dpools->Alloc(sp->setLayout);
     if (!set) { Err("descriptor set allocation failed"); return false; }
     std::vector<VkWriteDescriptorSet> w;
-    std::vector<VkDescriptorBufferInfo> bi; bi.reserve(m.ubos.size() + m.ssbos.size());
+    std::vector<VkDescriptorBufferInfo> bi; bi.reserve(m.ubos.size() + m.ssbos.size() + 1);
     std::vector<VkDescriptorImageInfo> ii; size_t nimg = m.imgs.size(); for (auto& t : m.texs) nimg += std::max(1u, t.arrayLen); ii.reserve(nimg);
+    if (m.supportBinding >= 0) {      // translator support buffer: viewport and render scale words (SHADER_CACHE.md section 5)
+      VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize so = 0; void* ptr = nullptr;
+      VkDeviceSize size = std::max<VkDeviceSize>(m.supportSize, 16);
+      if (s.scratch->Alloc((size + 15) & ~15ull, std::max<VkDeviceSize>(256, g_vk.props.limits.minUniformBufferOffsetAlignment), &buf, &so, &ptr)) {
+        FillSupportBuffer(s, (uint8_t*)ptr, (uint32_t)size);
+      } else { buf = g_nullVb; so = 0; size = 256; }
+      bi.push_back({buf, so, size});
+      VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; x.dstSet = set; x.dstBinding = (uint32_t)m.supportBinding; x.descriptorCount = 1;
+      x.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; x.pBufferInfo = &bi.back(); w.push_back(x);
+    }
     for (auto& u : m.ubos) {
       VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize off = 0, range = std::max<uint32_t>(u.size, 16);
-      if (u.nvnIndex >= 0 && u.nvnIndex < 16 && s.ub[st][u.nvnIndex].addr) {
-        const auto& r = s.ub[st][u.nvnIndex];
-        uint64_t o;
-        if (ResolveBuffer(r.addr, 1, &buf, &o)) { off = o; if (r.size) range = r.size; }
-        else buf = VK_NULL_HANDLE;
-        range = std::min<VkDeviceSize>(range, g_vk.props.limits.maxUniformBufferRange);
-      } else if (u.cbuf == 2 || u.cbuf == 0) {
+      int src = u.source;
+      if (src == UBO_NVN && u.nvnIndex < 0) src = u.cbuf == 2 ? UBO_HANDLES_C2 : u.cbuf == 0 ? UBO_DRIVER_C0 : u.cbuf == 1 ? UBO_PROGRAM_CONSTANTS : UBO_NVN;   // v1 manifest
+      if (src == UBO_NVN) {
+        if (u.nvnIndex >= 0 && u.nvnIndex < 16 && s.ub[st][u.nvnIndex].addr) {
+          const auto& r = s.ub[st][u.nvnIndex];
+          uint64_t o;
+          if (ResolveBuffer(r.addr, 1, &buf, &o)) { off = o; if (r.size) range = r.size; }
+          else buf = VK_NULL_HANDLE;
+        }
+      } else if (src == UBO_PROGRAM_CONSTANTS) {
+        if (ShaderCacheConstants(sp, &buf, &off)) range = 64 * 1024;
+      } else {
         void* ptr; VkDeviceSize so;
         range = (range + 15) & ~15ull;
         if (s.scratch->Alloc(range, std::max<VkDeviceSize>(256, g_vk.props.limits.minUniformBufferOffsetAlignment), &buf, &so, &ptr)) {
           memset(ptr, 0, range); off = so;
-          if (u.cbuf == 2) memcpy(ptr, s.c2[st], std::min<size_t>(range, sizeof s.c2[st]));
+          if (src == UBO_HANDLES_C2) memcpy(ptr, s.c2[st], std::min<size_t>(range, sizeof s.c2[st]));
           else for (int i = 0; i < 16; i++) { if (0x110 + 16 * (size_t)i + 16 > range) break; uint8_t* d = (uint8_t*)ptr + 0x110 + 16 * i; memcpy(d, &s.sb[st][i].addr, 8); uint32_t sz = (uint32_t)s.sb[st][i].size; memcpy(d + 8, &sz, 4); }
         }
       }
+      range = std::min<VkDeviceSize>(range, g_vk.props.limits.maxUniformBufferRange);
       if (!buf) { buf = g_nullVb; off = 0; range = 256; LogOnce(("ub" + sp->key + std::to_string(u.binding)).c_str(), "stage %s uniform binding %u (nvn index %d) is not bound", StageName(st), u.binding, u.nvnIndex); }
       bi.push_back({buf, off, range});
       VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; x.dstSet = set; x.dstBinding = u.binding; x.descriptorCount = 1;
@@ -547,18 +600,21 @@ static bool BindDescriptors(RS& s, bool compute) {
         uint32_t sw = t.hasSampler && t.sCbuf == 2 ? s.c2[st][std::min<uint32_t>(0x3FF, (t.sOff + 8 * k) / 4)] : 0;
         uint32_t tid = tw & 0xFFFFF, sid = t.hasSampler ? (sw & 0xFFFFF) : (tw >> 20); uint32_t h = tw | sw;
         VkDescriptorImageInfo di{g_dummySampler, g_dummy[std::min(t.dim, 5)].view, VK_IMAGE_LAYOUT_GENERAL};
+        if (t.res == RES_SAMPLER) { tid = UINT32_MAX; sid = tw & 0xFFFFF; }      // a pure sampler word carries only the sampler id
         if (s.texPool && tid < s.texPool->ents.size() && s.texPool->ents[tid].tex) {
           auto& e = s.texPool->ents[tid];
           PrepareSampled(s, e.texG);
           VkImageView v = GetView(e.tex, e.texG, e.hasView ? &e.view : nullptr, false);
           if (v) di.imageView = v;
-        } else LogOnce(("tex" + std::to_string(tid)).c_str(), "draw samples texture id %u that is not registered in the bound texture pool", tid);
+        } else if (t.res != RES_SAMPLER) LogOnce(("tex" + std::to_string(tid)).c_str(), "draw samples texture id %u that is not registered in the bound texture pool", tid);
         if (s.sampPool && sid < s.sampPool->ents.size() && s.sampPool->ents[sid] && s.sampPool->ents[sid]->sampler) di.sampler = s.sampPool->ents[sid]->sampler;
         else if (sid || h) LogOnce(("smp" + std::to_string(sid)).c_str(), "draw uses sampler id %u that is not registered", sid);
+        if (t.res == RES_SAMPLED_IMAGE) di.sampler = VK_NULL_HANDLE;
+        if (t.res == RES_SAMPLER) di.imageView = VK_NULL_HANDLE;
         ii.push_back(di);
       }
       VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; x.dstSet = set; x.dstBinding = t.binding; x.descriptorCount = n;
-      x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; x.pImageInfo = &ii[first]; w.push_back(x);
+      x.descriptorType = TexDescType(t); x.pImageInfo = &ii[first]; w.push_back(x);
     }
     for (auto& im : m.imgs) {
       VkDescriptorImageInfo di{VK_NULL_HANDLE, g_dummy[1].view, VK_IMAGE_LAYOUT_GENERAL};

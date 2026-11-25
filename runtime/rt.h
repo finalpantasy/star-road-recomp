@@ -47,6 +47,14 @@ void rt_brk(Ctx *c, uint32_t imm);
 void rt_poll(Ctx *c);                          /* GC / suspend safepoint (loop back-edge) */
 void rt_fatal(Ctx *c, const char *what, uint64_t arg);
 
+/* ---- task-14: exceptions (runtime/eh) and GC safepoints (runtime/gc), used by generated code ---- */
+extern volatile int32_t g_gc_pending;          /* nonzero while any thread has a suspend request (doc 4.5) */
+void gc_poll(Ctx *c);                          /* loop back-edge safepoint; every written register is flushed first */
+int eh_land(Ctx *c, uint64_t lsda, uint64_t action); /* landing-pad match for c->exc: 1 = land (c->x[0] record, c->x[1] selector) */
+void eh_no_site(Ctx *c, uint64_t call_addr);   /* exception left a call with no call-site entry (C++ would terminate) */
+typedef struct RtRedirect { uint64_t addr; const char *name; } RtRedirect;
+void eh_post_register(const RtRedirect *r, uint32_t n); /* called last from g_reg_chunks: sdk-internal EH calls to HLE */
+
 /* ---- provided by runtime/interp.c (our IR interpreter, same op semantics as the lifted code) ---- */
 void interp_run(Ctx *c, uint64_t pc);          /* run guest code from pc until it returns to the caller's x30 sentinel */
 

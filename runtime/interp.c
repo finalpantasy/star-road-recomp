@@ -6,12 +6,33 @@
 #include "ir_ops.h"
 #include "mode_interp.h"
 #include "ops_gen.h"
+#include "eh/eh.h"
 
 typedef struct { uint16_t op; uint8_t f[10]; uint32_t aux; int64_t i[2]; } IRec;
+int a64_crypto_exec(v128 *v, uint32_t w);
 static const IRec *g_ir[NMODULES];
 static uint32_t g_ir_n[NMODULES];
 static volatile LONG g_ir_state[NMODULES];   /* 0 unloaded, 1 loading, 2 ready, 3 failed */
 static volatile LONG64 g_interp_steps, g_interp_runs;
+
+/* task-14: a call that comes back with c->exc set lands at its LSDA pad (doc 4.4). The throwing callee never ran its
+ * epilogue, so the caller's callee-saved registers and sp are restored from a snapshot taken before the call. */
+typedef struct { uint64_t x[12]; v128 v[8]; } EhSave;
+static inline void eh_save(const Ctx *c, EhSave *s) {
+    for (int n = 0; n < 11; n++) s->x[n] = c->x[19 + n];
+    s->x[11] = c->x[31];
+    for (int n = 0; n < 8; n++) s->v[n] = c->v[8 + n];
+}
+static int eh_after_call(Ctx *c, uint64_t ra, const EhSave *s, uint64_t *pc) {
+    uint64_t pad;
+    if (!eh_interp_land(c, ra, &pad)) return 0;
+    for (int n = 0; n < 11; n++) c->x[19 + n] = s->x[n];
+    c->x[31] = s->x[11];
+    for (int n = 0; n < 8; n++) c->v[8 + n] = s->v[n];
+    *pc = pad;
+    return 1;
+}
+#define GC_BACK_EDGE(t) do { if ((t) <= pc && __builtin_expect(g_gc_pending != 0, 0)) gc_poll(c); } while (0)
 
 static int ir_load(int m) {
     if (g_ir_state[m] == 2) return 1;
@@ -36,6 +57,7 @@ static int ir_load(int m) {
     return g_ir_state[m] == 2;
 }
 
+extern __thread int g_rt_pure;
 void interp_run(Ctx *c, uint64_t pc) {
     InterlockedIncrement64(&g_interp_runs);
     uint64_t steps = 0;
@@ -51,45 +73,55 @@ void interp_run(Ctx *c, uint64_t pc) {
 #include "interp_gen.inc"
         case IROP_ctl_b: {
             uint64_t t = (uint64_t)i->i[0];
-            GuestFn f = rt_lookup(t);
+            GuestFn f = g_rt_pure ? 0 : rt_lookup(t);
             if (f) { c->pc = t; f(c); InterlockedAdd64(&g_interp_steps, steps); return; }   /* b to a function start = tail call */
+            GC_BACK_EDGE(t);
             pc = t; continue;
         }
         case IROP_ctl_bl: {
             uint64_t t = (uint64_t)i->i[0];
+            EhSave sv; eh_save(c, &sv);
             c->x[30] = pc + 4;
             rt_icall(c, t);
-            if (c->exc) { InterlockedAdd64(&g_interp_steps, steps); return; }
+            if (c->exc) {
+                if (eh_after_call(c, pc + 4, &sv, &pc)) continue;
+                InterlockedAdd64(&g_interp_steps, steps); return;
+            }
             break;
         }
         case IROP_ctl_blr: {
             uint64_t t = RX(i->f[0]);
+            EhSave sv; eh_save(c, &sv);
             c->x[30] = pc + 4;
             rt_icall(c, t);
-            if (c->exc) { InterlockedAdd64(&g_interp_steps, steps); return; }
+            if (c->exc) {
+                if (eh_after_call(c, pc + 4, &sv, &pc)) continue;
+                InterlockedAdd64(&g_interp_steps, steps); return;
+            }
             break;
         }
         case IROP_ctl_br: {
             uint64_t t = RX(i->f[0]);
-            GuestFn f = rt_lookup(t);
+            GuestFn f = g_rt_pure ? 0 : rt_lookup(t);
             if (f) { c->pc = t; f(c); InterlockedAdd64(&g_interp_steps, steps); return; }
+            GC_BACK_EDGE(t);
             pc = t; continue;
         }
         case IROP_ctl_ret:
             InterlockedAdd64(&g_interp_steps, steps);
             return;
         case IROP_ctl_bcond:
-            if (ir_cond(c->fl, i->f[0])) { pc = (uint64_t)i->i[0]; continue; }
+            if (ir_cond(c->fl, i->f[0])) { GC_BACK_EDGE((uint64_t)i->i[0]); pc = (uint64_t)i->i[0]; continue; }
             break;
         case IROP_ctl_cbz: {
             uint64_t v = RX(i->f[0]);
             if (!i->f[1]) v = (uint32_t)v;
-            if ((v == 0) != (i->f[2] != 0)) { pc = (uint64_t)i->i[0]; continue; }
+            if ((v == 0) != (i->f[2] != 0)) { GC_BACK_EDGE((uint64_t)i->i[0]); pc = (uint64_t)i->i[0]; continue; }
             break;
         }
         case IROP_ctl_tbz: {
             uint64_t v = RX(i->f[0]);
-            if ((((v >> i->f[1]) & 1) != 0) == (i->f[2] != 0)) { pc = (uint64_t)i->i[0]; continue; }
+            if ((((v >> i->f[1]) & 1) != 0) == (i->f[2] != 0)) { GC_BACK_EDGE((uint64_t)i->i[0]); pc = (uint64_t)i->i[0]; continue; }
             break;
         }
         case IROP_ctl_svc:
@@ -101,6 +133,8 @@ void interp_run(Ctx *c, uint64_t pc) {
             rt_brk(c, (uint32_t)i->i[0]);
             break;
         default: {
+            /* the lifter has no decoder for the cryptographic extension (AES, SHA, PMULL); the raw word is in aux (crypto_a64.c) */
+            if (i->op == 0xFFFF && a64_crypto_exec(c->v, i->aux)) break;
             char what[96];
             snprintf(what, sizeof what, "interpreter: %s IR record (op %#x)", i->op == 0xFFFF ? "undecodable" : "unknown", i->op);
             c->pc = pc; rt_fatal(c, what, i->aux); return;

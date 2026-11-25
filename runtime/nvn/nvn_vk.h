@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -95,8 +96,11 @@ struct Vk {
   VkPhysicalDeviceProperties props{};
   VkPhysicalDeviceMemoryProperties memProps{};
   VkPhysicalDeviceFeatures2 feat{};
+  VkPhysicalDeviceVulkan11Features f11{};
   VkPhysicalDeviceVulkan12Features f12{};
   VkPhysicalDeviceVulkan13Features f13{};
+  VkPhysicalDeviceVulkan11Properties p11{};   // subgroup size, stages, operations (shader cache capability check)
+  VkPhysicalDeviceVulkan13Properties p13{};   // required subgroup size range
   VkPhysicalDeviceDepthClipControlFeaturesEXT depthClip{};
   VkPhysicalDevice4444FormatsFeaturesEXT f4444{};
   VkPhysicalDeviceIndexTypeUint8FeaturesEXT idx8{};
@@ -111,6 +115,9 @@ struct Vk {
   // validation message counters (the tests assert zero)
   std::atomic<int> valErrors{0}, valWarnings{0};
   std::string firstValError;
+  // Validation messages grouped by message id (errors and warnings), for test reports: id -> count and the first full message
+  struct ValTally { int count = 0; bool error = false; std::string first; };
+  std::mutex valLock; std::map<std::string, ValTally> valById;
   bool inited = false;
 };
 

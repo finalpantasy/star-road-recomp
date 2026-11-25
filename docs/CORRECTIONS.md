@@ -10,5 +10,10 @@ On the second date, promote it in the same turn:
 - Rule: one imperative line under "Earned rules" in AGENTS.md, tagged R<n>. Keep AGENTS.md within its line cap by merging or retiring an older rule; record the retirement here.
 - Guard: when a check can catch it mechanically (a test or lint run by the check command), also add a task card for that guard. A hook needs the owner's separate approval.
 
+## Log
+| Correction | Dates | Status |
+|---|---|---|
+| Background and hidden game runs must be muted (2026-11-24: the owner heard the task-15 baseline run playing audio after the rule was sent but before the worker read it) | 2026-11-24 | Logged |
+
 ## Why behind each earned rule
 None yet.

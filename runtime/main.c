@@ -4,6 +4,7 @@
  * guest the way rtld does: nn::init::Start(thread handle, rtld end, flag fn, run-init fn, run-fini fn).
  * Stops with a clear log line once the first nn service request is logged. Our own code. */
 #include "rt_internal.h"
+int svc_thread_registry(RtThread **out, int max);   /* svc.c */
 
 static int g_no_init;
 static int g_max_seconds = 60;
@@ -92,6 +93,50 @@ static DWORD WINAPI watchdog_main(LPVOID p) {
     DWORD ms = (DWORD)(uintptr_t)p;
     Sleep(ms);
     rt_log("WATCHDOG: no result after %lu s, stopping", (unsigned long)(ms / 1000));
+    /* where is every guest thread? host RIP minus the image base resolves with llvm-symbolizer on the unstripped smrpg.exe */
+    {
+        RtThread *th[64];
+        int n = svc_thread_registry(th, 64);
+        uint64_t rip[64] = {0}, base = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
+        for (int i = 0; i < n; i++) {
+            if (!th[i]->host || th[i]->exited || th[i]->host == GetCurrentThread()) continue;
+            if (SuspendThread(th[i]->host) == (DWORD)-1) continue;
+            CONTEXT cx; memset(&cx, 0, sizeof cx); cx.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(th[i]->host, &cx)) rip[i] = cx.Rip;
+            ResumeThread(th[i]->host);
+        }
+        for (int i = 0; i < n; i++)
+            rt_log("WATCHDOG thread tid=%u handle=%#x '%s' host rip=%#llx (image+%#llx) guest lr=%#llx", th[i]->tid, th[i]->handle, th[i]->name,
+                   (unsigned long long)rip[i], (unsigned long long)(rip[i] ? rip[i] - base : 0), (unsigned long long)(th[i]->ctx ? th[i]->ctx->x[30] : 0));
+        /* guest frame chain from the saved x29 (flushed at every call out of lifted code); an unreadable link ends the walk */
+        for (int i = 0; i < n; i++) {
+            if (!th[i]->ctx) continue;
+            char bt[400]; int o = 0;
+            uint64_t fp = th[i]->ctx->x[29];
+            for (int d = 0; d < 14 && fp >= 0x1000 && !(fp & 7) && o < (int)sizeof bt - 24; d++) {
+                uint64_t lr = 0, nfp = 0;
+                if (IsBadReadPtr((void *)(uintptr_t)fp, 16)) break;
+                nfp = ((uint64_t *)fp)[0]; lr = ((uint64_t *)fp)[1];
+                o += snprintf(bt + o, sizeof bt - o, " %#llx", (unsigned long long)lr);
+                if (nfp <= fp) break;
+                fp = nfp;
+            }
+            rt_log("WATCHDOG tid=%u guest frames:%s", th[i]->tid, bt);
+        }
+    }
+    /* SMRPG_WDUMP=addr:len (hex) prints guest memory rows when the watchdog fires (debugging stuck boots) */
+    if (getenv("SMRPG_WDUMP")) {
+        unsigned long long a = 0, l = 0;
+        if (sscanf(getenv("SMRPG_WDUMP"), "%llx:%llx", &a, &l) == 2 && l <= 0x2000 && !IsBadReadPtr((void *)(uintptr_t)a, (size_t)l))
+            for (unsigned long long o = 0; o < l; o += 32) {
+                const uint32_t *w = (const uint32_t *)(uintptr_t)(a + o);
+                rt_log("WDUMP %#llx: %08x %08x %08x %08x %08x %08x %08x %08x", a + o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
+    }
+    for (int i = 0; i < hle_nslots(); i++) {                 /* nn::os calls the guest made through imported slots: what did the stuck threads (not) do */
+        HleSlot *s = hle_slot_n(i);
+        if (s->count && getenv("SMRPG_SLOTS")) rt_log("WATCHDOG slot %lld x %s", (long long)s->count, s->name);
+    }
     rt_ring_dump();
     rt_exit(4, "watchdog timeout");
     return 0;

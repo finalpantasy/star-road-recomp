@@ -166,21 +166,35 @@ struct WindowImpl;
 struct QueueImpl;
 
 // ---- shader cache ----------------------------------------------------------------------------------------------
-struct ManifestUbo { uint32_t binding; int cbuf; int nvnIndex; uint32_t size; };
+// Where a uniform buffer's bytes come from (manifest `source`; v1 manifests have none and are classified by cbuf).
+enum UboSource : int { UBO_NVN = 0, UBO_DRIVER_C0, UBO_HANDLES_C2, UBO_PROGRAM_CONSTANTS };
+// Descriptor kind of a resource (manifest `vk_type`); 0 means the manifest did not say and the section 4 defaults apply.
+enum ResKind : int { RES_DEFAULT = 0, RES_UNIFORM_BUFFER, RES_COMBINED_IMAGE_SAMPLER, RES_SAMPLED_IMAGE, RES_SAMPLER, RES_UNIFORM_TEXEL_BUFFER,
+                     RES_STORAGE_IMAGE, RES_STORAGE_TEXEL_BUFFER, RES_STORAGE_BUFFER };
+struct ManifestUbo { uint32_t binding; int cbuf; int nvnIndex; uint32_t size; int source = UBO_NVN; };
 struct ManifestTex { uint32_t binding; int dim; bool shadow; uint32_t arrayLen; int hCbuf; uint32_t hOff; bool hasSampler; int sCbuf; uint32_t sOff;
-                     int kind; int index; int samplerIndex; };
-struct ManifestImg { uint32_t binding; int dim; int hCbuf; uint32_t hOff; int index; };
-struct ManifestSsbo { uint32_t binding; uint32_t descOff; int nvnIndex; };
-struct ManifestInput { uint32_t location; uint32_t attr; };
+                     int kind; int index; int samplerIndex; int res = RES_DEFAULT; bool multisample = false; };
+struct ManifestImg { uint32_t binding; int dim; int hCbuf; uint32_t hOff; int index; int res = RES_DEFAULT; };
+struct ManifestSsbo { uint32_t binding; uint32_t descOff; int nvnIndex; bool write = false; };
+struct ManifestInput { uint32_t location; uint32_t attr; int type = 0; };   // type: 0 float, 1 int, 2 uint
 struct Manifest {
   std::string key; int stage = 0; uint32_t set = 0;
   std::vector<ManifestUbo> ubos; std::vector<ManifestTex> texs; std::vector<ManifestImg> imgs; std::vector<ManifestSsbo> ssbos;
   std::vector<ManifestInput> inputs; std::vector<uint32_t> outLocs;
   uint32_t rtMask = 1; uint32_t localSize[3] = {1, 1, 1}; bool subgroup32 = false, needsLayerOrVp = false;
+  // Phase A (reuse-v1) additions, docs/SHADER_CACHE.md section 5
+  int supportBinding = -1; uint32_t supportSize = 0;          // translator support buffer (binding 0), -1 when the module has none
+  std::string constFile;                                      // program constants (c[1]) file relative to the cache root, empty when inlined
+  std::vector<uint32_t> caps; std::vector<std::string> exts;  // SPIR-V capability numbers and extension names the module declares
+  std::vector<std::string> builtinsIn, builtinsOut;
+  bool writesDepth = false;
 };
 struct StageProgram {
   std::string key; Manifest man; std::vector<uint32_t> spv; VkShaderModule module = VK_NULL_HANDLE;
   VkDescriptorSetLayout setLayout = VK_NULL_HANDLE; bool ok = false; std::string reason;
+  // program constants (c[1]) as a 64 KiB zero padded uniform buffer slot, created on first draw
+  std::vector<uint8_t> consts; VkBuffer constBuf = VK_NULL_HANDLE; VkDeviceSize constOff = 0;
+  bool supportChecked = false;
 };
 struct ProgramImpl {
   std::vector<StageProgram*> stages;   // indexed by order given
@@ -192,7 +206,19 @@ struct ProgramImpl {
 bool ShaderCacheLoad(const std::string& root);                            // index.jsonl loader
 void ShaderCacheAdd(const std::string& key, int stage, const std::vector<uint32_t>& spv, const Manifest& m);   // tests, replace/
 StageProgram* ShaderCacheGet(const std::string& key);
+void ShaderCacheAlias(const std::string& alias, const std::string& key);                  // tests: `alias` resolves to the cache entry `key`
+void ShaderCacheSetConstants(const std::string& key, const std::vector<uint8_t>& bytes);   // tests: c[1] bytes of an added stage
 void ShaderCacheReleaseVk();                                              // device teardown
+// Check the module's declared SPIR-V capabilities and extensions against the device (once per stage). False sets sp->reason and
+// sp->ok = false; the draws that use the stage are skipped and the reason is logged once.
+bool ShaderCacheCheckDevice(StageProgram* sp);
+// Program constants (c[1]) of a stage as a 64 KiB zero padded uniform range. False when the file is missing (the caller binds zeros).
+bool ShaderCacheConstants(StageProgram* sp, VkBuffer* buf, VkDeviceSize* off);
+bool ShaderStageReady(StageProgram* sp);                                  // device check, VkShaderModule and descriptor set layout (tests, warm up)
+void ShaderCacheDrop(const std::string& key);                             // forget a loaded stage and its Vulkan objects (sweeps; no program may use it)
+size_t ShaderCacheIndexSize();                                         // entries in index.jsonl
+bool ShaderCacheIndexAt(size_t i, std::string* key, int* stage, bool* ok);   // enumerate the index (tests, sweeps)
+const std::string& ShaderCacheRoot();
 void ReplayShutdown();                                                    // device teardown: pipelines, layouts, dummies, scratch
 std::string Sha256Hex(const void* data, size_t n);
 const char* StageName(int stage);

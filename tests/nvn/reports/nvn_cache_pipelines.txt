@@ -1,0 +1,50 @@
+[nvn] shader cache: 25754 ok, 0 failed (A:/AI/Recomps/smrpg-work/shaders/cache/reuse-v1)
+cache A:/AI/Recomps/smrpg-work/shaders/cache/reuse-v1: 25754 index entries, 25754 ok, 0 failed in the index
+  stage vs       1304
+  stage fs       24446
+  stage gs       4
+static sample: 614 stage programs, 614 with SPIR-V magic, 614 with a support buffer, 583 with c[1] constants (583 loaded), 614 with capabilities, 614 with inputs
+[nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=0 validation=1
+[nvn] device initialized on NVIDIA GeForce RTX 4090
+device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=on subgroupSize=32
+support/constants pixel: (255,255,191,96), expected (255,255,191,96)
+variants.jsonl: 26766 distinct (vs, fs, gs) combinations
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more than VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710)
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more than VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710)
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more than VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710)
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more than VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710)
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more than VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710)
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more than VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710)
+[nvn] draw samples texture id 0 that is not registered in the bound texture pool
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] stage vs storage buffer 0 is not bound
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
+The input variable is:
+  pointer to Input -> vec4 of float32
+The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding shader stage's OpEntryPoint with Output as the Storage Class (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-OpEntryPoint-08743)
+[nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
+The input variable is:
+  pointer to Input -> vec4 of float32
+The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding shader stage's OpEntryPoint with Output as the Storage Class (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-OpEntryPoint-08743)
+variants: 600 sampled (6 with a geometry stage), 0 skipped (a stage failed the device check or did not translate), 0 incomplete
+variants: 600 draws recorded, replay executed 600 draws and skipped 0, built 600 pipelines, 0 pipeline failures
+variants: 647 stage programs use textures (437 shadow), 1206 have a support buffer, 639 have c[1] constants files, 2 write more than one target
+validation: 8 errors (8 known layer false positives), 0 warnings; by message id:
+  known VUID-RuntimeSpirv-OpEntryPoint-08743                       x2  # a fragment input the vertex shader does not write (61 pairs in the cache, undefined value)
+      first: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
+The input variable is:
+  pointer to Input -> vec4 of float32
+The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding shader stage's OpEntryPoint with Output as the Storage Class (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-OpEntryPoint-
+  known VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710    x6  # layer sums the gl_in and gl_out blocks of a geometry shader (each is 7 + 1 = 8)
+      first: vkCreateGraphicsPipelines(): pCreateInfos[0].pStages[2] shader [VK_SHADER_STAGE_GEOMETRY_BIT] has a ClipDistance BuiltIn array size of 14 and a CullDistance BuiltIn array size of 2 which sum to 16 and exceed maxCombinedClipAndCullDistances of 8.
+The Vulkan spec states: If VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances is not zero, then any entry point interface variable declared with the ClipDistance BuiltIn and CullDistance BuiltIn decoration must not have array sizes which sum to more than VkPhysicalDeviceLimits::maxCombinedClipAndCullDistances (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710)
+nvn_cache: 1229 checks, 0 failed
