@@ -4,6 +4,7 @@
 
 #include "../rt_internal.h"
 #include <timeapi.h>
+#include "overlay/overlay.h"
 #include "pad.h"
 #include "plat.h"
 
@@ -45,10 +46,12 @@ static void log_window_state(const char *when) {
              r.bottom, (SDL_GetWindowFlags(P.win) & SDL_WINDOW_HIDDEN) ? 1 : 0);
 }
 
-static void load_keymap(void) {
+/* chosen: a map picked in the options overlay (empty: none). At startup SMRPG_INPUT_CONFIG wins over it; when the overlay changes it live (use_env 0) it does not. */
+static void load_keymap(const char *chosen, int use_env) {
     char path[MAX_PATH] = "";
-    const char *cfg = getenv("SMRPG_INPUT_CONFIG");
+    const char *cfg = use_env ? getenv("SMRPG_INPUT_CONFIG") : NULL;
     if (cfg && *cfg) snprintf(path, sizeof path, "%s", cfg);
+    else if (chosen && *chosen) snprintf(path, sizeof path, "%s", chosen);
     else {
         char exe[MAX_PATH];
         DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
@@ -65,6 +68,12 @@ static void load_keymap(void) {
     int n = pad_keymap_load(&P.in.keymap, path);
     if (n < 0) plat_log("platform: keyboard map: built-in defaults (no %s)", path);
     else plat_log("platform: keyboard map: %d bindings from %s over the defaults", n, path);
+}
+
+void plat_apply_keymap(const char *path) {
+    pad_keymap_defaults(&P.in.keymap);
+    pad_input_clear_keys(&P.in);
+    load_keymap(path, 0);
 }
 
 static int load_script(void) {
@@ -100,10 +109,11 @@ int plat_init(const PlatOptions *o) {
     fine_timer();
     P.show = o->show_window;
     P.fullscreen = o->fullscreen;
+    overlay_init();                                                            /* task-16: options file (docs/PLATFORM.md "Options") */
     pad_input_init(&P.in);
-    load_keymap();
+    load_keymap(overlay_input_map(), 1);
     P.scripted = load_script();
-    plat_audio_set_enabled(o->audio);
+    plat_audio_set_enabled(o->audio || overlay_audio_enabled());
     plat_log("platform: audio %s", o->audio ? "ON (--audio): a real device opens when the game opens audout" : "off: null sink, no device");
 
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -115,7 +125,7 @@ int plat_init(const PlatOptions *o) {
     P.win = SDL_CreateWindow("Star Road Recomp", 1280, 720, wf);
     if (!P.win) { plat_log("platform: cannot create the window: %s", SDL_GetError()); return 1; }
     if (P.show) {
-        if (P.fullscreen) SDL_SetWindowFullscreen(P.win, true);
+        if (P.fullscreen || overlay_start_fullscreen()) SDL_SetWindowFullscreen(P.win, true);
         SDL_ShowWindow(P.win);
         SDL_RaiseWindow(P.win);
     }
@@ -129,9 +139,11 @@ int plat_init(const PlatOptions *o) {
 
 int plat_window_visible(void) { return P.visible ? 1 : 0; }
 uint32_t plat_frame(void) { return (uint32_t)P.frame; }
+void *plat_sdl_window(void) { return P.win; }
 
 void plat_present_tick(void) {
     LONG f = InterlockedIncrement(&P.frame);
+    overlay_pace();                                                            /* frame rate cap (options; "game" = no cap) */
     if (f == 300) log_window_state("present 300");
 }
 
@@ -167,11 +179,16 @@ static void handle_event(const SDL_Event *e) {
         break;
     }
     case SDL_EVENT_KEY_DOWN:
-        if (P.show && !e->key.repeat && (e->key.scancode == SDL_SCANCODE_F11 || (e->key.scancode == SDL_SCANCODE_RETURN && (e->key.mod & SDL_KMOD_ALT))))
-            SDL_SetWindowFullscreen(P.win, !(SDL_GetWindowFlags(P.win) & SDL_WINDOW_FULLSCREEN));
+        if (P.show && !e->key.repeat && (e->key.scancode == SDL_SCANCODE_F11 || (e->key.scancode == SDL_SCANCODE_RETURN && (e->key.mod & SDL_KMOD_ALT)))) {
+            bool fs = !(SDL_GetWindowFlags(P.win) & SDL_WINDOW_FULLSCREEN);
+            SDL_SetWindowFullscreen(P.win, fs);
+            overlay_note_fullscreen(fs);
+        }
+        if (!e->key.repeat && e->key.scancode == SDL_SCANCODE_F1) overlay_toggle("F1");      /* the options overlay (task-16) */
         break;
     default: break;
     }
+    overlay_event(e);
     if (!P.scripted) pad_input_event(&P.in, e);
 }
 
@@ -184,6 +201,8 @@ static void publish_pads(void) {
     } else {
         pad_input_compose(&P.in, pads, &mask);
     }
+    overlay_filter_pads(pads, &mask);                                          /* task-16: the overlay's combo; no input reaches the game while it is open */
+    pads[0].buttons &= ~PAD_SCRIPT_OVERLAY;
     hle_hid_publish(pads, mask);
     P.published++;
 }
@@ -194,6 +213,7 @@ void plat_run(void *boot_thread) {
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) handle_event(&e);
+        overlay_main_tick(P.win);
         uint64_t now = SDL_GetTicks();
         if (now >= next) {
             publish_pads();
@@ -211,6 +231,7 @@ void plat_run(void *boot_thread) {
 void plat_shutdown(void) {
     if (!P.ready) return;
     P.ready = 0;
+    overlay_shutdown();
     if (P.win) SDL_DestroyWindow(P.win);
     P.win = NULL;
     pad_script_free(&P.script);

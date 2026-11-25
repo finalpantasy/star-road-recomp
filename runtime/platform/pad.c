@@ -239,6 +239,7 @@ static int script_token(const char *tok, PadScriptEntry *e) {
         {"RSTICK_UP", 0, 0, 0, PAD_STICK_MAX}, {"RSTICK_DOWN", 0, 0, 0, -PAD_STICK_MAX}, {"RSTICK_LEFT", 0, 0, -PAD_STICK_MAX, 0}, {"RSTICK_RIGHT", 0, 0, PAD_STICK_MAX, 0}};
     int b = pad_button_from_name(tok);
     if (b >= 0) { e->buttons = PAD_BIT(b); return 0; }
+    if (!SDL_strcasecmp(tok, "F1")) { e->buttons = PAD_SCRIPT_OVERLAY; return 0; }      /* toggles the options overlay (task-16) */
     for (size_t i = 0; i < sizeof sticks / sizeof sticks[0]; i++)
         if (!SDL_strcasecmp(tok, sticks[i].name)) { e->lx = sticks[i].lx; e->ly = sticks[i].ly; e->rx = sticks[i].rx; e->ry = sticks[i].ry; return 0; }
     int right = !SDL_strncasecmp(tok, "RSTICK_", 7);

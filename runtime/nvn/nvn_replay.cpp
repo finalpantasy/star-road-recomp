@@ -9,6 +9,8 @@
 #include <mutex>
 
 #include "../gfx/texture/texture.h"
+#include "../gfx/upscale/overlay_hook.h"
+#include "../gfx/upscale/upscale.h"
 #include "nvn_core.h"
 
 namespace nvn {
@@ -1223,6 +1225,8 @@ bool WindowCreate(WindowImpl* w) {
 void WindowDestroy(WindowImpl* w) {
   if (!g_vk.inited) return;
   g_vk.f.vkDeviceWaitIdle(g_vk.dev);
+  for (VkImageView v : w->swapViews) g_vk.f.vkDestroyImageView(g_vk.dev, v, nullptr);
+  upscale::Shutdown();
   if (w->swap) g_vk.f.vkDestroySwapchainKHR(g_vk.dev, w->swap, nullptr);
   if (w->acquireSem) g_vk.f.vkDestroySemaphore(g_vk.dev, w->acquireSem, nullptr);
   for (VkSemaphore s : w->presentSems) g_vk.f.vkDestroySemaphore(g_vk.dev, s, nullptr);
@@ -1259,13 +1263,24 @@ static bool EnsureSwapchain(WindowImpl* w, VkFormat want, uint32_t width, uint32
   }
   VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
   ci.surface = w->surface; ci.minImageCount = std::max(2u, caps.minImageCount); ci.imageFormat = pick.format; ci.imageColorSpace = pick.colorSpace; ci.imageExtent = ext;
-  ci.imageArrayLayers = 1; ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ci.imageArrayLayers = 1; ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  // Only when the surface offers it: lets the overlay hook (task-16 hashes) and SMRPG_PRESENT_HASH read the presented image back. Output is unchanged.
+  if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
   ci.preTransform = caps.currentTransform; ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; ci.presentMode = mode; ci.clipped = VK_TRUE; ci.oldSwapchain = w->swap;
   VkSwapchainKHR ns = VK_NULL_HANDLE;
   if (F.vkCreateSwapchainKHR(g_vk.dev, &ci, nullptr, &ns) != VK_SUCCESS) { LogOnce("swapfail", "swapchain creation failed; presenting offscreen only"); w->useSwapchain = false; return false; }
   if (w->swap) F.vkDestroySwapchainKHR(g_vk.dev, w->swap, nullptr);
   w->swap = ns; w->swapFormat = pick.format; w->swapExtent = ext; w->swapHidden = hidden;
   uint32_t ni = 0; F.vkGetSwapchainImagesKHR(g_vk.dev, ns, &ni, nullptr); w->swapImages.resize(ni); F.vkGetSwapchainImagesKHR(g_vk.dev, ns, &ni, w->swapImages.data());
+  for (VkImageView v : w->swapViews) F.vkDestroyImageView(g_vk.dev, v, nullptr);      // the device is idle (waited above)
+  w->swapViews.assign(ni, VK_NULL_HANDLE);
+  for (uint32_t i = 0; i < ni; i++) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; vi.image = w->swapImages[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = pick.format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    F.vkCreateImageView(g_vk.dev, &vi, nullptr, &w->swapViews[i]);
+  }
+  w->swapGeneration++;
   for (VkSemaphore s : w->presentSems) F.vkDestroySemaphore(g_vk.dev, s, nullptr);      // the device is idle (waited above)
   w->presentSems.assign(ni, VK_NULL_HANDLE);
   VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -1303,11 +1318,29 @@ void QueuePresent(QueueImpl* q, WindowImpl* w, uint32_t idx) {
   };
   trans(w->swapImages[img], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
   GlobalBarrier(cb);
-  VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bl.dstSubresource = bl.srcSubresource;
-  bl.srcOffsets[1] = {(int32_t)t->width, (int32_t)t->height, 1};
-  if (q->dev && q->dev->originMode == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT) { bl.srcOffsets[0].y = (int32_t)t->height; bl.srcOffsets[1].y = 0; } bl.dstOffsets[1] = {(int32_t)w->swapExtent.width, (int32_t)w->swapExtent.height, 1};
-  F.vkCmdBlitImage(cb, t->image, VK_IMAGE_LAYOUT_GENERAL, w->swapImages[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
-  trans(w->swapImages[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+  // Frame order (task-23): 1. game image to the swapchain image, through the upscale pass when one is on, else the plain blit;
+  //                        2. PlatOverlayDraw (task-16); 3. present. Hook 1 returns false with upscale off, and then nothing changes.
+  const bool flipY = q->dev && q->dev->originMode == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT;
+  upscale::PresentIO uio{cb, t->image, t->vkFormat, t->width, t->height, flipY, w->swapImages[img], w->swapFormat, w->swapExtent.width, w->swapExtent.height, w->presents};
+  if (!upscale::Record(uio)) {
+    VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bl.dstSubresource = bl.srcSubresource;
+    bl.srcOffsets[1] = {(int32_t)t->width, (int32_t)t->height, 1};
+    if (flipY) { bl.srcOffsets[0].y = (int32_t)t->height; bl.srcOffsets[1].y = 0; } bl.dstOffsets[1] = {(int32_t)w->swapExtent.width, (int32_t)w->swapExtent.height, 1};
+    F.vkCmdBlitImage(cb, t->image, VK_IMAGE_LAYOUT_GENERAL, w->swapImages[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+  }
+  trans(w->swapImages[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  {
+    PlatOverlayFrame of{};
+    of.struct_size = sizeof(of); of.frame = (uint32_t)w->presents;
+    of.instance = g_vk.inst; of.physical_device = g_vk.phys; of.device = g_vk.dev; of.queue = g_vk.queue; of.queue_family = g_vk.family;
+    of.image_count = (uint32_t)w->swapImages.size(); of.get_instance_proc_addr = (void*)g_vk.f.vkGetInstanceProcAddr;
+    of.command_buffer = cb; of.image = w->swapImages[img]; of.image_view = w->swapViews[img]; of.image_index = img; of.format = (uint32_t)w->swapFormat;
+    of.width = w->swapExtent.width; of.height = w->swapExtent.height; of.layout = (uint32_t)VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    of.game_width = t->width; of.game_height = t->height; of.swapchain_generation = w->swapGeneration;
+    PlatOverlayDraw(&of);
+  }
+  upscale::DebugAfterOverlay(uio);                                  // hashes the presented image when SMRPG_PRESENT_HASH asks; otherwise returns at once
+  trans(w->swapImages[img], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
   F.vkEndCommandBuffer(cb);
   uint64_t value = NextTimeline();
   VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}; cbi.commandBuffer = cb;

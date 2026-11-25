@@ -61,6 +61,7 @@ def main():
         else:
             print("note: no", src, "(a build without the platform layer does not need it)")
     shutil.copyfile(os.path.join(ROOT, "config", "input.default.ini"), os.path.join(BUILD, "bin", "input.default.ini"))   # the default keyboard map
+    shutil.copyfile(os.path.join(ROOT, "config", "options.default.ini"), os.path.join(BUILD, "bin", "options.default.ini"))   # task-16: documented defaults (options.ini is written by the overlay)
     return 0
 
 

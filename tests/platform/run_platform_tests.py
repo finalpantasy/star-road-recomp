@@ -55,6 +55,22 @@ def build_unit():
     return exe
 
 
+def build_options_test():
+    """task-16: the options store (runtime/platform/overlay/options.c) is plain C with no SDL: its own small test."""
+    clang = shutil.which("clang")
+    if not clang:
+        return None
+    os.makedirs(OUT, exist_ok=True)
+    exe = os.path.join(OUT, "test_options.exe")
+    ovl = os.path.join(ROOT, "runtime", "platform", "overlay")
+    cmd = [clang, "-O1", "-g", "-Wall", "-Wextra", "-std=gnu11", os.path.join(ROOT, "tests", "platform", "test_options.c"), os.path.join(ovl, "options.c"), "-o", exe]
+    p = subprocess.run(cmd, capture_output=True, text=True, creationflags=BELOW_NORMAL | NO_WINDOW)
+    if p.returncode:
+        print("BUILD FAILED (test_options)" + chr(10) + (p.stdout + p.stderr)[-3000:])
+        return False
+    return exe
+
+
 def run_unit(exe):
     p = subprocess.Popen([exe, OUT, ROOT], cwd=OUT, env=muted_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          creationflags=BELOW_NORMAL | NO_WINDOW)
@@ -130,6 +146,15 @@ def main():
     lines += ["## Unit test (test_platform.c)", "", "```", out.strip()[-3500:], "```", "", "Exit code %d." % rc, ""]
     if rc:
         code = 1
+    oexe = build_options_test()
+    if oexe is False:
+        code = 1
+    elif oexe:
+        rc2, out2 = run_unit(oexe)
+        print(out2)
+        lines += ["## Options store (test_options.c, task-16)", "", "```", out2.strip()[-2000:], "```", "", "Exit code %d." % rc2, ""]
+        if rc2:
+            code = 1
     if a.game:
         r = run_game(a.game_seconds)
         if r is None:

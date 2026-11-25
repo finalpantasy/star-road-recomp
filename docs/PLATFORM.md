@@ -43,8 +43,70 @@ Confirmed on the game's own sdk by disassembling `nn::hid::GetNpadStates` (sdk+0
 2. Game-side proof: `hle_nn.c` logs what the game's own `nn::hid::GetNpadStates` returns whenever the buttons change (`hid read: ... buttons=0x1`). Example run: `SMRPG_INPUT="100:A:30,200:STICK_UP:40,260:PLUS:5"` shows buttons `0x1`, then `0x20000` with `lstick=(0,32767)`, then `0x400`.
 3. Hidden picture: `SMRPG_CAPTURE_FRAMES=1,300` capture at present 300 is the Loading screen (2366 non-black pixels, only the spinner differs from the earlier baseline).
 
+## Present hooks: upscale pass and overlay (task-23, stable)
+
+`QueuePresent` (`runtime/nvn/nvn_replay.cpp`) records one command buffer per presented frame, in this order. Nothing else edits it: the overlay (task-16) and the upscaler (task-23) plug in through the two functions below.
+
+1. Game image to the swapchain image: `upscale::Record(...)` (`runtime/gfx/upscale/upscale.h`). With `upscale = off`, the default, it returns false and the original `vkCmdBlitImage` runs.
+2. `PlatOverlayDraw(const PlatOverlayFrame*)` (`runtime/gfx/upscale/overlay_hook.h`): the overlay records into the same command buffer.
+3. Swapchain image to `PRESENT_SRC_KHR`, submit, present.
+
+`PlatOverlayDraw` has a weak no-op default in `runtime/gfx/upscale/overlay_stub.cpp` (part of the NVN library). A strong definition with the same signature in any object linked into `smrpg.exe` replaces it; no `QueuePresent` edit is needed. Contract (fields are only ever appended; `struct_size` says how many the caller filled):
+
+| Field | Meaning |
+|---|---|
+| `struct_size`, `frame` | `sizeof` of the caller's struct; 1-based present number of this window |
+| `instance`, `physical_device`, `device`, `queue`, `queue_family` | Vulkan handles as `void*` (Vulkan 1.3, dynamic rendering and synchronization2 on). Never submit to `queue` from the hook |
+| `get_instance_proc_addr` | `PFN_vkGetInstanceProcAddr`: the runtime links no Vulkan import library, so load every entry point through it (for ImGui: `ImGui_ImplVulkan_LoadFunctions`) |
+| `command_buffer` | recording, outside any render pass, one-time submit; record only, never end or submit it |
+| `image`, `image_view`, `image_index`, `image_count`, `format` | the swapchain image this frame presents and a 2D view of it (usage `COLOR_ATTACHMENT` and `TRANSFER_DST`); `format` is `B8G8R8A8_SRGB` when the game draws sRGB, else `B8G8R8A8_UNORM` (the sRGB case gets gamma from the view) |
+| `width`, `height` | extent of `image`: the window size; the upscaled picture (any target size) already fills it |
+| `layout` | `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` on entry; leave the image in it |
+| `game_width`, `game_height` | size of the game's own final image |
+| `swapchain_generation` | changes when the swapchain is rebuilt (resize, out of date): drop anything keyed on the old image views |
+
+Runs on the presenting thread with the NVN lock held; do not block on the GPU. Per-frame resources need their own fences: the frame waits for its own submit before the next present (`WaitTimeline`), so a resource used only by this frame is free again at the next call.
+
+Upscale settings (environment now, the overlay calls the `upscale::Set*` functions later): `SMRPG_UPSCALE=off|fsr1|fsr2` (default `off`), `SMRPG_UPSCALE_SHARPNESS` (RCAS attenuation in stops, default 0.25, negative turns sharpening off), `SMRPG_UPSCALE_TARGET=WxH` (output size, default the swapchain extent).
+
+### Upscaling (task-23)
+
+`upscale = off | fsr1 | fsr2` is applied at present time to the game's final image (`runtime/gfx/upscale/upscale.cpp`). `off` is the default and is the original blit, unchanged. `fsr1` is AMD FidelityFX FSR 1 (MIT, pinned v1.0.2, fetched by `tools/thirdparty/fetch_fsr.py`; shaders compiled at build time): EASU upscale, then RCAS sharpening, both compute passes on the encoded (gamma) values the game wrote. An sRGB game target is read through a raw UNORM view and the bytes are copied back unchanged. The output size is `SMRPG_UPSCALE_TARGET` (default the swapchain extent): equal to the swapchain it is a raw copy, otherwise a linear blit to the window. NVN's lower-left origin is honored.
+
+`fsr2` is not available and falls back to the plain blit with a logged reason. FSR 2 needs per-pixel motion vectors, a depth buffer and camera jitter in the projection. At present time only the final color image is reachable. The game's URP 12 does not run its motion vector pass: the `Hidden/kMotion/CameraMotionVectors` and `ObjectMotionVectors` shaders are in the shader set, but the pass is off (the public ElKiro recomp forced it on). Doing it here means patching the pipeline asset in guest memory to enable the pass, finding that render target in the NVN draw stream and jittering the camera matrices. That is its own task, after the faithful path is complete. Until then `fsr1` is the upscaler.
+
+Debug captures (all off unless set): `SMRPG_UPSCALE_CAPTURE_DIR` with `SMRPG_UPSCALE_CAPTURE_FRAMES=a,b` or `SMRPG_UPSCALE_CAPTURE_EVERY=N` writes `upscale_<frame>_in.png` (the game image) and `_out.png` (the pass output at the target size). `SMRPG_PRESENT_HASH=a,b` or `every:N` logs `present-hash: frame N ... fnv1a64 ...` of the image actually presented. With upscale off the line ends `ref-blit=equal` when the presented image equals the original plain blit redone in the same command buffer, byte for byte, and `ref-blit=DIFFERENT` otherwise. `SMRPG_PRESENT_HASH_DIR` also writes the presented image as PNG. Test: `python -I tests/upscale/run_upscale_tests.py`.
+
+## Options overlay (task-16)
+
+A Dear ImGui menu drawn over the presented frame. It is the one place the player changes settings; every item reads and writes `options.ini`.
+
+Open or close it with `F1`, or with L + R + MINUS held together on a controller (scripted input: the token `F1`, for example `SMRPG_INPUT=300:F1:3`). While it is open the game gets no input: `overlay_filter_pads` (`runtime/platform/overlay/overlay_apply.cpp`) zeroes every pad before it reaches the hid shared memory, and the log says how many samples carried input (`overlay: while open, N pad samples, M carried input; all hidden from the game`). After it closes, buttons and the stick that are still held stay hidden from the game until they are let go, so closing with B does not also press B in the game. The menu is driven by the Switch button snapshot (keyboard, gamepad or script alike): d-pad or left stick up/down moves, left/right changes the value (holding repeats), A is next value, X restores the default, L/R switch page, B closes. The mouse also works while it is open (click = next value, right click = previous). Pages: Display, Performance, Audio, Controls, Menu (reset all options needs A twice; close menu).
+
+| Page | Key in `options.ini` | Values | Applies |
+|---|---|---|---|
+| Display | `display.window_mode` | `windowed`, `fullscreen` | live when the window is shown (`--window`); F11 and Alt+Enter keep the option in step |
+| Display | `display.upscale` | `off`, `fsr1`, `fsr2` (falls back to the blit, see above) | live (`upscale::SetMode`) |
+| Display | `display.upscale_target` | `window`, `1080p`, `1440p`, `2160p` | live |
+| Display | `display.sharpness` | `off`, `sharpest`, `strong`, `default`, `mild`, `soft` | live |
+| Performance | `performance.fps_cap` | `game` (no cap), `30`, `60`, `90`, `120`, `144`, `240` | live (`overlay_pace`, once per presented frame, before the frame is recorded) |
+| Audio | `audio.enabled` | `off`, `on` | on restart (marked in the menu) |
+| Audio | `audio.volume` | 0 to 100, step 5 | live (`plat_audio_set_volume`) |
+| Controls | `controls.input_map` | `auto`, or an `input*.ini` file beside the exe | live (`plat_apply_keymap`) |
+| Gameplay | `gameplay.unlock_postgame` | `off`, `on` (task-24) | on save load or new game (marked "on load"); the game reads it then |
+
+File: `options.ini` beside `smrpg.exe`, or the path in `SMRPG_OPTIONS`. `config/options.default.ini` is the committed default (build_game.py copies it beside the exe; the generated copy is checked by `tests/platform/test_options.c`). A missing file or key keeps the default; unknown keys are preserved on save; the file is written atomically a moment after the last change, and at exit. `config/options.ini` is ignored by Git. Environment variables that already existed (`SMRPG_UPSCALE*`, `SMRPG_INPUT_CONFIG`, `--audio`) win over the file at startup; the menu then takes over.
+
+Reading an option from game or HLE code (task-24 and later): `#include "platform/overlay/overlay.h"`, then `overlay_unlock_postgame()` (1 when `gameplay.unlock_postgame = on`) or the general `overlay_option(OPT_UNLOCK_POSTGAME)` (ids in `runtime/platform/overlay/options.h`; enum and bool options return the index, so `off`/`on` are 0/1). It reads the live value under a lock on every call, so call it when the save loads or a new game starts, not once at startup. Without the overlay build both return 0, which is the faithful default. Adding an option: one line in the table in `options.c` (section, key, page, label, help, type, default, when it applies) and an id in `options.h`; the menu page, the ini and the default file follow from the table (regenerate `config/options.default.ini` with `test_options --emit`).
+
+The default for every option is the faithful behavior (D-004): no upscale, no cap, windowed, audio as before, the default keyboard map. With the menu closed nothing is recorded into the frame: `PlatOverlayDraw` returns on its first line, and `SMRPG_PRESENT_HASH` reports `ref-blit=equal`.
+
+Build: Dear ImGui is not in the repo. `python tools/thirdparty/fetch_imgui.py` downloads the pinned release (v1.93.0, sha256 checked) into `A:\AI\Recomps\thirdparty\imgui` (override with `SMRPG_IMGUI_DIR`); `runtime/CMakeLists.txt` builds the overlay only when that directory exists (otherwise `overlay.h` compiles to no-ops). Threading: ImGui is touched only on the presenting thread; the main thread feeds it pad snapshots and mouse events through queues and applies the window and keymap requests the menu makes.
+
+Contract note for the hook: the ImGui Vulkan backend uploads its font texture with its own queue submit and `vkQueueWaitIdle`, once on the first open and again when a new glyph is needed. That is one short stall while the menu is open and never happens with it closed, but it is a queue submit inside `PlatOverlayDraw` (the contract says the overlay only records). Tests: `tests/platform/test_options.c` (the options store, run by `run_platform_tests.py`).
+
 ## Known limits
 
 - Real audio is only the audout PCM path. The game's music and effects go through audren (`hle_audio.c` has no DSP: a null renderer), so `--audio` is silent until an audren mixer exists. That is a separate task.
 - Rumble, motion, touch, handheld/joy-con styles and more than four players are not provided.
-- Keyboard rebinding is an ini file; a UI is the overlay's (task-16).
+- Keyboard rebinding is an ini file; the Controls page of the overlay picks the map file (task-16).

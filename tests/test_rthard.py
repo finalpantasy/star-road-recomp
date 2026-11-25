@@ -152,7 +152,7 @@ def patched_runtime():
     pdir = os.path.join(WORK, "patched")
     os.makedirs(pdir, exist_ok=True)
     srcs = [os.path.join(rt, f) for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "main.c", "rt_weak.c", "interp.c", "crypto_a64.c")]
-    srcs += [os.path.join(rt, "eh", "eh.c"), os.path.join(rt, "gc", "gc.c")] + sorted(glob.glob(os.path.join(rt, "hle", "*.c")))
+    srcs += [os.path.join(rt, "eh", "eh.c"), os.path.join(rt, "gc", "gc.c")] + sorted(glob.glob(os.path.join(rt, "hle", "*.c"))) + sorted(glob.glob(os.path.join(rt, "mods", "*.c")))
     notes = []
     s = open(os.path.join(rt, "svc.c")).read()
     if "gc_set_activity" not in s:

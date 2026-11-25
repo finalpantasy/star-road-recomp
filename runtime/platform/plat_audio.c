@@ -16,8 +16,14 @@ struct PlatAudioSink {
 };
 
 static int g_enabled;
+static volatile int g_volume = 100;            /* percent */
+static PlatAudioSink *g_cur;                   /* the open sink (one audout at a time), for live volume changes */
 void plat_audio_set_enabled(int on) { g_enabled = on; }
 int plat_audio_enabled(void) { return g_enabled; }
+void plat_audio_set_volume(int percent) {
+    g_volume = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
+    if (g_cur) SDL_SetAudioStreamGain(g_cur->stream, (float)g_volume / 100.0f);
+}
 
 PlatAudioSink *plat_audio_open(uint32_t rate, uint32_t channels) {
     if (!g_enabled) return NULL;
@@ -27,6 +33,8 @@ PlatAudioSink *plat_audio_open(uint32_t rate, uint32_t channels) {
     if (!st) { plat_log("platform: cannot open the audio device: %s", SDL_GetError()); SDL_QuitSubSystem(SDL_INIT_AUDIO); return NULL; }
     PlatAudioSink *s = (PlatAudioSink *)calloc(1, sizeof *s);
     s->stream = st; s->rate = rate; s->channels = channels;
+    SDL_SetAudioStreamGain(st, (float)g_volume / 100.0f);
+    g_cur = s;
     SDL_ResumeAudioStreamDevice(st);
     plat_log("platform: audio device open (driver %s, %u Hz, %u channels)", SDL_GetCurrentAudioDriver(), rate, channels);
     return s;
@@ -51,6 +59,7 @@ void plat_audio_pause(PlatAudioSink *s, int paused) {
 
 void plat_audio_close(PlatAudioSink *s) {
     if (!s) return;
+    if (g_cur == s) g_cur = NULL;
     SDL_DestroyAudioStream(s->stream);        /* also closes the device it opened */
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     free(s);

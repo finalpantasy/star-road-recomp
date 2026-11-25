@@ -30,8 +30,10 @@ void plat_shutdown(void);
 int plat_window_visible(void);               /* 1 while the window is shown on screen */
 void plat_present_tick(void);                /* one presented frame (the scripted input clock) */
 uint32_t plat_frame(void);
+void *plat_sdl_window(void);                 /* the SDL_Window (NULL before plat_init); the options overlay's Dear ImGui SDL3 backend needs it */
 int plat_create_surface(void *vk_instance, uint64_t *vk_surface);       /* VkInstance, VkSurfaceKHR; 1 ok */
 void plat_destroy_surface(void *vk_instance, uint64_t vk_surface);
+void plat_apply_keymap(const char *path);    /* main thread: reload the keyboard map ini (NULL or empty: the default search, as at startup) */
 void plat_register_nvn(void);                /* plat_nvn.cpp: gives the window to NVN; call before the first NVN device is created */
 
 /* ---- pad state sink (hle_hid.c implements it) */
@@ -40,6 +42,7 @@ void hle_hid_publish(const PadState pads[PAD_MAX_PLAYERS], uint32_t connected_ma
 /* ---- audio */
 typedef struct PlatAudioSink PlatAudioSink;
 void plat_audio_set_enabled(int on);
+void plat_audio_set_volume(int percent);     /* 0 .. 100, any time: the open sink and every later one (task-16 options) */
 int plat_audio_enabled(void);
 PlatAudioSink *plat_audio_open(uint32_t rate, uint32_t channels);        /* int16 interleaved; NULL when audio is off (null sink) or no device */
 void plat_audio_write(PlatAudioSink *s, const void *pcm, uint32_t bytes);

@@ -337,6 +337,13 @@ static void test_script(void) {
     CHECK_EQ(p.buttons & (PAD_BIT(PAD_A) | PAD_BIT(PAD_B)), PAD_BIT(PAD_A) | PAD_BIT(PAD_B));
     CHECK_EQ(p.lx, PAD_STICK_MAX);
     pad_script_free(&s);
+    /* the token F1 toggles the options overlay (task-16): its own bit, no Switch button */
+    CHECK_EQ(pad_script_parse(&s, "50:F1:3", err, sizeof err), 0);
+    pad_script_state(&s, 51, &p);
+    CHECK_EQ(p.buttons, PAD_SCRIPT_OVERLAY);
+    pad_script_state(&s, 60, &p);
+    CHECK_EQ(p.buttons, 0);
+    pad_script_free(&s);
 }
 
 /* ------------------------------------------------------------------ 5: audio */

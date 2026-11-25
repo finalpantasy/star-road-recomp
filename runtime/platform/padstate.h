@@ -11,6 +11,7 @@ enum {   /* nn::hid::NpadButton bit numbers */
     PAD_NUM_MAPPABLE = 16           /* the sixteen a keyboard map binds; the stick direction bits are derived from the sticks */
 };
 #define PAD_BIT(n) (1ull << (n))
+#define PAD_SCRIPT_OVERLAY PAD_BIT(63)   /* scripted input only: the token F1 (task-16); the overlay consumes it, it never reaches the hid shared memory */
 #define PAD_STICK_MAX 32767
 #define PAD_MAX_PLAYERS 8
 

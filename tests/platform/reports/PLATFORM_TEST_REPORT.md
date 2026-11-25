@@ -12,7 +12,15 @@ keyboard map ini
 scripted input
 audio (muted by default)
 audio (--audio, dummy driver: no sound)
-389 checks, 0 failed
+392 checks, 0 failed
+```
+
+Exit code 0.
+
+## Options store (test_options.c, task-16)
+
+```
+options: 144 checks, 0 failed
 ```
 
 Exit code 0.

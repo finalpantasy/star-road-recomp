@@ -20,6 +20,8 @@ endif()
 add_library(smrpg_nvn STATIC
   nvn_vk.cpp nvn_objects.cpp nvn_formats.cpp nvn_shaders.cpp nvn_replay.cpp nvn_proc.cpp
   nvn_api_device.cpp nvn_api_mem.cpp nvn_api_cmd.cpp)
+# task-23: present-time upscale pass (FSR 1) and the weak overlay hook, runtime/gfx/upscale/, compiled into this library so QueuePresent links without a cycle
+include(${CMAKE_CURRENT_SOURCE_DIR}/../gfx/upscale/upscale.cmake)
 target_include_directories(smrpg_nvn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${NVN_VULKAN_SDK}/Include)
 target_include_directories(smrpg_nvn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_compile_definitions(smrpg_nvn PUBLIC _WIN32_WINNT=0x0A00)

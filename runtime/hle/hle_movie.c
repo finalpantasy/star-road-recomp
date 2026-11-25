@@ -12,6 +12,8 @@
  * Decoding is libavcodec's VP9 decoder from a separate LGPL-only DLL (tools/ffmpeg/build.py), loaded with LoadLibrary; a missing DLL makes
  * Configure fail (the movie never starts) instead of stopping the process. No other FFmpeg library is used: the NV12 packing is ours. */
 #include "hle.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 #if __has_include(<libavcodec/avcodec.h>)
 #define MOVIE_HAVE_FFMPEG 1
@@ -353,6 +355,7 @@ typedef struct MovieDec {
     AVFrame *pic[NOUT];                                 /* the decoded picture of each output slot until the game takes it */
 #endif
     uint64_t tex_writes, tex_fail;
+    int serial;                                         /* 1-based order of the decoder that first wrote a texture (diagnostics) */
 } MovieDec;
 
 static uint64_t g_dec_vt;
@@ -664,6 +667,38 @@ static void dec_get_output_buffer(Ctx *c) {
         }
         if (!d->tex_writes) rt_log("movie: texture mode: %ux%u format %#x flags %#x stride %llu -> %s", tg.width, tg.height, tg.format, tg.flags, (unsigned long long)tg.stride, bgra ? "BGRA" : "RGBA");
         yuv_to_rgba(f, w, h, d->cs, d->full, bgra, tg.data, (size_t)tg.stride);
+        if (!d->serial) { static int n; d->serial = ++n; }
+        {   /* diagnostics (task-21 banding check). SMRPG_MOVIE_DUMP=<dir>: the decoder's planes and our RGBA for pictures 120 and 300 of each decoder.
+             * SMRPG_MOVIE_DUMP_RANGE=<a>-<b> and SMRPG_MOVIE_DUMP_DEC=<n>: only our RGBA (tightly packed rows) of pictures a..b-1 of the n-th decoder. */
+            static const char *ra; static int ra0, ra1, radec, rinit;
+            if (!rinit) { ra = getenv("SMRPG_MOVIE_DUMP_RANGE"); if (ra) sscanf(ra, "%d-%d", &ra0, &ra1); const char *e = getenv("SMRPG_MOVIE_DUMP_DEC"); radec = e ? atoi(e) : 1; rinit = 1; }
+            const char *rd = getenv("SMRPG_MOVIE_DUMP");
+            if (rd && ra && d->serial == radec && d->tex_writes >= (uint64_t)ra0 && d->tex_writes < (uint64_t)ra1) {
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s/rgba_dec%d_f%llu.bin", rd, d->serial, (unsigned long long)d->tex_writes);
+                FILE *fp = fopen(fn, "wb");
+                if (fp) { for (int y = 0; y < h; y++) fwrite(tg.data + (size_t)y * tg.stride, 1, (size_t)w * 4, fp); fclose(fp); }
+            }
+        }
+        {
+            static const char *dir; static int init;
+            if (!init) { dir = getenv("SMRPG_MOVIE_DUMP"); init = 1; }
+            if (dir && (d->tex_writes == 120 || d->tex_writes == 300)) {
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s/pic%llu_%p.bin", dir, (unsigned long long)d->tex_writes, (void *)d);
+                FILE *fp = fopen(fn, "wb");
+                if (fp) {
+                    int hdr[8] = {f->width, f->height, f->linesize[0], f->linesize[1], d->cs, d->full, (int)tg.stride, w};
+                    fwrite(hdr, sizeof hdr, 1, fp);
+                    for (int y = 0; y < f->height; y++) fwrite(f->data[0] + (size_t)y * f->linesize[0], 1, (size_t)f->width, fp);
+                    for (int y = 0; y < f->height / 2; y++) fwrite(f->data[1] + (size_t)y * f->linesize[1], 1, (size_t)f->width / 2, fp);
+                    for (int y = 0; y < f->height / 2; y++) fwrite(f->data[2] + (size_t)y * f->linesize[2], 1, (size_t)f->width / 2, fp);
+                    for (int y = 0; y < h; y++) fwrite(tg.data + (size_t)y * tg.stride, 1, (size_t)w * 4, fp);
+                    fclose(fp);
+                    rt_log("movie: dumped picture %llu to %s", (unsigned long long)d->tex_writes, fn);
+                }
+            }
+        }
         nvn_movie_texture_dirty(tex);
         d->tex_writes++;
         b->offset = 0; b->size = 8;

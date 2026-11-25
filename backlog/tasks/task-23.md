@@ -1,7 +1,7 @@
 ---
 id: task-23
 title: Upscaling with AMD FSR (MIT) behind an option, faithful mode default (D-004, D-012)
-status: Ready
+status: Verified
 ---
 ## Problem before solution
 D-004 wants 4K and high resolution. The game renders at Switch resolutions; presenting at 4K needs a good upscaler as one route (the other route, native higher-resolution render targets, is its own card later). FidelityFX FSR is MIT and runs on Vulkan compute.
@@ -13,10 +13,10 @@ Execution: subchat smrpg-upscale, Sonnet high.
 ## Acceptance and evidence
 | ID | Criterion | Scenario/assertion | Required evidence | Result |
 |---|---|---|---|---|
-| AC1 | Faithful default | `off` gives a byte-identical present to the current build at the same frame | hashes | |
-| AC2 | FSR 1 works | 1080p game image to a 4K target, no validation errors | PNG pair on A:, validation log | |
-| AC3 | Cost | GPU time of the pass at 4K measured | log | |
-| AC4 | No regressions | NVN tests, game_check | outputs | |
+| AC1 | Faithful default | `off` gives a byte-identical present to the current build at the same frame | hashes | PASS (technical): 15 of 15 hashed frames (every 300th, 50 s hidden run) log `ref-blit=equal`: the presented swapchain image equals today's plain blit redone into a scratch image in the same command buffer, byte for byte; 0 differ. A second run with validation on: 3 of 3; the test script: 5 of 5. The off path in `QueuePresent` is the same `vkCmdBlitImage` call; the only additions are a layout barrier pair around the weak no-op overlay hook |
+| AC2 | FSR 1 works | 1080p game image to a 4K target, no validation errors | PNG pair on A:, validation log | PASS (technical): 1920x1080 title frame to 3840x2160, `A:\AI\Recomps\smrpg-work\captures\task23\fsr1\upscale_001800_in.png` and `upscale_001800_out.png` (also `compare_castle.png`, `compare_logo.png`: nearest, bilinear and FSR side by side). Validation layer on (`NVN_VALIDATION=1`), 60 s, 8,040 presents: 0 errors, 0 warnings (`A:\AI\Recomps\smrpg-work\build\logs\t23_fsr1_val.log.err`); the same for the direct 1280x720 path and with RCAS off. The look is the owner's call (ART_DIRECTION) |
+| AC3 | Cost | GPU time of the pass at 4K measured | log | MEASURED (RTX 4090, timestamp queries, 120 frame means in `build\logs\t23_fsr1.log.err`): EASU 0.40 to 0.59 ms, RCAS 0.07 to 0.12 ms, 1080p to 4K total about 0.55 to 0.94 ms (0.25 to 0.33 ms in later runs at lower clocks; worst frame 2.8 ms). The total includes a 4K to 720p blit onto the hidden window; on a real 4K swapchain it is a raw copy (estimated under 0.1 ms, not measured: the hidden window is 1280x720) |
+| AC4 | No regressions | NVN tests, game_check | outputs | NVN tests PASS: nvn_unit 2177 checks 0 failed, nvn_gpu 101 0, nvn_cache 38 and 6 0 failed (25,763 of 25,763 programs). Platform tests PASS: 389 checks 0 failed. New `tests/upscale/run_upscale_tests.py`: 7 checks 0 failed. game_check run: FAIL in `rthard` (first run) and `lifter` (second run; its runtime boot test with the mock game fails the same way; the instruction oracle 37,920 cases 0 mismatches and the lift smoke PASS), not from this task: the link fails on undefined `postgame_enabled`, `postgame_is_save_name`, `postgame_filter_save` referenced from the uncommitted `runtime/hle/hle_fs.c` (another worker's edit in progress); to retest when that lands |
 ## Human gates
 The owner judges the look (ART_DIRECTION); technical PASS does not approve it.
 ## Recovery and return condition
@@ -24,3 +24,10 @@ Return once at done or blocked.
 ## Approach and commands
 Same build and hidden muted run as task-22.
 ## Log and handoff
+
+- 2026-11-25 (smrpg-upscale): hook points first. `QueuePresent` now runs: `upscale::Record` (false with off, then the original blit), swapchain image to COLOR_ATTACHMENT_OPTIMAL, `PlatOverlayDraw(&PlatOverlayFrame)` (weak no-op in `runtime/gfx/upscale/overlay_stub.cpp`), `upscale::DebugAfterOverlay`, PRESENT_SRC. The contract is in docs/PLATFORM.md and `runtime/gfx/upscale/overlay_hook.h` (command buffer, swapchain image and view, extent, format, instance proc addr, swapchain generation). `WindowImpl` gained `swapViews` and `swapGeneration` (nvn_core.h).
+- FSR 1 v1.0.2 is pinned by `tools/thirdparty/fetch_fsr.py` (per-file sha256, files in `A:\AI\Recomps\thirdparty\fsr\`). `runtime/gfx/upscale/upscale.cmake` (included from `runtime/nvn/CMakeLists.txt`) compiles `fsr_pass.comp` with glslc into SPIR-V arrays at build time; without the FSR files the build still works and `fsr1` falls back to the blit with a logged reason. Settings by environment for now: `SMRPG_UPSCALE`, `SMRPG_UPSCALE_SHARPNESS`, `SMRPG_UPSCALE_TARGET`; the overlay can call `upscale::SetMode/SetSharpness/SetTarget`. No CLI flag: `main.c` is task-22's.
+- FSR 2: not feasible now, reason in docs/PLATFORM.md (no motion vectors, depth or jitter reachable at present time; the URP 12 motion vector pass is off). A separate task would patch the pipeline asset, find the target and jitter the camera.
+- Gotchas: the game's final image is 1920x1080 and the swapchain B8G8R8A8_SRGB (hidden window 1280x720). FSR is fed raw bytes through a UNORM view and the bytes go back by raw copy (a blit would encode twice). My timing runs overlapped a tiny `test_sync.exe` (not mine) that stayed alive for hours; numbers vary with GPU clocks.
+- Not done: no real 4K swapchain test (window size is task-22's), UNORM-swapchain branch untested on the game (always sRGB), FSR 2. Nothing committed.
+- 2026-11-25 (smrpg-upscale), coordinator request for task-16: `EnsureSwapchain` now adds `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` to the swapchain usage only when the surface `supportedUsageFlags` include it (otherwise today's flags). This replaced the earlier `SMRPG_PRESENT_HASH`-only gating, so `PlatOverlayDraw` can read the presented image back. Also fixed a trailing comment that had swallowed `ci.imageSharingMode` on that line (it is on its own line now). Rebuilt; `tests/upscale/run_upscale_tests.py` 7 checks 0 failed (off: 9 of 9 `ref-blit=equal`, so AC1 holds; fsr1 4K validation clean). `game_check` still FAILs in `lifter` from the other worker's unfinished `postgame_*` code in `hle_fs.c`, not this task.

@@ -1,7 +1,7 @@
 ---
 id: task-25
 title: Our own Hard difficulty: stronger enemies through the monster table, behind an option (D-004)
-status: Blocked
+status: Ready
 ---
 ## Problem before solution
 The game has only Normal and Breezy. The owner wants a harder mode (2026-11-25). Enemy stats live in data tables (`romfs/Data/StreamingAssets/data_tbl/monster.tbl`, MS-NRBF serialized), so a Hard mode can be data, not code.

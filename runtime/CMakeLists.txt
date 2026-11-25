@@ -17,7 +17,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-list(APPEND SMRPG_RT_SOURCES mods/postgame.c)   # task-24: unlock_postgame (the save view hle/hle_fs.c serves)
 set(SMRPG_WORK "A:/AI/Recomps/smrpg-work" CACHE PATH "work data root (extraction, build, saves)")
 set(SMRPG_GEN_DIR "${SMRPG_WORK}/build/gen_game" CACHE PATH "generated headers (ops_gen.h, interp_gen.inc, prelude.h)")
 set(SMRPG_GAME_OBJECTS "" CACHE FILEPATH "response file listing the lifted objects (build.py link.rsp); empty = runtime only")
@@ -35,6 +34,7 @@ if(SMRPG_GAME_OBJECTS)
   list(APPEND SMRPG_RT_SOURCES interp.c crypto_a64.c eh/eh.c gc/gc.c)   # eh/ and gc/ are task-14's (exceptions, collector safepoints); interp.c calls both
 endif()
 
+list(APPEND SMRPG_RT_SOURCES mods/postgame.c)   # task-24: unlock_postgame (the save view hle/hle_fs.c serves)
 # NVN line 2 of 3: ${SMRPG_NVN_REGISTER_SOURCE} joins the runtime sources
 add_executable(smrpg_boot ${SMRPG_RT_SOURCES} ${SMRPG_HLE_SOURCES} ${SMRPG_NVN_REGISTER_SOURCE} ${SMRPG_EXTRA_SOURCES})
 target_include_directories(smrpg_boot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SMRPG_GEN_DIR})
@@ -64,6 +64,25 @@ if(EXISTS "${SMRPG_SDL3_DIR}/include/SDL3/SDL.h" AND EXISTS "${SMRPG_SDL3_DIR}/l
   message(STATUS "platform layer: SDL3 from ${SMRPG_SDL3_DIR}")
 else()
   message(STATUS "platform layer: SDL3 not found under ${SMRPG_SDL3_DIR}; building without a window (set SMRPG_SDL3_DIR)")
+endif()
+
+# task-16: the options overlay (runtime/platform/overlay/): Dear ImGui (MIT) drawn over the present through PlatOverlayDraw, options in options.ini. The ImGui
+# source is fetched by `python -I tools/thirdparty/fetch_imgui.py` into A: (never committed); without it the runtime builds with no overlay (SMRPG_OVERLAY undefined,
+# overlay.h is all no-ops) and F1 does nothing. ImGui's Vulkan backend loads its functions through vkGetInstanceProcAddr (the runtime links no Vulkan import library).
+set(SMRPG_IMGUI_DIR "A:/AI/Recomps/thirdparty/imgui/src/imgui-1.93.0" CACHE PATH "Dear ImGui release unpacked by tools/thirdparty/fetch_imgui.py")
+if(EXISTS "${SMRPG_SDL3_DIR}/include/SDL3/SDL.h" AND EXISTS "${SMRPG_IMGUI_DIR}/imgui.h" AND NVN_VULKAN_SDK)
+  set(_ovl ${CMAKE_CURRENT_SOURCE_DIR}/platform/overlay)
+  set(_imgui_srcs ${SMRPG_IMGUI_DIR}/imgui.cpp ${SMRPG_IMGUI_DIR}/imgui_draw.cpp ${SMRPG_IMGUI_DIR}/imgui_tables.cpp ${SMRPG_IMGUI_DIR}/imgui_widgets.cpp
+      ${SMRPG_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp ${SMRPG_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
+  target_sources(smrpg_boot PRIVATE ${_ovl}/options.c ${_ovl}/overlay_apply.cpp ${_ovl}/overlay.cpp ${_imgui_srcs})
+  target_include_directories(smrpg_boot PRIVATE ${SMRPG_IMGUI_DIR} ${SMRPG_IMGUI_DIR}/backends "${NVN_VULKAN_SDK}/Include")
+  target_compile_definitions(smrpg_boot PRIVATE SMRPG_OVERLAY=1)
+  set_source_files_properties(${_imgui_srcs} ${_ovl}/overlay.cpp PROPERTIES
+      COMPILE_DEFINITIONS "VK_NO_PROTOTYPES;IMGUI_IMPL_VULKAN_NO_PROTOTYPES;IMGUI_DISABLE_WIN32_FUNCTIONS;IMGUI_DISABLE_DEMO_WINDOWS;IMGUI_DISABLE_DEBUG_TOOLS")
+  set_source_files_properties(${_imgui_srcs} PROPERTIES COMPILE_OPTIONS "-w")       # the vendored source is not ours to clean up
+  message(STATUS "options overlay: Dear ImGui from ${SMRPG_IMGUI_DIR}")
+else()
+  message(STATUS "options overlay: Dear ImGui not found under ${SMRPG_IMGUI_DIR} (run tools/thirdparty/fetch_imgui.py); building without the overlay")
 endif()
 
 if(SMRPG_GAME_OBJECTS)

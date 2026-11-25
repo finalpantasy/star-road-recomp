@@ -23,6 +23,8 @@ struct WindowImpl {
   VkSurfaceKHR surface = VK_NULL_HANDLE;
   VkSwapchainKHR swap = VK_NULL_HANDLE;
   std::vector<VkImage> swapImages;
+  std::vector<VkImageView> swapViews;      // one view per swapchain image (task-23: handed to the overlay hook)
+  uint64_t swapGeneration = 0;             // bumps whenever the swapchain is rebuilt
   VkFormat swapFormat = VK_FORMAT_UNDEFINED;
   VkExtent2D swapExtent{};
   std::vector<TextureG*> textures;         // the game's render target textures for this window

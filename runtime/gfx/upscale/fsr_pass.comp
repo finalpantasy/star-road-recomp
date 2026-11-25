@@ -1,0 +1,53 @@
+// Star Road Recomp: FSR 1 compute passes (task-23). Our own wrapper around AMD FidelityFX FSR 1 (MIT, tools/thirdparty/fetch_fsr.py).
+// Built twice by glslc (see CMakeLists.txt in this directory):  -DSTAGE_EASU (spatial upscale)  and  -DSTAGE_RCAS (sharpen, final store).
+// Both work in the encoded (gamma) values the game wrote, which is the space FSR 1 was made for; the input view is a raw UNORM view.
+#version 450
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D uIn;
+layout(set = 0, binding = 1, OUT_FMT) uniform writeonly image2D uOut;
+layout(set = 0, binding = 2) uniform sampler uSmp;
+layout(push_constant) uniform PC {
+  uvec4 c0, c1, c2, c3;      // FsrEasuCon / FsrRcasCon (c0 only) constants
+  uvec4 flags;               // x: bit0 swap R and B on store (BGRA bytes), bit1 RCAS on, bit2 flip Y; y, z: output width and height
+} pc;
+
+#ifdef STAGE_EASU
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(sampler2D(uIn, uSmp), p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(sampler2D(uIn, uSmp), p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(sampler2D(uIn, uSmp), p, 2); }
+#endif
+#ifdef STAGE_RCAS
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(sampler2D(uIn, uSmp), p, 0); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#endif
+#include "ffx_fsr1.h"
+
+void Filter(AU2 pos) {
+  if (pos.x >= pc.flags.y || pos.y >= pc.flags.z) return;
+  AF3 c;
+#ifdef STAGE_EASU
+  FsrEasuF(c, pos, pc.c0, pc.c1, pc.c2, pc.c3);
+#else
+  if ((pc.flags.x & 2u) != 0u) FsrRcasF(c.r, c.g, c.b, pos, pc.c0);
+  else c = FsrRcasLoadF(ASU2(pos)).rgb;
+#endif
+  if ((pc.flags.x & 1u) != 0u) c = c.bgr;
+  ASU2 op = ASU2(pos);
+  if ((pc.flags.x & 4u) != 0u) op.y = ASU1(pc.flags.z) - 1 - op.y;
+  imageStore(uOut, op, AF4(c, 1.0));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+  // the 8x8 swizzle from AMD's sample: each group of 64 threads covers a 16x16 block as four 8x8 quads
+  AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+  Filter(gxy);
+  gxy.x += 8u; Filter(gxy);
+  gxy.y += 8u; Filter(gxy);
+  gxy.x -= 8u; Filter(gxy);
+}

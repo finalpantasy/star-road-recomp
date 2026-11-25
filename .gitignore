@@ -47,3 +47,6 @@ evidence/last-check.*
 
 # Reused code (D-009): local only, never committed or pushed until rewritten as our own
 reuse/
+
+# Local settings of the options overlay (task-16): config/options.default.ini is the committed default
+config/options.ini
