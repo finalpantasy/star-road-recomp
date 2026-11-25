@@ -38,15 +38,97 @@ static void nvdrv_open(IpcCtx *x) {
     out_u32(x, 0, fd > 0 ? (uint32_t)fd : 0);
     out_u32(x, 4, fd > 0 ? 0 : 0x0Du);                    /* NvError_BadParameter... out of descriptors */
 }
+/* /dev/nvmap: handle table for the sdk's nn::nv memory objects (the guest's own code and the movie decoder create handles here; our NVN
+ * layer keeps its memory in host allocations, so a handle is just an id with a size). Structs are the Tegra nvmap ioctl ABI. */
+#define NVMAP_MAX 4096
+static struct { uint32_t size, align; uint8_t used, kind; uint64_t addr; } g_nvmap[NVMAP_MAX];
+static uint32_t nvmap_ioctl(uint32_t cmd, uint8_t *io, uint64_t n) {
+    uint32_t *w = (uint32_t *)io;
+    switch (cmd) {
+    case 0xC0080101: {                                   /* CREATE {size, handle} */
+        if (n < 8) return 0x16u;
+        for (uint32_t h = 1; h < NVMAP_MAX; h++) if (!g_nvmap[h].used) { g_nvmap[h].used = 1; g_nvmap[h].size = w[0]; w[1] = h; return 0; }
+        return 0x0Cu;                                    /* NvError_InsufficientMemory */
+    }
+    case 0xC0080103: case 0xC008010E:                    /* FROM_ID {id, handle}, GET_ID {id, handle}: the id is the handle itself */
+        if (n < 8) return 0x16u;
+        if (cmd == 0xC008010E) w[0] = w[1]; else w[1] = w[0];
+        return 0;
+    case 0xC0200104: {                                   /* ALLOC {handle, heap_mask, flags, align, kind, pad[7], address} */
+        if (n < 0x20 || w[0] >= NVMAP_MAX || !g_nvmap[w[0]].used) return 0x16u;
+        g_nvmap[w[0]].align = w[3]; g_nvmap[w[0]].kind = io[16]; g_nvmap[w[0]].addr = *(uint64_t *)(io + 24);
+        return 0;
+    }
+    case 0xC0180105: {                                   /* FREE {handle, pad, address, size, flags} */
+        if (n < 0x18 || w[0] >= NVMAP_MAX || !g_nvmap[w[0]].used) return 0x16u;
+        *(uint64_t *)(io + 8) = g_nvmap[w[0]].addr; w[4] = g_nvmap[w[0]].size; w[5] = 0;
+        memset(&g_nvmap[w[0]], 0, sizeof g_nvmap[0]);
+        return 0;
+    }
+    case 0xC00C0109: {                                   /* PARAM {handle, param, result}: 1 size, 2 alignment, 3 base, 4 heap, 5 kind */
+        if (n < 12 || w[0] >= NVMAP_MAX || !g_nvmap[w[0]].used) return 0x16u;
+        switch (w[1]) {
+        case 1: w[2] = g_nvmap[w[0]].size; break;
+        case 2: w[2] = g_nvmap[w[0]].align; break;
+        case 3: w[2] = 0; break;
+        case 4: w[2] = 0x40000000u; break;               /* NVMAP_HEAP_IOVMM */
+        case 5: w[2] = g_nvmap[w[0]].kind; break;
+        default: w[2] = 0; break;
+        }
+        return 0;
+    }
+    default: return 0xFFFFFFFFu;                         /* not an nvmap call we know */
+    }
+}
 static void nvdrv_ioctl(IpcCtx *x) {
+
     uint32_t fd = in_u32(x, 0), cmd = in_u32(x, 4);
     IpcBuf *in = ipc_in_buf(x, 0), *out = ipc_out_buf(x, 0);
     nv_lock();
     int dev = fd < NV_MAX_FD ? g_nv_dev[fd] : 0;
     const char *nm = fd < NV_MAX_FD && g_nv_name[fd] ? g_nv_name[fd] : "?";
     LeaveCriticalSection(&g_nv_cs);
+    if (dev == NVDEV_NVMAP) {
+        IpcBuf *di = ipc_in_buf(x, ipc_in_data_idx(x)), *dout = ipc_out_buf(x, ipc_out_data_idx(x));
+        uint8_t io[64] = {0};
+        uint64_t n = di ? di->size : 0;
+        if (n > sizeof io) n = sizeof io;
+        if (di && n) memcpy(io, (void *)di->addr, (size_t)n);
+        nv_lock();
+        uint32_t r = nvmap_ioctl(cmd, io, n);
+        LeaveCriticalSection(&g_nv_cs);
+        if (r != 0xFFFFFFFFu) {
+            if (dout && dout->size) ipc_write_out(x, ipc_out_data_idx(x), io, n < dout->size ? n : dout->size);
+            out_u32(x, 0, r);
+            return;
+        }
+    }
+    if (cmd == 0x40044801u && dev == NVDEV_OTHER) {        /* nvhost channel SET_NVMAP_FD (nvdec, nvjpg ...): the fd is only remembered by the real driver */
+        out_u32(x, 0, 0);
+        return;
+    }
+    if (dev == NVDEV_OTHER && strstr(nm, "nvhost-nv")) {   /* decoder channels (nvdec, nvjpg, nvenc): init-time channel calls succeed; no engine behind them yet */
+        IpcBuf *di = ipc_in_buf(x, ipc_in_data_idx(x)), *dout = ipc_out_buf(x, ipc_out_data_idx(x));
+        uint8_t io[64] = {0};
+        uint64_t n = di ? di->size : 0;
+        if (n > sizeof io) n = sizeof io;
+        if (di && n) memcpy(io, (void *)di->addr, (size_t)n);
+        int known = 1;
+        switch (cmd) {
+        case 0xC0080002u: *(uint32_t *)(io + 4) = 1 + (fd & 7); break;   /* GET_SYNCPOINT {module, value} */
+        case 0xC0080003u: *(uint32_t *)(io + 4) = 0; break;              /* GET_WAITBASE {module, value} */
+        case 0x40040007u: case 0x40040009u: case 0x400C0004u: case 0x400C0005u: case 0xC0100001u: break;   /* SET_TIMEOUT, SET_SUBMIT_TIMEOUT, MAP/UNMAP_CMDBUF, SUBMIT */
+        default: known = 0; break;
+        }
+        if (known) {
+            if (dout && dout->size) ipc_write_out(x, ipc_out_data_idx(x), io, n < dout->size ? n : dout->size);
+            out_u32(x, 0, 0);
+            return;
+        }
+    }
     char tag[96];
     snprintf(tag, sizeof tag, "nvdrv:ioctl %s cmd %#x", nm, cmd);
+
     hle_ipc_note_unknown(tag, cmd);
     rt_log("nvdrv: Ioctl fd %u (%s) cmd %#x in=%llu out=%llu (dev %d): not implemented", fd, nm, cmd, in ? (unsigned long long)in->size : 0ull,
            out ? (unsigned long long)out->size : 0ull, dev);

@@ -35,6 +35,8 @@ struct QueueImpl {
   VkCommandPool pool = VK_NULL_HANDLE;
   uint64_t lastSignal = 0;
   uint32_t flags = 0;
+  struct TexPool* texPool = nullptr;      // SetTexturePool / SetSamplerPool state: owned by the queue, it outlives one command buffer
+  struct SampPool* sampPool = nullptr;
 };
 
 // ---- registries ----------------------------------------------------------------------------------------------

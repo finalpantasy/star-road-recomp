@@ -34,3 +34,8 @@ Record failed hypotheses and measured numbers.
 - ASTC fixes that the oracle forced (kept in tex_astc.c): rounding (endpoint * 257, lerp +32 >> 6, result >> 8), sRGB endpoint (e<<8)|0x80, quint/trit color unquantization constants, quint weight constant, partition hash shifts.
 - BC7 transcode (ASTC to BC7 mode 6, 121 sampled textures): mean PSNR 48.08 dB, min 21.35 dB, 4.4 Mpix/s single thread. Lossy second pass; native ASTC stays the faithful mode.
 - Not covered: BC6H decode (not needed: desktop GPUs sample it); non-empty-blob multi-image layer stride (no such texture in the dump); 3D/array layout beyond the model; HDR ASTC; Sprite/RenderTexture objects.
+
+### Follow-up: blocky "Loading..." text and gray spinner (worker, 2026-11-25; nothing committed)
+- Cause is not in the texture path: at draw time the replay had no texture or sampler pool (a fresh `RS` per command buffer in `QueueSubmit`), so every sampled texture read the 1x1 white dummy. Traced with a scratch build: 733 textures registered, every draw logged `pool=0 poolsize=0`. The font atlas (512x512 R8) and the spinner (40x40 RGBA8 sRGB) decode and upload correctly once the pool is bound.
+- Fix (task-12 owns runtime/nvn, so not applied there): patch in the shared notes folder, `task-11-texture-pool-persist.patch` (queue keeps the pools across command buffers) plus regression test 2b in tests/nvn/nvn_gpu.cpp. Verified in a scratch copy: test fails without the fix (3 of 70 checks, white texels), passes with it (70 of 70, validation 0 errors); nvn_unit 2161 of 2161.
+- Before/after/baseline crops: A:\AI\Recomps\smrpg-work\captures\tex2\compare_before_after_baseline.png.

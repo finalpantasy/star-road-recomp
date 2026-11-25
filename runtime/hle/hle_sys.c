@@ -32,9 +32,18 @@ static void aoc_count(IpcCtx *x) { out_u32(x, 0, 0); }
 static void aoc_list(IpcCtx *x) { out_u32(x, 0, 0); }
 static void aoc_base_id(IpcCtx *x) { out_u64(x, 0, PROGRAM_ID + 0x1000); }
 CMD_TABLE(g_aoc_cmds) = {CMD(0, aoc_count), CMD(1, aoc_list), CMD(2, aoc_count), CMD(3, aoc_list), CMD(4, aoc_base_id), CMD(5, aoc_base_id),
-                         CMD(6, nop), CMD(7, nop), CMD(8, aoc_event), CMD(9, ret_u32_0), CMD(10, aoc_event)};
+                         CMD(6, nop), CMD(7, nop), CMD(8, aoc_event), CMD(9, ret_u32_0), CMD(10, aoc_event), CMD(50, nop) /* CheckAddOnContentMountStatus: nothing is pending */};
 IFACE(g_aoc_iface, "nn::aocsrv::IAddOnContentManager", g_aoc_cmds);
 static const ServiceDef g_aoc_def = {"aoc:u", &g_aoc_iface, 0};
+
+/* ------------------------------------------------------------------ mm:u (nn::mmnv::IRequest: multimedia clock requests the movie decoder makes
+ * for nvdec and the video memory controller; every request is granted at once, the host decides the real clocks) */
+static uint32_t g_mm_next = 1;
+static void mm_init_id(IpcCtx *x) { out_u32(x, 0, InterlockedIncrement((volatile LONG *)&g_mm_next)); }
+static void mm_get(IpcCtx *x) { out_u32(x, 0, 0); }
+CMD_TABLE(g_mm_cmds) = {CMD(0, nop), CMD(1, nop), CMD(2, nop), CMD(3, mm_get), CMD(4, mm_init_id), CMD(5, nop), CMD(6, nop), CMD(7, mm_get)};
+IFACE(g_mm_iface, "nn::mmnv::IRequest", g_mm_cmds);
+static const ServiceDef g_mm_def = {"mm:u", &g_mm_iface, 0};
 
 /* ------------------------------------------------------------------ ectx:aw (error context registrar; the context is dropped) */
 CMD_TABLE(g_ectx_cmds) = {CMD(0, nop), CMD(1, nop), CMD(2, nop), CMD(10, nop)};
@@ -45,5 +54,6 @@ void hle_sys_init(void) {
     for (int i = 0; i < 4; i++) hle_register_service(&g_pctl_def[i]);
     hle_register_service(&g_aoc_def);
     hle_register_service(&g_ectx_def);
+    hle_register_service(&g_mm_def);
     (void)ret_u64_0;
 }

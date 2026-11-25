@@ -1,8 +1,7 @@
 // Star Road Recomp: host-side glue between the runtime and the NVN library (task-13 step 2). Our own code (D-008).
 //
 // Two jobs the NVN library leaves to its host:
-//   1. load the shader cache (nvn::ShaderCacheLoad takes one root; tools/rtprep/merge_shader_cache.py builds a merged root
-//      that holds our own translator's programs and the reused ones for the stages v1 cannot translate yet);
+//   1. load the shader cache (nvn::ShaderCacheLoad takes one root: the own-translator cache, shaders/cache/v1);
 //   2. read a presented frame back and save it as a PNG (captures, not part of the game).
 // Nothing from the game is written anywhere but the capture directory the caller names.
 #include <stdint.h>

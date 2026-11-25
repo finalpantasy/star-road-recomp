@@ -70,6 +70,19 @@ void hle_session_closed(void *user) {
     free(s);
 }
 
+/* i-th interface object passed as an argument: a domain object id inside a domain, else a moved session handle */
+SvcObj *ipc_in_obj(IpcCtx *x, int i) {
+    if (x->is_domain) {
+        Session *d = D(x->sess);
+        if (i < 0 || i >= x->nin_objs) return 0;
+        uint32_t id = x->in_objs[i];
+        return id && id <= (uint32_t)d->nobjs ? d->objs[id - 1] : 0;
+    }
+    if (i < 0 || i >= x->nmove) return 0;
+    Session *s = k_session_user(x->move_h[i]);
+    return s ? s->root : 0;
+}
+
 static int domain_add(Session *s, SvcObj *o) {
     s = D(s);
     if (s->nobjs == s->capobjs) {
@@ -146,6 +159,9 @@ IpcBuf *ipc_out_buf(IpcCtx *x, int i) {
     if (i < x->npc) return &x->pc[i];
     return 0;
 }
+/* An auto-select (HipcAutoSelect) buffer arrives as both a map-alias and a pointer descriptor and only one carries bytes: these find it. */
+int ipc_in_data_idx(IpcCtx *x) { int n = x->npa + x->npx; for (int i = 0; i < n; i++) { IpcBuf *b = ipc_in_buf(x, i); if (b && b->size) return i; } return 0; }
+int ipc_out_data_idx(IpcCtx *x) { int n = x->npb + x->npc; for (int i = 0; i < n; i++) { IpcBuf *b = ipc_out_buf(x, i); if (b && b->size) return i; } return 0; }
 uint64_t ipc_write_out(IpcCtx *x, int i, const void *data, uint64_t n) {
     IpcBuf *b = ipc_out_buf(x, i);
     if (!b) return 0;

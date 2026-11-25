@@ -4,7 +4,7 @@ Status: Building; technical evidence: baseline check PASS (receipt in evidence/r
 Last verified source/build and receipt: inputs per tools/inputs.json; extraction on `A:\AI\Recomps\smrpg-work` (base, v101 exefs and romfs, 1,934 files, 6.82 GB).
 Dependencies/blockers/open decisions: task-5 Ready; task-6 waits on task-5. RECOMPILER.md open items: L4 reference original (owner), movie decoder licenses. Tools in `A:\AI\Recomps\tools-ext` (owner approved 2026-11-24): Il2CppDumper 6.7.46, Cpp2IL 2022.1.0-pre21, CMake 4.5.1; digests checked. Prior art: a public MIT recomp of 1.0.0 exists (ElKiro1311/smrpg-recompiled, LASRecomp base), ideas only; our edge is 1.0.1, reference tests against the original, and the decomp.
 Integration owner and active file/resource owners: lead = coordinator chat. See table.
-Next action and skill: our own runtime shows its first frame (Loading screen). Next: task-13 controller-support applet stall and loading cache v1 alone; textures for the blocky Loading text and gray icon; task-10 bindless d30675c2 difference. Last push: f5d8534.
+Next action and skill: our own runtime shows its first frame (Loading screen). Next: task-13 controller-support applet stall and loading cache v1 alone; textures for the blocky Loading text and gray icon; task-10 bindless d30675c2 difference. Last push: d22f566.
 Resume/run commands: `python tools/game_check.py run --root .`
 Git: local repo at `F:\Super Mario RPG`, branch main, commits allowed at verified milestones (owner yes 2026-11-24); GitHub: public repo under finalpantasy (owner yes 2026-11-24).
 

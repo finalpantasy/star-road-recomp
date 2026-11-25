@@ -996,7 +996,9 @@ void QueueSubmit(QueueImpl* q, uint32_t n, const uint64_t* handles) {
     keep->push_back(l);
     RS s; s.cb = cb; s.value = value; s.scratch = sc.get(); s.dpools = dp.get(); s.keep = keep.get(); s.q = q; s.dev = q->dev;
     if (q->dev) { s.depthMode = q->dev->depthMode; s.originMode = q->dev->originMode; }
+    s.texPool = q->texPool; s.sampPool = q->sampPool;       // Unity binds the pools once and draws from later command buffers
     Exec(s, *l, 0);
+    q->texPool = s.texPool; q->sampPool = s.sampPool;
     EndRendering(s);
   }
   F.vkEndCommandBuffer(cb);

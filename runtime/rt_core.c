@@ -188,7 +188,27 @@ static void miss_dump(void) {
 
 /* ------------------------------------------------------------------ calls */
 __thread int g_rt_pure;   /* debug aid (rt_diffcall): while set, guest calls skip lifted code and run in the interpreter */
+/* debug aid: SMRPG_ICTRACE=1 keeps the last 256 indirect calls (target, caller, x0, x1, thread) and prints them at a fatal error */
+static int g_ictrace = -1;
+static struct { uint64_t t, lr, x0, x1; DWORD tid; } g_icring[256];
+static volatile LONG g_icn;
+static void icring_dump(void) {
+    if (g_ictrace <= 0) return;
+    LONG n = g_icn;
+    for (LONG i = n > 256 ? n - 256 : 0; i < n; i++) {
+        int k = (int)(i & 255);
+        rt_log("  icall T%lu %#llx from %#llx x0=%#llx x1=%#llx", (unsigned long)g_icring[k].tid, (unsigned long long)g_icring[k].t, (unsigned long long)g_icring[k].lr,
+               (unsigned long long)g_icring[k].x0, (unsigned long long)g_icring[k].x1);
+    }
+}
 void rt_icall(Ctx *c, uint64_t t) {
+    if (__builtin_expect(g_ictrace != 0, 0)) {
+        if (g_ictrace < 0) g_ictrace = getenv("SMRPG_ICTRACE") ? 1 : 0;
+        if (g_ictrace) {
+            int k = (int)(InterlockedIncrement(&g_icn) - 1) & 255;
+            g_icring[k].t = t; g_icring[k].lr = c->x[30]; g_icring[k].x0 = c->x[0]; g_icring[k].x1 = c->x[1]; g_icring[k].tid = GetCurrentThreadId();
+        }
+    }
     GuestFn f = g_rt_pure ? 0 : rt_lookup(t);
     c->pc = t;                        /* HLE thunks identify their slot from c->pc */
     if (f) { f(c); return; }
@@ -256,7 +276,8 @@ static void dump_ctx(const Ctx *c) {
     if (n) rt_log("  guest frames:%s", bt);
 }
 
-static void dump_addrs(void) {   /* debug aid: SMRPG_DUMPADDR=<hex addr>[,<hex addr>...] dumps 0x60 bytes of guest memory at a fatal error */
+static void dump_addrs(void) {
+    icring_dump();   /* debug aid: SMRPG_DUMPADDR=<hex addr>[,<hex addr>...] dumps 0x60 bytes of guest memory at a fatal error */
     const char *d = getenv("SMRPG_DUMPADDR");
     while (d && *d) {
         char *e; uint64_t da = strtoull(d, &e, 16);

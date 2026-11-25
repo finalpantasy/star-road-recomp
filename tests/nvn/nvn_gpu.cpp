@@ -467,6 +467,34 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- 2b. texture and sampler pools stay bound across command buffers ---------------------------------------------
+  // Unity binds its pools in one command buffer and draws from later ones. On hardware the pool registers belong to the queue,
+  // so a draw in a later command buffer still samples the real textures. A replay that starts every command buffer with no pool
+  // reads the 1x1 white dummy instead: the Loading text became white boxes and the spinner a gray blob (task-11 follow-up).
+  {
+    uint64_t hp = Record([&]() { nvnCommandBufferSetTexturePool(cb, texPool); nvnCommandBufferSetSamplerPool(cb, sampPool); });
+    SubmitWait(hp);
+    uint64_t h = Record([&]() {
+      Targets(color, true); State();
+      float col[4] = {0, 0, 0, 0};
+      nvnCommandBufferClearColor(cb, 0, col, NVN_CLEAR_COLOR_MASK_RGBA); nvnCommandBufferClearDepthStencil(cb, 1.0f, true, 0, 0);
+      nvnCommandBufferBindProgram(cb, progTex, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);     // note: no SetTexturePool here
+      nvnCommandBufferBindSeparateTexture(cb, NVN_SHADER_STAGE_FRAGMENT, 0, nvnDeviceGetSeparateTextureHandle(dev, kTexSrc));
+      nvnCommandBufferBindSeparateSampler(cb, NVN_SHADER_STAGE_FRAGMENT, 0, hSampler);
+      nvnCommandBufferBindUniformBuffer(cb, NVN_SHADER_STAGE_FRAGMENT, 0, ubAddr + 0, 16);
+      nvnCommandBufferBindVertexBuffer(cb, 0, vbAddr + 0, 4 * sizeof(Vtx));
+      nvnCommandBufferDrawArrays(cb, NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP, 0, 4);
+    });
+    SubmitWait(h);
+    std::vector<uint8_t> img; Read(color, &img);
+    if (img.size() == 64 * 64 * 4) {
+      Px tl = At(img, 64, 16, 16), tr = At(img, 64, 48, 16), bl = At(img, 64, 16, 48), br = At(img, 64, 48, 48);
+      CHECK(Near(tl, {255, 0, 0, 255}), "pool set in an earlier command buffer: top-left texel red, got %s (white means the pool was dropped)", S(tl));
+      CHECK(Near(tr, {0, 255, 0, 255}), "pool set in an earlier command buffer: top-right texel green, got %s", S(tr));
+      CHECK(Near(bl, {0, 0, 255, 255}), "pool set in an earlier command buffer: bottom-left texel blue, got %s", S(bl));
+    }
+  }
+
   // ---- 3. RGBA4 component order ------------------------------------------------------------------------------------
   {
     uint64_t h = Record([&]() {

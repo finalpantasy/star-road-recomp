@@ -5,6 +5,7 @@
 
 #define RES_AM_NO_MESSAGES    MAKE_RES(128, 3)     /* 0x680 */
 #define RES_AM_NOT_AVAILABLE  MAKE_RES(128, 1)     /* no launch parameter / storage */
+#define RES_AM_NO_DATA        MAKE_RES(128, 2)     /* 0x480: nothing in the launch parameter channel (the sdk treats this as "none queued") */
 
 static void nop(IpcCtx *x) { (void)x; }
 static void ret_true(IpcCtx *x) { out_bytes(x, 0, &(uint8_t){1}, 1); }
@@ -59,7 +60,12 @@ CMD_TABLE(g_csg_cmds) = {
 IFACE(g_csg_iface, "nn::am::ICommonStateGetter", g_csg_cmds);
 
 /* ------------------------------------------------------------------ ISelfController */
-static void sc_launchable_event(IpcCtx *x) { ret_event(x, &g_launchable_event); }
+/* a console with nothing running in front lets the application open a library applet at once: signaled from the start */
+static void sc_launchable_event(IpcCtx *x) {
+    int first = !g_launchable_event;
+    ret_event(x, &g_launchable_event);
+    if (first) k_event_set(g_launchable_event, 1);
+}
 static void sc_create_layer(IpcCtx *x) { out_u64(x, 0, 1); }                       /* managed layer id */
 static void sc_create_separable_layer(IpcCtx *x) { out_u64(x, 0, 1); out_u64(x, 8, 2); } /* display layer id, recording layer id */
 static void sc_suspended_tick(IpcCtx *x) { out_u64(x, 0, 0); }
@@ -84,13 +90,106 @@ CMD_TABLE(g_dc_cmds) = {CMD(8, nop), CMD(11, nop), CMD(15, nop)};
 IFACE(g_dc_iface, "nn::am::IDisplayController", g_dc_cmds);
 
 /* ------------------------------------------------------------------ ILibraryAppletCreator, IDebugFunctions */
-CMD_TABLE(g_lac_cmds) = {CMD(0xFFFFFFF0u, nop)};
+/* Library applets (the controller support applet is the one the game opens): a console with one connected controller answers
+ * a ShowControllerSupport request at once with one player and success. Protocol (switchbrew "Applet Manager services"):
+ * ILibraryAppletCreator.CreateLibraryApplet(id, mode) gives an ILibraryAppletAccessor; the caller pushes IStorage objects with
+ * its arguments, calls Start, waits for the state event, then pops the reply IStorage. Storages are plain byte buffers. */
+typedef struct { uint8_t *data; int64_t size; } Storage;
+static Storage *storage_new(int64_t size) {
+    Storage *s = calloc(1, sizeof *s);
+    if (size < 0) size = 0;
+    s->data = calloc(1, (size_t)size + 1);
+    s->size = size;
+    return s;
+}
+static void sta_get_size(IpcCtx *x) { Storage *s = x->self->state; out_u64(x, 0, (uint64_t)(s ? s->size : 0)); }
+static void sta_write(IpcCtx *x) {
+    Storage *s = x->self->state;
+    int64_t off = (int64_t)in_u64(x, 0);
+    IpcBuf *b = ipc_in_buf(x, ipc_in_data_idx(x));
+    if (!s || !b || off < 0 || off + (int64_t)b->size > s->size) { x->result = MAKE_RES(128, 502); return; }   /* out of range */
+    memcpy(s->data + off, (const void *)(uintptr_t)b->addr, (size_t)b->size);
+}
+static void sta_read(IpcCtx *x) {
+    Storage *s = x->self->state;
+    int64_t off = (int64_t)in_u64(x, 0);
+    int bi = ipc_out_data_idx(x);
+    IpcBuf *b = ipc_out_buf(x, bi);
+    if (!s || !b || off < 0) { x->result = MAKE_RES(128, 502); return; }
+    uint64_t n = b->size;
+    if (off + (int64_t)n > s->size) n = off < s->size ? (uint64_t)(s->size - off) : 0;
+    ipc_write_out(x, bi, s->data + off, n);
+}
+CMD_TABLE(g_sta_cmds) = {CMD(0, sta_get_size), CMD(10, sta_write), CMD(11, sta_read)};
+IFACE(g_sta_iface, "nn::am::IStorageAccessor", g_sta_cmds);
+static void st_open(IpcCtx *x) { out_obj(x, &g_sta_iface, x->self->state); }
+CMD_TABLE(g_st_cmds) = {CMD(0, st_open)};
+IFACE(g_st_iface, "nn::am::IStorage", g_st_cmds);
+
+#define LA_ID_CONTROLLER 0x0C   /* libnx AppletId_LibraryAppletController */
+typedef struct { uint32_t id, mode; KObj *state_ev, *out_ev; int started; Storage *out; } LibApplet;
+static void la_state_event(IpcCtx *x) { LibApplet *a = x->self->state; out_copy_handle(x, k_handle_for(a->state_ev, 1)); }
+static void la_is_completed(IpcCtx *x) { LibApplet *a = x->self->state; out_bytes(x, 0, &(uint8_t){(uint8_t)a->started}, 1); }
+static void la_start(IpcCtx *x) {
+    LibApplet *a = x->self->state;
+    /* reply of the controller applet (libnx HidLaControllerSupportResultInfoInternal): s8 player count, u32 selected npad id, u32 result */
+    a->out = storage_new(0x10);
+    a->out->data[0] = 1;                       /* one player */
+    uint32_t selected = 0;                     /* NpadId No1 (the connected controller) */
+    memcpy(a->out->data + 4, &selected, 4);    /* result 0 at +8 */
+    a->started = 1;
+    k_event_set(a->out_ev, 1);
+    k_event_set(a->state_ev, 1);               /* the applet ran to completion */
+}
+static void la_push_in(IpcCtx *x) {
+    SvcObj *o = ipc_in_obj(x, 0);
+    Storage *s = o ? o->state : 0;
+    rt_log("applet %u: PushInData %lld bytes", ((LibApplet *)x->self->state)->id, (long long)(s ? s->size : -1));
+}
+static void la_pop_out(IpcCtx *x) {
+    LibApplet *a = x->self->state;
+    if (!a->out) { x->result = RES_AM_NOT_AVAILABLE; return; }
+    out_obj(x, &g_st_iface, a->out);
+    a->out = 0;
+}
+static void la_get_result(IpcCtx *x) { (void)x; }
+static void la_out_event(IpcCtx *x) { LibApplet *a = x->self->state; out_copy_handle(x, k_handle_for(a->out_ev, 1)); }
+static void la_info(IpcCtx *x) { LibApplet *a = x->self->state; out_u32(x, 0, a->id); out_u32(x, 4, a->mode); }
+CMD_TABLE(g_la_cmds) = {
+    CMD(0, la_state_event), CMD(1, la_is_completed), CMD(10, la_start), CMD(20, nop), CMD(25, nop), CMD(30, la_get_result), CMD(50, nop),
+    CMD(100, la_push_in), CMD(101, la_pop_out), CMD(102, nop), CMD(103, nop), CMD(105, la_out_event), CMD(106, la_out_event), CMD(110, ret_false),
+    CMD(120, la_info), CMD(150, nop)};
+IFACE(g_la_iface, "nn::am::ILibraryAppletAccessor", g_la_cmds);
+
+static void lac_create(IpcCtx *x) {
+    LibApplet *a = calloc(1, sizeof *a);
+    a->id = in_u32(x, 0);
+    a->mode = in_u32(x, 4);
+    a->state_ev = k_event_named("libapplet_state", 0);
+    a->out_ev = k_event_named("libapplet_out", 0);
+    rt_log("applet: CreateLibraryApplet id=0x%x mode=%u%s", a->id, a->mode, a->id == LA_ID_CONTROLLER ? " (controller support)" : "");
+    out_obj(x, &g_la_iface, a);
+}
+static void lac_create_storage(IpcCtx *x) { out_obj(x, &g_st_iface, storage_new((int64_t)in_u64(x, 0))); }
+CMD_TABLE(g_lac_cmds) = {CMD(0, lac_create), CMD(10, lac_create_storage)};
 IFACE(g_lac_iface, "nn::am::ILibraryAppletCreator", g_lac_cmds);
 CMD_TABLE(g_dbg_cmds) = {CMD(0xFFFFFFF0u, nop)};
 IFACE(g_dbg_iface, "nn::am::IDebugFunctions", g_dbg_cmds);
 
 /* ------------------------------------------------------------------ IApplicationFunctions */
-static void af_pop_launch_param(IpcCtx *x) { x->result = RES_AM_NOT_AVAILABLE; }     /* started from the home menu: nothing queued */
+/* Launched from the home menu with one user selected: kind 2 (PreselectedUser) holds a 0x88 byte storage, magic 0xC79497CA, a
+ * "selected" byte and the 16 byte user id (the same id acc:u0 reports); no other launch parameter is queued. */
+static void af_pop_launch_param(IpcCtx *x) {
+    rt_log("applet: PopLaunchParameter kind=%u", in_u32(x, 0));
+    if (in_u32(x, 0) != 2) { x->result = RES_AM_NO_DATA; return; }
+    Storage *s = storage_new(0x88);
+    uint32_t magic = 0xC79497CAu;
+    memcpy(s->data, &magic, 4);
+    s->data[4] = 1;
+    s->data[8] = 1;                            /* user id {1, 0, ...} */
+    out_obj(x, &g_st_iface, s);
+}
+static void af_set_terminate_result(IpcCtx *x) { rt_log("applet: SetTerminateResult 0x%x", in_u32(x, 0)); }
 static void af_ensure_save(IpcCtx *x) { out_u64(x, 0, 0); }                          /* the save area lives under hle_save_dir() */
 static void af_desired_language(IpcCtx *x) { out_u64(x, 0, 0x00000053552D6E65ull); } /* "en-US" */
 static void af_display_version(IpcCtx *x) { char v[16] = "1.0.1"; out_bytes(x, 0, v, 16); }
@@ -99,7 +198,7 @@ static void af_uuid(IpcCtx *x) { out_zero(x, 0, 16); }
 static void af_gpu_error_event(IpcCtx *x) { ret_event(x, &g_gpuerr_event); }
 static void af_misc_event(IpcCtx *x) { ret_event(x, &g_misc_event); }
 CMD_TABLE(g_af_cmds) = {
-    CMD(1, af_pop_launch_param), CMD(20, af_ensure_save), CMD(21, af_desired_language), CMD(22, nop), CMD(23, af_display_version),
+    CMD(1, af_pop_launch_param), CMD(20, af_ensure_save), CMD(21, af_desired_language), CMD(22, af_set_terminate_result), CMD(23, af_display_version),
     CMD(25, ret_u64_0), CMD(26, af_save_size), CMD(27, nop), CMD(28, af_save_size), CMD(30, nop), CMD(31, nop), CMD(32, nop), CMD(33, nop),
     CMD(40, ret_true), CMD(50, af_uuid), CMD(60, nop), CMD(65, ret_false), CMD(66, nop), CMD(67, nop), CMD(90, nop), CMD(100, nop),
     CMD(101, nop), CMD(102, nop), CMD(110, ret_u64_0), CMD(111, ret_u64_0), CMD(120, nop), CMD(121, nop), CMD(122, nop), CMD(123, ret_u32_0),

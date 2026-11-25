@@ -1,10 +1,10 @@
 /* Star Road Recomp: NVN host wiring for the game build (task-13 step 2). Our own code (D-008).
  *
- *   - loads the shader cache (merged v1 + reuse-v1 root, see tools/rtprep/merge_shader_cache.py);
+ *   - loads the shader cache (own translator only: shaders/cache/v1, every entry is translator shaderxlate 1; reuse-v1 is retired);
  *   - wraps nvnQueuePresentTexture to save chosen presented frames as PNG (captures live outside the repo).
  *
  * Environment:
- *   SMRPG_SHADER_CACHE   cache root (default A:\AI\Recomps\smrpg-work\shaders\cache\merged-v1; "off" skips loading)
+ *   SMRPG_SHADER_CACHE   cache root (default A:/AI/Recomps/smrpg-work/shaders/cache/v1; "off" skips loading)
  *   SMRPG_CAPTURE_DIR    directory for frame PNGs (unset: no captures)
  *   SMRPG_CAPTURE_FRAMES comma list of 1-based present numbers to save (default "1")
  *   SMRPG_CAPTURE_EVERY  also save every Nth present (default 0 = off)
@@ -59,7 +59,7 @@ void gfxcap_init(void) {
     const HleDef *boot = hle_find("nvnBootstrapLoader");
     if (boot) hle_slot("nvnBootstrapLoader", SLOT_HLE, boot->fn, 0)->fn = boot->fn;
     const char *root = getenv("SMRPG_SHADER_CACHE");
-    if (!root || !*root) root = "A:/AI/Recomps/smrpg-work/shaders/cache/merged-v1";
+    if (!root || !*root) root = "A:/AI/Recomps/smrpg-work/shaders/cache/v1";
     if (strcmp(root, "off") != 0) rt_log("shader cache %s: %s", root, nvn_host_cache_load(root) ? "loaded" : "NOT LOADED");
     const char *di = getenv("SMRPG_DEVINFO_5E");
     if (di && *di) g_devinfo_5e = atoi(di);

@@ -365,7 +365,17 @@ static void acc_list(IpcCtx *x) {              /* 2 ListAllUsers, 3 ListOpenUser
 }
 static void acc_last(IpcCtx *x)   { out_bytes(x, 0, k_uid, 16); }
 static void acc_init(IpcCtx *x)   { (void)x; }
-CMD_TABLE(g_acc_cmds) = {CMD(0, acc_count), CMD(1, acc_exists), CMD(2, acc_list), CMD(3, acc_list), CMD(4, acc_last), CMD(100, acc_init)};
+static void acc_false(IpcCtx *x)  { uint8_t v = 0; out_bytes(x, 0, &v, 1); }
+/* nn::account::detail::INotifier: GetSystemEvent hands back an event that never fires (no account changes on this console) */
+static KObj *g_acc_notify_ev;
+static void accn_event(IpcCtx *x) {
+    if (!g_acc_notify_ev) g_acc_notify_ev = k_event_named("acc_notifier", 0);
+    out_copy_handle(x, k_handle_for(g_acc_notify_ev, 1));
+}
+CMD_TABLE(g_accn_cmds) = {CMD(0, accn_event)};
+IFACE(g_accn_iface, "nn::account::detail::INotifier", g_accn_cmds);
+static void acc_notifier(IpcCtx *x) { out_obj(x, &g_accn_iface, 0); }
+CMD_TABLE(g_acc_cmds) = {CMD(0, acc_count), CMD(1, acc_exists), CMD(2, acc_list), CMD(3, acc_list), CMD(4, acc_last), CMD(51, acc_last), CMD(100, acc_notifier), CMD(101, acc_notifier), CMD(103, acc_notifier), CMD(104, acc_notifier), CMD(106, acc_notifier), CMD(140, acc_init), CMD(141, acc_list), CMD(150, acc_false), CMD(160, acc_init)};
 IFACE(g_acc_iface, "nn::account::detail::IAccountServiceForApplication", g_acc_cmds);
 
 static const ServiceDef g_audio_defs[] = {{"audren:u", &g_audren_iface, 0}, {"audout:u", &g_audout_iface, 0}, {"hwopus", &g_hwopus_iface, 0},

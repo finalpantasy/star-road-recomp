@@ -106,9 +106,12 @@ void out_obj(IpcCtx *x, const SvcIface *iface, void *state);   /* return a new i
 void out_copy_handle(IpcCtx *x, uint32_t h);
 void out_move_handle(IpcCtx *x, uint32_t h);
 /* i-th input buffer: map-alias (A) buffers first, then pointer (X); out buffer: B first, then the C list */
+SvcObj *ipc_in_obj(IpcCtx *x, int i);      /* i-th interface object argument, 0 if none */
 IpcBuf *ipc_in_buf(IpcCtx *x, int i);
 IpcBuf *ipc_out_buf(IpcCtx *x, int i);
 uint64_t ipc_write_out(IpcCtx *x, int i, const void *data, uint64_t n);   /* writes into out buffer i, registers C-list size, returns bytes written */
+int ipc_in_data_idx(IpcCtx *x);    /* index (for ipc_in_buf) of the input buffer that carries bytes; auto-select pairs have one empty half */
+int ipc_out_data_idx(IpcCtx *x);   /* same for ipc_out_buf */
 
 /* services and objects */
 SvcObj *svcobj_new(const SvcIface *iface, void *state);
