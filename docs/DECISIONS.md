@@ -31,4 +31,4 @@ Mark unresolved choices OPEN. Defaults are provisional unless explicitly approve
 ## D-012: Third-party libraries now, replaced over time
 - Date: 2026-11-25. Decided by: the owner ("include 3rd party things for now, we'll slowly replace them"; "ffmpeg inclusion is fine - just include it").
 - Decision: to reach a playable build fast, the runtime may use third-party libraries (first: FFmpeg for movies). Each one is listed in `docs/REUSE_LEDGER.md` with its license and a replacement card, and is replaced by our own code over time, tested against the library as the oracle. Binaries are not committed; they are loaded at run time from A: during development and shipped beside the exe at release with their license files.
-- Unchanged: D-009 still keeps copied third-party source out of Git unless the owner says otherwise.
+- Unchanged (owner confirmed 2026-11-25, "Yes, keep it out"): D-009 keeps copied third-party source out of Git until our rewrite replaces it.
