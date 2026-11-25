@@ -1,6 +1,6 @@
 # Super Mario RPG PC: static recompilation, then full decompilation
 Native PC version of Super Mario RPG (Switch, 2023, v1.0.1) built from the owner's own dump: first an ahead-of-time ARM64 to x86-64 static recompilation, then a full decompilation of the game onto a lightweight native engine.
-Original: Unity 2021.3.15f1, IL2CPP, NVN, CRIWARE movies. Target: Windows x64 first, controller plus keyboard. Decomp language: OPEN (D-003).
+Original: Unity 2021.3.15f1, IL2CPP, NVN, CRIWARE movies. Target: Windows x64 first, controller plus keyboard. Decomp language: Rust (D-003).
 
 ## Commands and evidence
 - Inputs (owner dumps): `F:\Super Mario RPG\*.xci`, `*.nsp`. Never modify, move or commit them.
