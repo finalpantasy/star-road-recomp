@@ -30,3 +30,4 @@ Sources: IL2CPP dump `A:\AI\Recomps\smrpg-work\analysis\il2cpp\crosscheck\dumper
 - Owner gates: (1) permanent clearing: the flags land in the next in-game save and stay; a write-side strip is not built. (2) lifting `_chapter_number` to 8 is a story skip and is off (`raise_chapter` in `postgame_patch_save`); a save below chapter 8 may not show the rematch hosts without it.
 - Open: boss identity per rematch host, whether the game's own post-game save holds chapter 8 or 9, new-game effect (needs a save reload; in-memory hook waits for stage 2 swaps), 2048 and 2300 roles.
 2026-11-25 owner: keep the unlock permanent (flags stay in the save after the next in-game save, even with the option off later).
+2026-11-25 owner: chapter is left untouched (lead recommendation). Revisit with a real save: if the rematch hosts need chapter 8, propose a separate off-by-default option.
