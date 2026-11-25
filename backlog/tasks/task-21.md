@@ -13,7 +13,7 @@ Execution: subchat smrpg-movies, Sonnet high.
 ## Acceptance and evidence
 | ID | Criterion | Scenario/assertion | Required evidence | Result |
 |---|---|---|---|---|
-| AC1 | LGPL-only DLL | Built from a pinned FFmpeg release by `tools/ffmpeg/build.py` with only the decoders and parsers needed; `configure` output shows no `--enable-gpl`, `--enable-nonfree`; license reported LGPL | build log on A:, `avcodec_license()` output | |
+| AC1 | LGPL-only DLL (optional this round; owner OK to include FFmpeg, MSYS2 DLLs allowed for development) | Built from a pinned FFmpeg release by `tools/ffmpeg/build.py` with only the decoders and parsers needed; `configure` output shows no `--enable-gpl`, `--enable-nonfree`; license reported LGPL | build log on A:, `avcodec_license()` output | |
 | AC2 | nn::movie HLE | Every `nn::movie` import the game calls on the boot path is handled (strict mode: no unknown call); nvdec ioctls no longer reached; `SMRPG_NVDEC_OK` not needed | `hle_boot.log` grep | |
 | AC3 | Frames decode | movie_017 and movie_001 decode with 0 decode errors; frame count matches the USM header | log counters | |
 | AC4 | Pictures right | Captured movie frames show the movie (not black, gray or white); compared by eye with the baseline's frames at the same moments (`A:\AI\Recomps\smrpg-work\captures\baseline\`) | PNGs on A: | |

@@ -26,3 +26,4 @@ Mark unresolved choices OPEN. Defaults are provisional unless explicitly approve
 - Why: the title screen needs decoded movies now; libavcodec's VP9 decoder is mature and fast; the released baseline already shows the route works. Our own VP9 decoder is weeks of work for no visible gain, and dynamic linking keeps our own license free.
 - Rejected: our own VP9 decoder (cost, risk); answering the nvdec ioctls with a full NVDEC emulation (more surface than the 31 `nn::movie` imports).
 - Revisit if: the owner wants zero third-party binaries in the release, or LGPL terms conflict with how the release is packaged.
+- Update 2026-11-25: the owner: "ffmpeg inclusion is fine - just include it". Development uses the FFmpeg DLLs already on A: (MSYS2) for speed; the minimal LGPL-only build is deferred to release packaging (a release card), so the shipped DLL does not pull GPL terms onto our code.
