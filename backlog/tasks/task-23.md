@@ -1,15 +1,15 @@
 ---
 id: task-23
 title: Upscaling with AMD FSR (MIT) behind an option, faithful mode default (D-004, D-012)
-status: Planned
+status: Ready
 ---
 ## Problem before solution
 D-004 wants 4K and high resolution. The game renders at Switch resolutions; presenting at 4K needs a good upscaler as one route (the other route, native higher-resolution render targets, is its own card later). FidelityFX FSR is MIT and runs on Vulkan compute.
 ## Outcome and scope
 An option `upscale = off | fsr1 | fsr2` (FSR 2 only if motion vectors are reachable; FSR 1 spatial first) applied at present time to the game's final image, sized to the SDL window or a target resolution, with sharpening as a setting. `off` is the faithful mode and the default. FSR source is fetched at a pinned release into `A:\AI\Recomps\thirdparty\fsr\` by a committed script; its shaders compiled at build time; nothing from it is committed.
 ## Dependencies and ownership
-Depends on task-22 (SDL window and swapchain size). Owns the present and blit section of `runtime/nvn/nvn_replay.cpp`, `runtime/gfx/upscale/`, `tools/thirdparty/fetch_fsr.py`.
-Execution: subchat, Sonnet high.
+Depends on task-22 (SDL window and swapchain size). Owns the present and blit section of `runtime/nvn/nvn_replay.cpp` (`QueuePresent`), `runtime/gfx/upscale/`, `tools/thirdparty/fetch_fsr.py`. First edit: two hook points in `QueuePresent`, the upscale pass and then `PlatOverlayDraw(...)` (a weak no-op default in `runtime/gfx/upscale/`), so task-16 never edits `QueuePresent`. Execution order in a frame: game image, upscale, overlay, present.
+Execution: subchat smrpg-upscale, Sonnet high.
 ## Acceptance and evidence
 | ID | Criterion | Scenario/assertion | Required evidence | Result |
 |---|---|---|---|---|
