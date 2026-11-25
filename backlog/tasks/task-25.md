@@ -1,7 +1,7 @@
 ---
 id: task-25
 title: Our own Hard difficulty: stronger enemies through the monster table, behind an option (D-004)
-status: Ready
+status: Rejected
 ---
 ## Problem before solution
 The game has only Normal and Breezy. The owner wants a harder mode (2026-11-25). Enemy stats live in data tables (`romfs/Data/StreamingAssets/data_tbl/monster.tbl`, MS-NRBF serialized), so a Hard mode can be data, not code.
@@ -24,3 +24,4 @@ Return once at done or blocked.
 ## Approach and commands
 Files: extracted romfs under `A:\AI\Recomps\smrpg-work\v101\` (find the `data_tbl` folder there). `docs/analysis/prior-art.md` row 10 names a public tool that round trips these tables (no license: read for facts only, write our own codec, D-009). Build and run commands as in `AGENTS.md` and `docs/PLATFORM.md`.
 ## Log and handoff
+2026-11-25 lead: cancelled by the owner ("no not both, just the 1st on"): only the post-game unlock (task-24) is wanted. Worker stopped before writing any file. Kept as a rejected direction.
