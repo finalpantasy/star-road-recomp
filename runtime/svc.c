@@ -163,11 +163,62 @@ static void *commit_exact(uint64_t addr, uint64_t sz) {
     return (void *)addr;
 }
 
+/* Stack growth stopgap (SMRPG_NO_STACKGROW=1 disables). The CRI decode thread (CriManaDecodeThread) is created with a 16 KiB stack and
+ * the game's own managed code on it then does a 16 KiB stackalloc one frame in, which runs 0x770 bytes below the mapping into the
+ * guard gap: Horizon would fault there too, so the real game must not take this path (it only appears once nvdec opens and fails).
+ * Until that path is understood, a fault in the 256 KiB below a stack mapping commits the missing pages instead of killing the process.
+ * The commit is on demand, so the guard gap still looks free to QueryMemory when the sdk checks it at thread creation. */
+#define STK_MAX 512
+#define STK_GROW (256u << 10)
+static struct { uint64_t dst, size; } g_stk[STK_MAX];
+static volatile LONG g_nstk;
+static volatile LONG g_stk_grown;
+
+static void stk_register(uint64_t dst, uint64_t sz) {
+    if (dst < GUEST_STACK_BASE) return;
+    LONG i = InterlockedIncrement(&g_nstk) - 1;
+    if (i < STK_MAX) { g_stk[i].size = sz; g_stk[i].dst = dst; }
+}
+
+int svc_stack_grow(uint64_t fa) {
+    static int off = -1;
+    if (off < 0) off = getenv("SMRPG_NO_STACKGROW") != NULL;
+    if (off || fa < GUEST_STACK_BASE) return 0;
+    LONG n = g_nstk < STK_MAX ? g_nstk : STK_MAX;
+    for (LONG i = 0; i < n; i++) {
+        uint64_t d = g_stk[i].dst;
+        if (!d || fa >= d || fa + STK_GROW < d) continue;
+        uint64_t lo = (fa & ~0xFFFULL);
+        int ok = 1;
+        for (uint64_t a = lo; a < d; a += 0x1000) {
+            MEMORY_BASIC_INFORMATION mi;
+            if (VirtualQuery((void *)a, &mi, sizeof mi) && mi.State == MEM_COMMIT) { ok = a == lo ? 0 : 1; break; }
+            if (!commit_exact(a, 0x1000)) { ok = 0; break; }
+        }
+        if (!ok) return 0;
+        /* nn::os checks sp against the ThreadType's recorded stack (sdk 0x12ebb0: base at +0x50, size at +0x58): keep it in step */
+        if (tl_ctx && tl_ctx->tpidrro_el0 && !IsBadReadPtr((void *)(uintptr_t)(tl_ctx->tpidrro_el0 + 0x1f8), 8)) {
+            uint64_t tt = *(uint64_t *)(tl_ctx->tpidrro_el0 + 0x1f8);
+            if (tt && !IsBadWritePtr((void *)(uintptr_t)(tt + 0x50), 16)) {
+                uint64_t *b = (uint64_t *)(tt + 0x50), *z = (uint64_t *)(tt + 0x58);
+                if (*b >= lo && *b <= d && *b + *z >= d) { *z += *b - lo; *b = lo; }
+            }
+        }
+        if (InterlockedIncrement(&g_stk_grown) <= 8)
+            rt_log("STOPGAP stack growth: fault at %#llx below the stack mapping %#llx (size %#llx); committed %#llx bytes (SMRPG_NO_STACKGROW=1 disables)",
+                   (unsigned long long)fa, (unsigned long long)d, (unsigned long long)g_stk[i].size, (unsigned long long)(d - lo));
+        return 1;
+    }
+    return 0;
+}
+
 static void svc_map_memory(Ctx *c) {
     uint64_t dst = c->x[0], src = c->x[1], sz = c->x[2];
     DWORD old;
     if ((dst | src | sz) & 0xFFF || !sz) { c->x[0] = RES_INVALID_ADDR; return; }
     if (!commit_exact(dst, sz)) { c->x[0] = RES_INVALID_ADDR; return; }
+    stk_register(dst, sz);
+    if (getenv("SMRPG_STKLOG")) rt_log("  MapMemory dst=%#llx src=%#llx size=%#llx", (unsigned long long)dst, (unsigned long long)src, (unsigned long long)sz);
     memcpy((void *)dst, (void *)src, sz);                 /* copy semantics: see runtime-handover.md */
     VirtualProtect((void *)src, sz, PAGE_NOACCESS, &old);
     c->x[0] = 0;
@@ -207,6 +258,16 @@ static void svc_query_memory(Ctx *c) {
                 type = 12;
                 /* the kernel reports the main thread's stack as one mapping; neighbors that Windows merges into the same region
                  * (the next allocation) would make the sdk's stack info end short of the real sp */
+                /* a thread stack that grew below its mapping (svc_stack_grow) is reported as one stack region */
+                { LONG n = g_nstk < STK_MAX ? g_nstk : STK_MAX;
+                  for (LONG i = 0; i < n; i++) {
+                      uint64_t d = g_stk[i].dst, e = d + g_stk[i].size;
+                      if (!d || addr >= e || addr + STK_GROW < d) continue;
+                      uint64_t lo = d;
+                      while (lo > d - STK_GROW) { MEMORY_BASIC_INFORMATION q; if (!VirtualQuery((void *)(lo - 0x1000), &q, sizeof q) || q.State != MEM_COMMIT) break; lo -= 0x1000; }
+                      if (addr >= lo) { base = lo; size = e - lo; }
+                      break;
+                  } }
                 const RtThread *mt = svc_main_thread();
                 if (mt && mt->stack_base && addr >= mt->stack_base && addr < mt->stack_base + (16u << 20)) { base = mt->stack_base; size = 16u << 20; }
             }
@@ -222,7 +283,7 @@ static void svc_query_memory(Ctx *c) {
             size = end - base;
         }
     }
-    if (g_trace) rt_log("  QueryMemory(%#llx) -> base=%#llx size=%#llx type=%u perm=%u", (unsigned long long)addr, (unsigned long long)base, (unsigned long long)size, type, perm);
+    if (g_trace || (addr >= GUEST_STACK_BASE && getenv("SMRPG_STKLOG"))) rt_log("  QueryMemory(%#llx) -> base=%#llx size=%#llx type=%u perm=%u", (unsigned long long)addr, (unsigned long long)base, (unsigned long long)size, type, perm);
     uint64_t *o = (uint64_t *)out;
     o[0] = base; o[1] = size;
     ((uint32_t *)o)[4] = type; ((uint32_t *)o)[5] = 0; ((uint32_t *)o)[6] = perm; ((uint32_t *)o)[7] = 0; ((uint32_t *)o)[8] = 0; ((uint32_t *)o)[9] = 0;
@@ -406,6 +467,15 @@ static void svc_create_thread(Ctx *c) {
     RtThread *t = thread_new("guest");
     LeaveCriticalSection(&g_k);
     t->entry = entry; t->arg = arg; t->stack_top = top; t->prio = prio; t->core = core;
+    if (getenv("SMRPG_STKLOG")) {
+        char fr[200]; int n = 0; uint64_t fp = c->x[29];
+        for (int i = 0; i < 8 && fp >= GUEST_STACK_BASE && (fp & 7) == 0 && n < 180; i++) {
+            n += snprintf(fr + n, sizeof fr - n, " %#llx", (unsigned long long)*(uint64_t *)(fp + 8));
+            fp = *(uint64_t *)fp;
+        }
+        fr[n] = 0;
+        rt_log("  CreateThread tid~%u entry=%#llx arg=%#llx top=%#llx lr=%#llx frames:%s", t->tid, (unsigned long long)entry, (unsigned long long)arg, (unsigned long long)top, (unsigned long long)c->x[30], fr);
+    }
     c->x[0] = t->handle ? 0 : RES_OUT_OF_MEM;
     c->x[1] = t->handle;
 }

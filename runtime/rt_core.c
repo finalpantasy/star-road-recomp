@@ -278,11 +278,21 @@ static void dump_ctx(const Ctx *c) {
 
 static void dump_addrs(void) {
     icring_dump();   /* debug aid: SMRPG_DUMPADDR=<hex addr>[,<hex addr>...] dumps 0x60 bytes of guest memory at a fatal error */
+    if (getenv("SMRPG_STACKSTR") && tl_ctx) {   /* debug aid: printable runs (8+ chars) in the 24 KiB above the guest sp, e.g. a formatted error message */
+        const unsigned char *b = (const unsigned char *)tl_ctx->x[31];
+        for (uint64_t i = 0; i < 0x6000 && !IsBadReadPtr(b + i, 16);) {
+            uint64_t j = i;
+            while (j < 0x6000 && b[j] >= 32 && b[j] < 127) j++;
+            if (j - i >= 8) { char t[161]; uint64_t n = j - i < 160 ? j - i : 160; memcpy(t, b + i, n); t[n] = 0; rt_log("  stackstr sp+%#llx: \"%s\"", (unsigned long long)i, t); }
+            i = j > i ? j : i + 1;
+        }
+    }
     const char *d = getenv("SMRPG_DUMPADDR");
     while (d && *d) {
         char *e; uint64_t da = strtoull(d, &e, 16);
         if (e == d) break;
         for (int i = 0; i < 0x60; i += 8) rt_log("  dump %#llx = %#llx", (unsigned long long)(da + i), (unsigned long long)*(uint64_t *)(da + i));
+        { char t[161]; int k = 0; for (; k < 160 && ((const char *)da)[k] >= 32 && ((const char *)da)[k] < 127; k++) t[k] = ((const char *)da)[k]; t[k] = 0; rt_log("  dump %#llx as text: \"%s\"", (unsigned long long)da, t); }
         d = (*e == ',') ? e + 1 : e;
     }
 }
@@ -298,8 +308,10 @@ void rt_fatal(Ctx *c, const char *what, uint64_t arg) {
 
 void rt_brk(Ctx *c, uint32_t imm) { rt_fatal(c, "brk instruction executed", imm); }
 
+int svc_stack_grow(uint64_t fa);
 static LONG WINAPI rt_veh(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters > 1 && svc_stack_grow((uint64_t)ep->ExceptionRecord->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (code == EXCEPTION_ACCESS_VIOLATION && g_fn_arena) {
         uint64_t fa = (uint64_t)ep->ExceptionRecord->ExceptionInformation[1];
         uint64_t per = (GUEST_MOD_SPAN >> 2) * sizeof(uint32_t);

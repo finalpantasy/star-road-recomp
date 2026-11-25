@@ -96,6 +96,13 @@ void hle_thunk(Ctx *c) {
     } else if (g_trace && s->kind != SLOT_INTERNAL) {
         rt_log("%s call #%lld %s [x19=%#llx sp=%#llx]", s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : "WRAP", (long long)n, s->name, (unsigned long long)c->x[19], (unsigned long long)c->x[31]);
     }
+    if (s->kind == SLOT_WRAP) {                      /* SMRPG_FSLOG=1: every nn::fs path the guest opens (which movie, which bundle) */
+        static int fslog = -1;
+        if (fslog < 0) fslog = getenv("SMRPG_FSLOG") != NULL;
+        if (fslog && s->name && (strstr(s->name, "2fs8OpenFile") || strstr(s->name, "2fs9GetEntryType") || strstr(s->name, "2fs10GetFileSize")) &&
+            c->x[1] > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)c->x[1], 8))
+            rt_log("fslog %s \"%.160s\"", s->name, (const char *)(uintptr_t)c->x[1]);
+    }
     switch (s->kind) {
     case SLOT_STUB: c->x[0] = 0; break;
     case SLOT_WRAP: rt_icall(c, s->real); break;

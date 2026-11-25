@@ -146,13 +146,87 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
     _, base, tab, sh, nmadd, fadd = s
     _, taddr, sz, sgn, opt, amt, idxreg, fld = tab
     # table bound: look back for  cmp xI, #N ; b.hi/b.hs
+    # the index often reaches the table load through a copy (mov w8, w1 after cmp w1, #N): every register it was copied from
+    # holds the same value, so a compare on any alias bounds the table
+    aliases = {idxreg}
+    for k in range(idx - 1, max(-1, idx - 48), -1):
+        a, nm, f = insns[k]
+        if nm == "log_reg" and f["opc"] == 1 and f["rn"] == 31 and not f["neg"] and f["amt"] == 0 and f["shift"] == 0                 and f["rd"] in aliases and f["rm"] != 31:
+            aliases.add(f["rm"])
     bound = None
     # a guard `cmp xI, #N ; b.ls/b.lo <table>` that branches straight to the table setup just above the br (the guard can sit in
     # another block, with unrelated compares of the same register in between)
     br_addr = insns[idx][0]
-    for k in range(idx - 1, max(-1, idx - 400), -1):
+    # value numbering over the straight-line window: the compare can sit on a register that holds the same value as the index
+    # through `and x, y, #0xffffffff` / `and w, w, #0xffff` (masks that a bounded compare makes a no-op) as well as plain copies
+    cmpcore = {}
+    vn = {}
+    lo_w = max(0, idx - 700)
+
+    def vn_of(r):
+        return vn.get(r, ("in", r))
+
+    def core(e):
+        while e[0] == "and":
+            e = e[1]
+        return e
+
+    for k in range(lo_w, idx):
         a, nm, f = insns[k]
-        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["rn"] == idxreg and k + 1 < len(insns):
+        if nm is None:
+            continue
+        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31:
+            cmpcore[k] = core(vn_of(f["rn"]))
+            continue
+        if nm == "log_reg" and f["opc"] == 1 and f["rn"] == 31 and not f["neg"] and f["amt"] == 0 and f["shift"] == 0 and f["rm"] != 31:
+            vn[f["rd"]] = vn_of(f["rm"])
+            continue
+        if nm == "log_imm" and f["opc"] == 0 and f["imm"] & (f["imm"] + 1) == 0 and f["rd"] != 31 and f["rn"] != 31:
+            vn[f["rd"]] = ("and", vn_of(f["rn"]), f["imm"])
+            continue
+        try:
+            _r, wr = op_regs(nm, f)
+        except Exception:
+            continue
+        for n in range(31):
+            if wr & bit_x(n):
+                vn[n] = ("d", k, n)
+    idx_core = core(vn_of(idxreg))
+
+    def rewritten(reg, k):
+        for j in range(k + 1, idx):
+            _a, _nm, _f = insns[j]
+            if _nm is None:
+                continue
+            try:
+                _r, _w = op_regs(_nm, _f)
+            except Exception:
+                continue
+            if _w & bit_x(reg):
+                return True
+        return False
+
+    def cmp_ok(k, f):
+        if cmpcore.get(k) == idx_core:
+            return True
+        if f["rn"] in aliases:
+            # a compare on a stale value of the register (it was reloaded since) says nothing about the index; compares far
+            # above the window cannot be told apart and stay accepted (the guard branch must still land at the table setup)
+            return k < lo_w or not rewritten(f["rn"], k)
+        return False
+
+    def guard_lands(k, f):
+        # `cmp xI, #N ; b.ls/b.lo <setup>` jumps straight to the table setup: the compared value is the index as long as nothing
+        # rewrites the register between the branch target and the br
+        nxt = insns[k + 1] if k + 1 < len(insns) else None
+        if not nxt or nxt[1] != "bcond" or not (br_addr - 0x80 <= nxt[2]["target"] <= br_addr):
+            return False
+        ti = (nxt[2]["target"] - insns[0][0]) >> 2
+        return 0 <= ti < idx and not rewritten(f["rn"], ti - 1)
+
+    for k in range(idx - 1, max(-1, idx - 4000), -1):
+        a, nm, f = insns[k]
+        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and (cmp_ok(k, f) or (f["rn"] in aliases and guard_lands(k, f))) and k + 1 < len(insns):
             nxt = insns[k + 1]
             if nxt[1] == "bcond" and nxt[2]["cond"] in (3, 9) and br_addr - 0x80 <= nxt[2]["target"] <= br_addr and f["imm"] < 4096:
                 bound = f["imm"] + 1 if nxt[2]["cond"] == 9 else f["imm"]
@@ -161,7 +235,7 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
         if bound is not None:
             break
         a, nm, f = insns[k]
-        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["rn"] == idxreg:
+        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and cmp_ok(k, f):
             bound = f["imm"] + 1
             nxt = insns[k + 1] if k + 1 < len(insns) else None
             if nxt and nxt[1] == "bcond" and nxt[2]["cond"] in (2,):  # hs: >= N goes to default
@@ -172,7 +246,7 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
         order = list(range(idx - 1, -1, -1)) + list(range(idx + 1, len(insns)))
         for k in order:
             a, nm, f = insns[k]
-            if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["rn"] == idxreg and f["imm"] < 4096:
+            if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and (f["rn"] in aliases or cmpcore.get(k) == idx_core) and f["imm"] < 4096:
                 nxt = insns[k + 1] if k + 1 < len(insns) else None
                 if nxt and nxt[1] == "bcond" and nxt[2]["cond"] in (2, 8, 9, 12):
                     # hs: >= N exits; hi: > N exits; ls/le style forms enter the table below the bound
@@ -193,6 +267,41 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
                     bound = f["imm"] + 1
                 break
     if bound is None:
+        # last resort: a guard on a register that derives from the same source as the index (range reduction through
+        # sub/csel/and/mov chains: `w21 = w1 - 15; cmp w21, #4; b.hi default; w24 = csel(lt, ..., w21)`). Tracks, per register,
+        # the set of values it derives from over the preceding straight-line window; the nearest guard that shares a source wins.
+        dep = {}
+
+        def dep_of(r):
+            return dep.get(r) or frozenset([("in", r)])
+
+        guards = []
+        for k in range(max(0, idx - 600), idx):
+            a, nm, f = insns[k]
+            if nm is None:
+                continue
+            if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["imm"] < 4096 and k + 1 < len(insns):
+                nxt = insns[k + 1]
+                if nxt[1] == "bcond" and nxt[2]["cond"] in (2, 8):
+                    guards.append((k, f["imm"] if nxt[2]["cond"] == 2 else f["imm"] + 1, dep_of(f["rn"])))
+                continue
+            try:
+                rd_, wr_ = op_regs(nm, f)
+            except Exception:
+                continue
+            if nm in ("log_reg", "log_imm", "addsub_imm", "addsub_reg", "csel") and f.get("rd", 31) != 31:
+                srcs = frozenset().union(*[dep_of(f[x]) for x in ("rn", "rm") if x in f and f[x] != 31])
+                dep[f["rd"]] = srcs if srcs else frozenset([("d", k)])
+            else:
+                for n in range(31):
+                    if wr_ & bit_x(n):
+                        dep[n] = frozenset([("d", k, n)])
+        want = dep_of(idxreg)
+        for k, bd, dp in reversed(guards):
+            if dp & want and all(x[0] != "in" or x[1] != 31 for x in dp & want):
+                bound = bd
+                break
+    if bound is None:
         return None
     targets = []
     for i in range(bound):
@@ -203,7 +312,10 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
         if sgn:
             raw = raw - (1 << (8 * sz)) if raw >> (8 * sz - 1) else raw
         targets.append((base + (raw << sh)) & dec._ones(64))
-    if func_range and any(not (func_range[0] <= t < func_range[1]) or t & 3 for t in targets):
+    # The inventory often splits a switch from its case blocks (each block has its own FDE), so targets outside func_range are
+    # expected. They are accepted when aligned and near the br (byte, halfword and word offset tables stay within the window);
+    # the emitter turns them into tail calls to the function that owns the case block.
+    if any(t & 3 or t < base_addr or abs(t - br_addr) > 0x40000 for t in targets):
         return None
     return idxreg, opt, targets
 
@@ -249,10 +361,13 @@ class Lifter:
         self.summ_cache[addr] = res
         return res
 
-    def lift(self, start, end):
+    def lift(self, start, end, entry=None):
+        """Lift [start, end) as one function entered at `entry` (default start). A synthetic entry (entry > start) is a
+        mid-function target: only code reachable from it is emitted, and branches back below it stay local gotos."""
         m = self.mod
+        entry = start if entry is None else entry
         insns = decode_range(m["words"], m["base"], start, end)
-        info = dict(addr=start, insns=len(insns), jt=0, jt_unresolved=0, bad=None, tail=0, calls=0, mid=0)
+        info = dict(addr=entry, insns=len(insns), jt=0, jt_unresolved=0, bad=None, tail=0, calls=0, mid=0, mid_t=set())
         pos = {a: i for i, (a, _, _) in enumerate(insns)}
         # ---- exception call sites (task-14): LSDA answer per call, landing pads become leaders and roots
         sites = {}
@@ -262,7 +377,8 @@ class Lifter:
                     s = self.eh.site(a + 4)
                     if s[0]:
                         sites[a] = s
-        pads = sorted({s[1] for s in sites.values() if s[0] == 1 and start <= s[1] < end})
+        site_pads = {a: s[1] for a, s in sites.items() if s[0] == 1 and start <= s[1] < end}
+        pad_roots = set()
         self._sites = sites
         has_pad = any(s[0] == 1 for s in sites.values())
         info["eh_sites"] = len(sites)
@@ -270,65 +386,72 @@ class Lifter:
         info["eh_pads_out"] = sum(1 for s in sites.values() if s[0] == 1 and not (start <= s[1] < end))
         info["eh_nosite"] = sum(1 for s in sites.values() if s[0] == 3)
         # ---- reachability and leaders
-        leaders = {start} | set(pads)
+        leaders = {entry}
         jt = {}
         bad = None
-        work = [start] + pads
+        work = [entry]
         seen = set()
         reach = set()
-        while work:
-            a = work.pop()
-            while start <= a < end and a not in seen:
-                seen.add(a)
-                i = pos[a]
-                _, nm, f = insns[i]
-                if nm is None:
-                    if bad is None:
-                        bad = (a, f)
-                    break
-                reach.add(a)
-                nxt = a + 4
-                if nm == "b":
-                    t = f["target"]
-                    if start <= t < end:
-                        leaders.add(t)
-                        work.append(t)
-                    break
-                if nm in ("bcond", "cbz", "tbz"):
-                    t = f["target"]
-                    if start <= t < end:
-                        leaders.add(t)
-                        work.append(t)
-                    leaders.add(nxt)
-                elif nm == "br":
-                    r = match_jump_table(insns, i, m["base"], m["rd_mem"], (start, end))
-                    if r:
-                        jt[a] = r
-                        for t in r[2]:
-                            if start <= t < end:
-                                leaders.add(t)
-                                work.append(t)
-                    else:
-                        # indirect jump through a loaded pointer (virtual/import tail call) vs an unresolved switch
-                        org = None
-                        for k in range(i - 1, max(-1, i - 30), -1):
-                            nm2, f2 = insns[k][1], insns[k][2]
-                            if nm2 is None:
-                                continue
-                            try:
-                                if op_regs(nm2, f2)[1] & bit_x(f["rn"]):
-                                    org = nm2
-                                    break
-                            except Exception:
-                                pass
-                        if org in ("addsub_reg", "addsub_ext"):
-                            info["jt_unresolved"] += 1      # a computed switch we could not bound
+        while True:
+            while work:
+                a = work.pop()
+                while start <= a < end and a not in seen:
+                    seen.add(a)
+                    i = pos[a]
+                    _, nm, f = insns[i]
+                    if nm is None:
+                        if bad is None:
+                            bad = (a, f)
+                        break
+                    reach.add(a)
+                    nxt = a + 4
+                    if nm == "b":
+                        t = f["target"]
+                        if start <= t < end:
+                            leaders.add(t)
+                            work.append(t)
+                        break
+                    if nm in ("bcond", "cbz", "tbz"):
+                        t = f["target"]
+                        if start <= t < end:
+                            leaders.add(t)
+                            work.append(t)
+                        leaders.add(nxt)
+                    elif nm == "br":
+                        r = match_jump_table(insns, i, m["base"], m["rd_mem"], (start, end))
+                        if r:
+                            jt[a] = r
+                            for t in r[2]:
+                                if start <= t < end:
+                                    leaders.add(t)
+                                    work.append(t)
                         else:
-                            info["br_tail_ptr"] = info.get("br_tail_ptr", 0) + 1
-                    break
-                elif nm in ("ret", "brk"):
-                    break
-                a = nxt
+                            # indirect jump through a loaded pointer (virtual/import tail call) vs an unresolved switch
+                            org = None
+                            for k in range(i - 1, max(-1, i - 30), -1):
+                                nm2, f2 = insns[k][1], insns[k][2]
+                                if nm2 is None:
+                                    continue
+                                try:
+                                    if op_regs(nm2, f2)[1] & bit_x(f["rn"]):
+                                        org = nm2
+                                        break
+                                except Exception:
+                                    pass
+                            if org in ("addsub_reg", "addsub_ext"):
+                                info["jt_unresolved"] += 1      # a computed switch we could not bound
+                            else:
+                                info["br_tail_ptr"] = info.get("br_tail_ptr", 0) + 1
+                        break
+                    elif nm in ("ret", "brk"):
+                        break
+                    a = nxt
+            new = sorted({p for a, p in site_pads.items() if a in reach and p not in pad_roots})
+            if not new:
+                break
+            pad_roots.update(new)
+            leaders.update(new)
+            work.extend(new)
         if bad:
             info["bad"] = "%x: %s" % bad
             raise Unlifted(info["bad"])
@@ -336,7 +459,7 @@ class Lifter:
         order = [a for a, _, _ in insns if a in reach]
         # dirty-in per leader, iterate to fixpoint over the instruction stream
         din = {a: 0 for a in leaders}
-        din[start] = 0
+        din[entry] = 0
         used_r = used_w = 0
         flags_used = False
         for a in order:
@@ -410,7 +533,7 @@ class Lifter:
         xs = [n for n in range(31) if (used_r | used_w) & bit_x(n) or (n == 30 and has_call) or (has_pad and 19 <= n <= 29)]
         xs_set = set(xs)
         self._vs = set(n for n in range(32) if (used_r | used_w) & bit_v(n) or (has_pad and 8 <= n <= 15))
-        P("void %s(Ctx *restrict c) {" % fname(start))
+        P("void %s(Ctx *restrict c) {" % fname(entry))
         if xs:
             P("  u64 %s;" % ", ".join("x%d" % n for n in xs))
         P("  u64 x31 = 0, sp = c->x[31];")
@@ -425,15 +548,19 @@ class Lifter:
             P("  x%d = c->x[%d];" % (n, n))
         for n in vs:
             P("  v%d = c->v[%d];" % (n, n))
-        P("L_%x:;" % start)
+        top = order[0] == entry
+        if top:
+            P("L_%x:;" % entry)
+        else:
+            P("goto L_%x;" % entry)
         dirty = 0
         prev_falls = True
         for a in order:
             _, nm, f = insns[pos[a]]
-            if a in leaders and a != start:
+            if a in leaders and not (top and a == entry):
                 P("L_%x:;" % a)
                 dirty = din[a]
-            elif (a - 4) not in reach and a != start:
+            elif (a - 4) not in reach and not (top and a == entry):
                 dirty = din.get(a, dirty)
             if nm in dec_control():
                 dirty = self.emit_control(P, insns, pos, a, nm, f, start, end, leaders, jt, dirty, info, xs_set)
@@ -575,7 +702,7 @@ class Lifter:
             """Emit a direct call or tail call to guest address t (flushes first)."""
             if t in starts:
                 return "%s(c)" % fname(t), True
-            info["mid"] += 1
+            info["mid"] += 1; info["mid_t"].add(t)
             return None, False
 
         if nm == "b" or nm in ("bcond", "cbz", "tbz"):
@@ -612,7 +739,7 @@ class Lifter:
             elif t in starts:
                 body.append("__attribute__((musttail)) return %s(c);" % fname(t))
             else:
-                info["mid"] += 1
+                info["mid"] += 1; info["mid_t"].add(t)
                 body.append("c->pc = 0x%xull; __attribute__((musttail)) return rt_dispatch(c);" % t)
             if cond is None:
                 for l in body:
@@ -636,7 +763,7 @@ class Lifter:
             elif t in starts:
                 P("  %s(c);" % fname(t))
             else:
-                info["mid"] += 1
+                info["mid"] += 1; info["mid_t"].add(t)
                 P("  c->pc = 0x%xull; rt_dispatch(c);" % t)
             for l in self.exc_lines(a, start, end, xs_set):
                 P("  " + l)
@@ -683,7 +810,8 @@ class Lifter:
                     if start <= t < end:
                         P("  case 0x%xull: goto L_%x;" % (t, t))
                     else:
-                        info["mid"] += 1
+                        if t not in starts:
+                            info["mid"] += 1; info["mid_t"].add(t)
                         P("  case 0x%xull: c->pc = 0x%xull; goto TAIL_PC_%x;" % (t, t, a))
                 P("  default: c->pc = x%d; goto TAIL_PC_%x;" % (f["rn"], a))
                 P("  }")

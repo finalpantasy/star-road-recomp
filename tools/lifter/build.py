@@ -13,6 +13,7 @@ Every long step stops starting new work after --budget seconds (default 540) so 
 """
 import argparse
 import array
+import bisect
 import collections
 import concurrent.futures as cf
 import ctypes
@@ -80,6 +81,11 @@ def _load_mod(name):
     rows = inv.load(name)
     starts = {base + s for s, e, k in rows}
     ends = {base + s: base + e for s, e, k in rows}
+    # synthetic entries (mid-function branch targets found by earlier passes): (entry, lo, end), module-relative
+    synth = read_synth(name)
+    for en, lo, e2 in synth:
+        starts.add(base + en)
+        ends[base + en] = base + e2
     size = len(img)
 
     def rd_mem(addr, n):
@@ -95,8 +101,25 @@ def _load_mod(name):
     if eh and eh[1] > eh[0]:
         mod["eh"] = eh_tables.EhInfo(img, base, eh[0], eh[1])
     mod["redirect"] = eh_redirects(name)
-    m = _W[name] = (lf, lf.Lifter(mod), rows)
+    m = _W[name] = (lf, lf.Lifter(mod), rows, synth)
     return m
+
+
+def synth_path(name):
+    return os.path.join(INV, "synth_%s.tsv" % name)
+
+
+def read_synth(name):
+    out = []
+    try:
+        with open(synth_path(name)) as f:
+            for ln in f:
+                p = ln.split()
+                if len(p) == 3:
+                    out.append(tuple(int(x, 16) for x in p))
+    except OSError:
+        pass
+    return sorted(out)
 
 
 def eh_redirects(name):
@@ -116,18 +139,24 @@ CALL_RE = re.compile(r"\bf_([0-9a-f]+)\(c\)")
 
 def lift_chunk(job):
     name, k = job
-    lf, lifter, rows = _load_mod(name)
+    lf, lifter, rows, synth = _load_mod(name)
     base = BASES[name]
-    part = rows[k * CHUNK:(k + 1) * CHUNK]
+    ninv = (len(rows) + CHUNK - 1) // CHUNK
+    is_synth = k >= ninv
+    if is_synth:
+        part = [(en, e2, "synth", lo) for en, lo, e2 in synth[(k - ninv) * CHUNK:(k - ninv + 1) * CHUNK]]
+    else:
+        part = [(s, e, kind, s) for s, e, kind in rows[k * CHUNK:(k + 1) * CHUNK]]
+    mid_t = set()
     bodies = []
     lifted = []
     failed = []
     tot = collections.Counter()
     flags = collections.Counter()
-    for s, e, kind in part:
+    for s, e, kind, lo in part:
         a, b = base + s, base + e
         try:
-            text, info = lifter.lift(a, b)
+            text, info = lifter.lift(base + lo, b, a)
         except lf.Unlifted as ex:
             msg = str(ex)
             failed.append((a, b - a, "undecodable", msg))
@@ -137,6 +166,7 @@ def lift_chunk(job):
             continue
         bodies.append(text)
         lifted.append(a)
+        mid_t |= info["mid_t"]
         for key in ("insns", "calls", "tail", "mid", "jt", "jt_unresolved", "br_tail_ptr", "eh_sites", "eh_pads", "eh_pads_out",
                     "eh_nosite", "polls", "redirects"):
             tot[key] += info.get(key, 0)
@@ -164,7 +194,7 @@ def lift_chunk(job):
         with open(path, "wb") as f:
             f.write(data)
     return dict(mod=name, k=k, path=path, nfuncs=len(part), lifted=len(lifted), failed=failed, tot=dict(tot),
-                flags=dict(flags), nbytes=len(data))
+                flags=dict(flags), nbytes=len(data), synth=is_synth, mid_t=sorted(mid_t))
 
 
 IRSEG = 65536
@@ -176,7 +206,7 @@ def irgen_seg(job):
     import gen
     import lower as lw
     import dec
-    lf, lifter, rows = _load_mod(name)
+    lf, lifter, rows, _synth = _load_mod(name)
     words = lifter.mod["words"]
     base = BASES[name]
     out = bytearray()
@@ -200,7 +230,7 @@ def cmd_irgen(a):
     write_prelude()
     t0 = time.time()
     for m in a.modules or ["main", "sdk", "subsdk0"]:
-        lf, lifter, rows = _load_mod(m)
+        lf, lifter, rows, _synth = _load_mod(m)
         nw = len(lifter.mod["words"])
         segs = [(m, k) for k in range((nw + IRSEG - 1) // IRSEG)]
         path = os.path.join(IMG, "ir_%s.bin" % m)
@@ -242,26 +272,72 @@ def cmd_lift(a):
     t0 = time.time()
     os.makedirs(LOGS, exist_ok=True)
     mods = a.modules or ["main", "sdk", "subsdk0"]
-    jobs = []
     os.makedirs(CDIR, exist_ok=True)
+    os.makedirs(INV, exist_ok=True)
     if not a.limit:
         for f in os.listdir(CDIR):
             if f.split("_")[0] in mods and f.endswith(".c"):
                 os.remove(os.path.join(CDIR, f))
+    # Mid-function targets: a pass lifts everything, collects every branch or call target that is not a function start,
+    # maps it to the inventory function that contains it and adds a synthetic entry (the containing function lifted
+    # with its entry at the target). A later pass sees those entries as starts, so direct calls replace rt_dispatch
+    # misses; passes repeat until no new target appears (the synthetic bodies can reach new ones). --no-synth skips it.
+    rowsof = {m: inventory.load(m) for m in mods}
+    synth = {m: {} for m in mods}                         # module -> {entry_rel: (lo_rel, end_rel)}
+    unresolved = {m: set() for m in mods}
+    passes = []
+    while True:
+        for m in mods:
+            with open(synth_path(m), "w") as f:
+                for en in sorted(synth[m]):
+                    f.write("%x %x %x" % (en, synth[m][en][0], synth[m][en][1]) + chr(10))
+        jobs = []
+        for m in mods:
+            n = (len(rowsof[m]) + CHUNK - 1) // CHUNK
+            ns = (len(synth[m]) + CHUNK - 1) // CHUNK
+            jobs += [(m, k) for k in range(n + ns)]
+        if a.limit:
+            jobs = jobs[:a.limit]
+        res = collections.defaultdict(list)
+        tp = time.time()
+        with mp.Pool(a.jobs, initializer=_worker_init) as pool:
+            for i, r in enumerate(pool.imap_unordered(lift_chunk, jobs, chunksize=1)):
+                res[r["mod"]].append(r)
+                if i % 100 == 0:
+                    print("  pass %d: lifted %d/%d chunks %.0fs" % (len(passes) + 1, i + 1, len(jobs), time.time() - t0), flush=True)
+        newcount = 0
+        for m in mods:
+            base = BASES[m]
+            starts_sorted = [s for s, e, k in rowsof[m]]
+            have = set(starts_sorted) | set(synth[m])
+            targets = set()
+            for r in res[m]:
+                targets.update(r["mid_t"])
+            for t in sorted(targets):
+                rel = t - base
+                if rel in have or rel in unresolved[m]:
+                    continue
+                i = bisect.bisect_right(starts_sorted, rel) - 1
+                if i >= 0 and rel & 3 == 0 and starts_sorted[i] < rel < rowsof[m][i][1]:
+                    synth[m][rel] = (starts_sorted[i], rowsof[m][i][1])
+                    newcount += 1
+                else:
+                    unresolved[m].add(rel)
+        passes.append((len(jobs), newcount, time.time() - tp))
+        print("pass %d: %d chunks, %d new synthetic entries, %.1fs" % (len(passes), len(jobs), newcount, time.time() - tp), flush=True)
+        if not newcount or a.no_synth or len(passes) >= 8:
+            break
+    # chunk files of a smaller earlier pass for synthetic entries are overwritten; drop stale ones beyond the final count
     for m in mods:
-        n = len(inventory.load(m))
-        jobs += [(m, k) for k in range((n + CHUNK - 1) // CHUNK)]
-    if a.limit:
-        jobs = jobs[:a.limit]
-    res = collections.defaultdict(list)
-    with mp.Pool(a.jobs, initializer=_worker_init) as pool:
-        for i, r in enumerate(pool.imap_unordered(lift_chunk, jobs, chunksize=1)):
-            res[r["mod"]].append(r)
-            if i % 20 == 0:
-                print("  lifted %d/%d chunks %.0fs" % (i + 1, len(jobs), time.time() - t0), flush=True)
+        n = (len(rowsof[m]) + CHUNK - 1) // CHUNK + (len(synth[m]) + CHUNK - 1) // CHUNK
+        for f in os.listdir(CDIR):
+            if f.startswith(m + "_") and f.endswith(".c") and int(f[len(m) + 1:-2]) >= n:
+                os.remove(os.path.join(CDIR, f))
     report = {}
     for m, rs in res.items():
-        rs.sort(key=lambda r: r["k"])
+        inv_rs = sorted((r for r in rs if not r["synth"]), key=lambda r: r["k"])
+        syn_rs = sorted((r for r in rs if r["synth"]), key=lambda r: r["k"])
+        rs = inv_rs
         total = sum(r["nfuncs"] for r in rs)
         lifted = sum(r["lifted"] for r in rs)
         tot = collections.Counter()
@@ -271,13 +347,22 @@ def cmd_lift(a):
             tot.update(r["tot"])
             flags.update(r["flags"])
             failed += r["failed"]
+        stot = collections.Counter()
+        sfailed = []
+        for r in syn_rs:
+            stot.update(r["tot"])
+            sfailed += r["failed"]
         hist = collections.Counter()
         for fa, sz, cat, msg in failed:
             hist[cat + ": " + re.sub(r"^[0-9a-f]+: ", "", msg)[:60]] += 1
         raw_rows = sum(1 for _ in open(os.path.join(INV, m + ".tsv")))
         report[m] = dict(inventory_rows=raw_rows, functions=total, lifted=lifted, listed_with_reason=len(failed), chunks=len(rs),
                          totals=dict(tot), flags=dict(flags), reasons=dict(hist.most_common(60)),
-                         failed=sorted(failed))
+                         failed=sorted(failed),
+                         synthetic=dict(entries=len(synth[m]), lifted=sum(r["lifted"] for r in syn_rs), listed_with_reason=len(sfailed),
+                                        chunks=len(syn_rs), passes=[list(p) for p in passes], totals=dict(stot),
+                                        unresolved_targets=sorted(unresolved[m])[:200], n_unresolved=len(unresolved[m]),
+                                        failed=sorted(sfailed)))
         with open(os.path.join(LOGS, "lift_%s.json" % m), "w") as f:
             json.dump(report[m], f, indent=1)
         print("%s: %d functions, lifted %d, listed with reason %d; %s; flags %s" %
@@ -449,6 +534,7 @@ def main():
         p.add_argument("--budget", type=int, default=540)
         p.add_argument("--limit", type=int, default=0)
         p.add_argument("--only", default="")
+        p.add_argument("--no-synth", action="store_true")
         p.set_defaults(fn=fn)
     a = ap.parse_args()
     sys.exit(a.fn(a) or 0)

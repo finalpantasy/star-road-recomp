@@ -80,6 +80,18 @@ static uint32_t nvmap_ioctl(uint32_t cmd, uint8_t *io, uint64_t n) {
     default: return 0xFFFFFFFFu;                         /* not an nvmap call we know */
     }
 }
+/* STOPGAP (task-13): with SMRPG_NVDEC_OK=1 the two nvdec ioctls the CRI movie decoder sends right after opening /dev/nvhost-nvdec
+ * (0xC0A40009, 0xC1BC0001) answer success and nothing is decoded. Without it they answer NotSupported, which CRI reports through its
+ * error callback. Not a decoder; the decoder decision is the owner's. */
+static int nvdec_stopgap(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SMRPG_NVDEC_OK") != NULL;
+    if (on) {
+        static volatile LONG logged;
+        if (InterlockedIncrement(&logged) <= 4) rt_log("STOPGAP nvdec ioctl answered with success and no decode (SMRPG_NVDEC_OK=1)");
+    }
+    return on;
+}
 static void nvdrv_ioctl(IpcCtx *x) {
 
     uint32_t fd = in_u32(x, 0), cmd = in_u32(x, 4);
@@ -103,6 +115,12 @@ static void nvdrv_ioctl(IpcCtx *x) {
             return;
         }
     }
+    if (dev == NVDEV_CTRL && nvdec_stopgap()) {              /* STOPGAP: nvhost-ctrl fence and event ioctls the CRI decoder issues (EventRegister, EventUnregister, EventWait ...) */
+        static volatile LONG logged;
+        if (InterlockedIncrement(&logged) <= 12) rt_log("STOPGAP nvhost-ctrl ioctl %#x answered with success (SMRPG_NVDEC_OK=1)", cmd);
+        out_u32(x, 0, 0);
+        return;
+    }
     if (cmd == 0x40044801u && dev == NVDEV_OTHER) {        /* nvhost channel SET_NVMAP_FD (nvdec, nvjpg ...): the fd is only remembered by the real driver */
         out_u32(x, 0, 0);
         return;
@@ -118,7 +136,14 @@ static void nvdrv_ioctl(IpcCtx *x) {
         case 0xC0080002u: *(uint32_t *)(io + 4) = 1 + (fd & 7); break;   /* GET_SYNCPOINT {module, value} */
         case 0xC0080003u: *(uint32_t *)(io + 4) = 0; break;              /* GET_WAITBASE {module, value} */
         case 0x40040007u: case 0x40040009u: case 0x400C0004u: case 0x400C0005u: case 0xC0100001u: break;   /* SET_TIMEOUT, SET_SUBMIT_TIMEOUT, MAP/UNMAP_CMDBUF, SUBMIT */
-        default: known = 0; break;
+        case 0xC0A40009u: case 0xC0A4000Au: case 0xC1BC0001u:                              /* nvdec submit / engine ioctls the CRI movie decoder sends */
+            known = nvdec_stopgap();                                     /* STOPGAP, SMRPG_NVDEC_OK=1: succeed without decoding anything */
+            break;
+        default:
+            /* nvhost channel Submit (nr 1), MapCommandBuffer (nr 9), UnmapCommandBuffer (nr 10): the ioctl size field varies with the entry count */
+            if (((cmd >> 8) & 0xFF) == 0 && ((cmd & 0xFF) == 1 || (cmd & 0xFF) == 9 || (cmd & 0xFF) == 10) && (cmd >> 30) == 3) known = nvdec_stopgap();
+            else known = 0;
+            break;
         }
         if (known) {
             if (dout && dout->size) ipc_write_out(x, ipc_out_data_idx(x), io, n < dout->size ? n : dout->size);
