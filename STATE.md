@@ -4,7 +4,7 @@ Status: Building; technical evidence: baseline check PASS (receipt in evidence/r
 Last verified source/build and receipt: inputs per tools/inputs.json; extraction on `A:\AI\Recomps\smrpg-work` (base, v101 exefs and romfs, 1,934 files, 6.82 GB).
 Dependencies/blockers/open decisions: task-5 Ready; task-6 waits on task-5. RECOMPILER.md open items: L4 reference original (owner), movie decoder licenses. Tools in `A:\AI\Recomps\tools-ext` (owner approved 2026-11-24): Il2CppDumper 6.7.46, Cpp2IL 2022.1.0-pre21, CMake 4.5.1; digests checked. Prior art: a public MIT recomp of 1.0.0 exists (ElKiro1311/smrpg-recompiled, LASRecomp base), ideas only; our edge is 1.0.1, reference tests against the original, and the decomp.
 Integration owner and active file/resource owners: lead = coordinator chat. See table.
-Next action and skill: task-21 (movies: nn::movie HLE plus LGPL FFmpeg DLL, D-011) running in subchat smrpg-movies; goal is the title screen. Last push: 3e8c687.
+Next action and skill: task-21 (movies, title screen) and task-22 (SDL3 platform layer: window, input, --audio) running. Then task-16 (Dear ImGui overlay) and task-23 (FSR upscaling) start on task-22's window. Last push: see git log.
 Resume/run commands: `python tools/game_check.py run --root .`
 Git: local repo at `F:\Super Mario RPG`, branch main, commits allowed at verified milestones (owner yes 2026-11-24); GitHub: public repo under finalpantasy (owner yes 2026-11-24).
 
@@ -32,6 +32,8 @@ Board rule (owner, 2026-11-24): the work board carries every sub-step, roadmap i
 | task-14 | smrpg-rthard `local_d711dd0b-72e2-4462-ad9e-bbbd98b3386c` | `runtime/eh/`, `runtime/gc/`, listed lifter changes | Opus high | Verified 2026-11-24 (lead reran test_rthard --real: PASS after adding crypto_a64.c to its source list). Rechecked against task-13's real hooks 2026-11-24 (lead reran test_rthard --real: PASS, AC3 PASS). |
 | task-15 | smrpg-baseline `local_a3f898a9-a6e3-43d0-90e6-0ddfcfe3489e` | `A:\AI\Recomps\smrpg-elkiro`, `backlog/tasks/task-15.md` | Sonnet high | Verified 2026-11-24 (lead viewed captures: title, difficulty menu, Peach cutscene, 60 fps, muted run proven). Released. |
 | task-21 | smrpg-movies `local_ab2bcdc2-1fe3-47c7-bcf4-e68cf3dbcf29` | `runtime/hle/` nn::movie files, `tools/ffmpeg/`, `A:\AI\Recomps\ffmpeg\` | Sonnet high | Started 2026-11-25 (D-011: FFmpeg as a separate LGPL DLL, lead decision on the owner's delegation). |
+| task-22 | smrpg-platform `local_f854e7a4-a785-49cd-9e1c-4952ffad98e3` | `runtime/platform/`, window and swapchain section of `runtime/nvn/nvn_replay.cpp`, `runtime/hle/hle_hid.c`, `runtime/hle/hle_audio.c` output, `runtime/main.c` flags | Sonnet high | Started 2026-11-25 (owner yes for SDL3, ImGui, FSR; D-012). |
+| task-23 | not started | present section of `runtime/nvn/nvn_replay.cpp`, `runtime/gfx/upscale/` | Sonnet high | Planned: waits on task-22. |
 | task-7 | smrpg-bugs `local_6d272edb-9ebe-457e-88ae-7e61663e7af4` | `docs/analysis/known-bugs-1.0.1.md` | Sonnet medium | Verified with Reddit pass (about 30 threads; lead spot-checked 1ji4ath). Released. |
 | task-8 | smrpg-retools `local_3f1d12dc-77cb-41dd-90eb-0d76b6584edf` | `docs/analysis/re-tools.md`, `F:\AI\Recomps\research_notes\ai-re-tools-2026-11.md` | Sonnet medium | Verified (re-tools.md, shared note). Released. |
 | task-9 | smrpg-priorart `local_56d775aa-ae3d-4427-8281-1f1c2da48f99` | `docs/analysis/prior-art.md` | Sonnet medium | Verified 2026-11-24 (prior-art.md; lead rechecked the ElKiro repo via gh). Released. |
