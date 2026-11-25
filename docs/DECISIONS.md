@@ -19,3 +19,10 @@ Mark unresolved choices OPEN. Defaults are provisional unless explicitly approve
 - Decision: ElKiro1311/smrpg-recompiled (MIT, LASRecomp base, plays 1.0.0 start to finish) becomes our playable baseline now. We build it from source on A: from the owner's 1.0.0 dump and use it three ways: to play and capture frames now, as a reference oracle (frames, service traces, timing) for our own recompiler and runtime, and as a reuse source under D-009 (its code stays out of our Git until rewritten). Our own tracks (task-10, task-13, task-14) continue in parallel.
 - Why: images and a playable game today instead of after the first frame of our own runtime; a working reference speeds up every subsystem test.
 - Limits: it targets 1.0.0 only; 1.0.1 support is ours to add. No prebuilt installer or release binary is run; everything is built from source.
+
+## D-011: Movie decoding through FFmpeg as a separate LGPL DLL
+- Date: 2026-11-25. Decided by: the lead, on the owner's delegation ("Up 2 u").
+- Decision: VP9 video (and Opus audio if the movies need it) is decoded by FFmpeg's libavcodec, loaded as a separate LGPL-only DLL (no GPL or nonfree parts), built from source on A: by a script we commit. Our code only calls its public API. No FFmpeg source or binary enters Git. The release ships the DLL beside the exe with its license and a pointer to the source. The HLE boundary stays the one in docs/RECOMPILER.md: `nn::movie` (subsdk0, 31 imports) is replaced by our HLE, which hands compressed frames to libavcodec.
+- Why: the title screen needs decoded movies now; libavcodec's VP9 decoder is mature and fast; the released baseline already shows the route works. Our own VP9 decoder is weeks of work for no visible gain, and dynamic linking keeps our own license free.
+- Rejected: our own VP9 decoder (cost, risk); answering the nvdec ioctls with a full NVDEC emulation (more surface than the 31 `nn::movie` imports).
+- Revisit if: the owner wants zero third-party binaries in the release, or LGPL terms conflict with how the release is packaged.
