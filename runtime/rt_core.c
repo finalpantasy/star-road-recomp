@@ -256,19 +256,21 @@ static void dump_ctx(const Ctx *c) {
     if (n) rt_log("  guest frames:%s", bt);
 }
 
+static void dump_addrs(void) {   /* debug aid: SMRPG_DUMPADDR=<hex addr>[,<hex addr>...] dumps 0x60 bytes of guest memory at a fatal error */
+    const char *d = getenv("SMRPG_DUMPADDR");
+    while (d && *d) {
+        char *e; uint64_t da = strtoull(d, &e, 16);
+        if (e == d) break;
+        for (int i = 0; i < 0x60; i += 8) rt_log("  dump %#llx = %#llx", (unsigned long long)(da + i), (unsigned long long)*(uint64_t *)(da + i));
+        d = (*e == ',') ? e + 1 : e;
+    }
+}
+
 void rt_fatal(Ctx *c, const char *what, uint64_t arg) {
     if (InterlockedExchange(&g_dying, 1)) { Sleep(INFINITE); }
     rt_log("FATAL: %s (%#llx)", what, (unsigned long long)arg);
     if (c) dump_ctx(c);
-    {   /* debug aid: SMRPG_DUMPADDR=<hex addr>[,<hex addr>...] dumps 0x60 bytes of guest memory at a fatal error */
-        const char *d = getenv("SMRPG_DUMPADDR");
-        while (d && *d) {
-            char *e; uint64_t da = strtoull(d, &e, 16);
-            if (e == d) break;
-            for (int i = 0; i < 0x60; i += 8) rt_log("  dump %#llx = %#llx", (unsigned long long)(da + i), (unsigned long long)*(uint64_t *)(da + i));
-            d = (*e == ',') ? e + 1 : e;
-        }
-    }
+    dump_addrs();
     rt_ring_dump();
     rt_exit(3, what);
 }
@@ -301,6 +303,7 @@ static LONG WINAPI rt_veh(EXCEPTION_POINTERS *ep) {
            er->NumberParameters > 1 ? (er->ExceptionInformation[0] == 0 ? "read" : er->ExceptionInformation[0] == 1 ? "write" : "exec") : "n/a");
     rt_log("  host rsp=%#llx rbp=%#llx", (unsigned long long)ep->ContextRecord->Rsp, (unsigned long long)ep->ContextRecord->Rbp);
     if (tl_ctx) dump_ctx(tl_ctx);
+    dump_addrs();
     rt_ring_dump();
     rt_exit(5, "host crash");
 }
@@ -334,6 +337,7 @@ void rt_summary(void) {
 
 void rt_exit(int code, const char *why) {
     rt_log("EXIT code=%d (%s)", code, why ? why : "");
+    if (code == 4) dump_addrs();   /* watchdog: lets a passing run be compared with a crashing one */
     rt_summary();
     rt_log_flush();
     ExitProcess((UINT)code);

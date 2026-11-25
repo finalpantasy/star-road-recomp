@@ -8,3 +8,6 @@ __attribute__((weak)) const uint32_t g_reg_nchunks = 0;
 __attribute__((weak)) void interp_run(Ctx *c, uint64_t pc) {
     rt_fatal(c, "guest address has no lifted function and no interpreter is linked", pc);
 }
+
+/* the mock boot test links without the graphics glue (gfxcap.c); the game build supplies the strong definition */
+__attribute__((weak)) void gfxcap_init(void) {}

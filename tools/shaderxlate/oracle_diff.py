@@ -26,7 +26,7 @@ HARNESS = r'A:\AI\Recomps\new-pokemon-snap\build\release\harness_work\bin\Releas
 GLSLANG = r'A:\AI\Recomps\new-pokemon-snap\tools\vulkan_sdk\Bin\glslangValidator.exe'
 VKDIFF = r'A:\AI\Recomps\smrpg-work\build\vkdiff\cmake\vkdiff.exe'
 LVP_ICD = r'A:\AI\Recomps\tools-ext\mesa\x\x64\lvp_icd.x86_64.json'
-STAGE_NUM = {'vs': 0, 'fs': 1}
+STAGE_NUM = {'vs': 0, 'fs': 1, 'gs': 2}
 RYU_DIM = {1: '1d', 3: '2d', 4: '3d', 5: 'cube'}
 
 
@@ -95,6 +95,8 @@ def our_layout(meta, ref):
         s = t['sampler_handle']
         out.append('tex %d %d %s %d %s' % (st, t['binding'], t['dim'], int(t['shadow']),
                                           tex_key(t['handle']['offset'], s['offset'] if s else None)))
+    for b in meta.get('ssbos', []):
+        out.append('ssbo %d %d %d' % (st, b['binding'], b['nvn_index']))
     return out
 
 
@@ -116,6 +118,10 @@ def ryu_layout(js, ref, stage, c1_path):
         dim = RYU_DIM.get(typ & 0xFF)
         if dim is None:
             raise ValueError('ryubing texture type %#x' % typ)
+        if typ & 0x200:
+            if dim != '2d':
+                raise ValueError('ryubing multisample texture type %#x' % typ)
+            dim = '2dms'
         if typ & 0x100:
             dim += '_array'
         h, sec = o0 * 4, (o1 * 4 if kind else None)
@@ -123,6 +129,11 @@ def ryu_layout(js, ref, stage, c1_path):
             h, sec = sec, h          # texture handles live below the sampler handles (0x168 vs 0x568)
         out.append('tex %d %d %s %d %s' % (t['set'], t['binding'], dim, 1 if typ & 0x400 else 0,
                                           tex_key(h, sec)))
+    for b in js.get('sbuffers', []):
+        off = b['sbCbOffset'] * 4
+        if b['sbCbSlot'] != 0 or off < 0x110 or (off - 0x110) % 16:
+            raise ValueError('ryubing storage buffer at c[%d][%#x]' % (b['sbCbSlot'], off))
+        out.append('ssbo %d %d %d' % (b['set'], b['binding'], (off - 0x110) // 16))
     return out
 
 
@@ -159,6 +170,87 @@ def helper_gs(path, locs, width):
            '  val = v; EmitVertex(); EndPrimitive();\n}\n' % width +
            'void main() {\n' + emits + '}\n')
     return glsl(path, src, 'geom')
+
+
+def helper_vs_gs(path, locs, pos_loc):
+    """Geometry jobs: pass random per-vertex data through (position from attribute pos_loc)."""
+    decl = ''.join('layout(location=%d) in vec4 a%d;\nlayout(location=%d) out vec4 v%d;\n' % (l, l, l, l)
+                   for l in locs)
+    src = ('#version 450\nlayout(location=%d) in vec4 p;\n' % pos_loc + decl +
+           'void main() {\n  gl_Position = p;\n' + ''.join('  v%d = a%d;\n' % (l, l) for l in locs) + '}\n')
+    return glsl(path, src, 'vert')
+
+
+GS_PRIMS = 21      # triangles drawn per geometry job (63 of vkdiff's 64 random vertices)
+
+
+def xfb_slots(locs):
+    """Capture record shared by both sides: position, layer, viewport, then generic outputs."""
+    off = {'pos': 0, 'layer': 16, 'viewport': 20}
+    for n, l in enumerate(sorted(locs)):
+        off[('loc', l)] = 32 + 16 * n
+    return off, 32 + 16 * len(locs)
+
+
+def xfb_patch(spv, off, stride):
+    """Add transform feedback decorations so the geometry shader's emitted vertices are captured with
+    the same record layout on both sides. Layer and viewport become plain Locations (built-ins other than
+    position cannot be captured)."""
+    w = list(struct.unpack('<%dI' % (len(spv) // 4), spv))
+    i, ptr, var_out, first_deco, cap_end, mode_end, fid = 5, {}, [], None, None, None, None
+    decos, mdecos = [], []
+    while i < len(w):
+        n, op = w[i] >> 16, w[i] & 0xFFFF
+        if op == 17:
+            cap_end = i + n
+        elif op == 15:
+            fid = w[i + 2]
+            mode_end = mode_end or i + n
+        elif op == 16:
+            mode_end = i + n
+        elif op in (71, 72):
+            first_deco = i if first_deco is None else first_deco
+            (decos if op == 71 else mdecos).append(i)
+        elif op == 32:
+            ptr[w[i + 1]] = (w[i + 2], w[i + 3])
+        elif op == 59 and w[i + 3] == 3:
+            var_out.append((w[i + 2], w[i + 1]))
+        i += n
+    vdeco = collections.defaultdict(dict)
+    for j in decos:
+        vdeco[w[j + 1]][w[j + 2]] = j
+    new, seen = [], set()
+    for v, pt in var_out:
+        d = vdeco.get(v, {})
+        slot = None
+        if 11 in d:
+            b = w[d[11] + 3]
+            if b == 0:
+                slot = 'pos'
+            elif b in (9, 10):
+                slot = 'layer' if b == 9 else 'viewport'
+                w[d[11] + 2], w[d[11] + 3] = 30, 30 if b == 9 else 29     # BuiltIn Layer -> Location 30
+        elif 30 in d:
+            slot = ('loc', w[d[30] + 3])
+        if slot is not None:
+            new += [(4 << 16) | 71, v, 35, off[slot]]
+        else:
+            t = ptr[pt][1]
+            mem = [j for j in mdecos if w[j + 1] == t and w[j + 3] == 11 and w[j + 4] == 0]
+            if not mem:
+                continue
+            slot = 'pos'
+            new += [(5 << 16) | 72, t, w[mem[0] + 2], 35, off['pos']]
+        if slot in seen:
+            raise ValueError('two outputs for xfb slot %r' % (slot,))
+        seen.add(slot)
+        new += [(4 << 16) | 71, v, 36, 0, (4 << 16) | 71, v, 37, stride]
+    if fid is None or cap_end is None or first_deco is None:
+        raise ValueError('xfb patch: module layout not recognized')
+    out = w[:cap_end] + [(2 << 16) | 17, 53] + w[cap_end:mode_end] + [(3 << 16) | 16, fid, 11] + \
+        w[mode_end:first_deco] + new + w[first_deco:]
+    out[3] = max(out[3], w[3])
+    return struct.pack('<%dI' % len(out), *out)
 
 
 def helper_fs(path):
@@ -221,7 +313,7 @@ def main():
     ap.add_argument('--cases', help='file of "stage key" lines: compare exactly these (no variant sample)')
     ap.add_argument('--corpus', default=os.path.join(SHADERS, 'corpus'))
     ap.add_argument('--budget', type=float, default=480,
-                    help='seconds after which no new vkdiff chunk starts; rerun the same --work to continue')
+                    help='seconds after the first vkdiff chunk starts after which no new chunk starts; rerun the same --work to continue')
     ap.add_argument('--jobs', type=int, default=16, help='processes for the compat translation prepass')
     a = ap.parse_args()
     t_start = time.time()
@@ -334,6 +426,25 @@ def main():
                 lb += ['rt %d' % r for r in rts]
                 hv = helper_vs(os.path.join(hdir, 'vs_' + '_'.join(map(str, locs)) + '.spv'), locs)
                 helpers = (hv, '-', '-')
+            elif st == 'gs':
+                ins = sorted(set(ro['in']) | set(rr['in']))
+                pos_loc = next(x for x in range(15, -1, -1) if x not in ins)
+                outs = sorted(set(ro['out']) | set(rr['out']))
+                off, stride = xfb_slots(outs)
+                maxv = json.load(open(os.path.join(rdir, k + '.json'))).get('max_vertices') or \
+                    meta.get('geometry', {}).get('max_vertices', 0)
+                for lay in (la, lb):
+                    lay += ['attr %d' % x for x in sorted(ins + [pos_loc])] + \
+                        ['xfb %d %d %d' % (stride, GS_PRIMS, maxv)]
+                xdir = os.path.join(a.work, 'xfb')
+                os.makedirs(xdir, exist_ok=True)
+                pa_spv, pb_spv = os.path.join(xdir, k + '.ours.spv'), os.path.join(xdir, k + '.ryu.spv')
+                open(pa_spv, 'wb').write(xfb_patch(open(our_spv, 'rb').read(), off, stride))
+                open(pb_spv, 'wb').write(xfb_patch(open(ryu_spv, 'rb').read(), off, stride))
+                our_spv, ryu_spv = pa_spv, pb_spv
+                hv = helper_vs_gs(os.path.join(hdir, 'vsgs_%d_' % pos_loc + '_'.join(map(str, ins)) + '.spv'),
+                                  ins, pos_loc)
+                helpers = (hv, '-', '-')
             else:
                 attrs = sorted(set(ro['in']) | set(rr['in']))
                 locs = sorted(set(ro['out']) | set(rr['out']))
@@ -364,7 +475,7 @@ def main():
     env = dict(os.environ, VK_ICD_FILENAMES=LVP_ICD, VK_DRIVER_FILES=LVP_ICD)
     t0 = time.time()
     pending = [j for j in jobs if j[0] not in results]
-    while pending and time.time() - t_start < a.budget:
+    while pending and time.time() - t0 < a.budget:
         jf = os.path.join(a.work, 'jobs.tsv')
         rf = os.path.join(a.work, 'results.tsv')
         chunk = pending[:150]     # keep each vkdiff process to a few minutes

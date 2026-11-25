@@ -432,6 +432,135 @@ def corpus_slice(shaders, n=40):
              'detail': '; '.join(bad[:5])}]
 
 
+@test
+def ldg_through_storage_descriptor():
+    """LDG.E from c[0][0x110] + offset: a read-only SSBO for NVN descriptor 0, address minus the
+    256-aligned base, B64 fills two registers, and the manifest names the descriptor."""
+    lo = 0x4c1080000447000c                # IADD.CC R12, R0, c[0][0x110]
+    hi = 0x4c1008000457ff0d                # IADD.X  R13, RZ, c[0][0x114]
+    ldg = 0xeed5a00000070c00 | (8 << 20)   # LDG.E.64 R0, [R12 + 0x8]
+    fn, info, spv, em = full(build('fs', pack_code([lo, hi, ldg, exit_(), bra(-8)]), fs_sph()))
+    loads = [o for o in ops_of(fn) if o.op == 'sload']
+    assert len(loads) == 2 and all(o.attr == 0 for o in loads), loads
+    assert ('and', 0xFFFFFF00) in [(o.op, o.args[1].attr) for o in ops_of(fn)
+                                   if o.op == 'and' and o.args[1].op == 'const'], 'base not aligned down'
+    man = em.manifest('t')['ssbos']
+    assert man == [{'binding': man[0]['binding'], 'desc': {'cbuf': 0, 'offset': 0x110}, 'nvn_index': 0,
+                    'write': False, 'base_align': 256}], man
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+
+
+@test
+def ldg_untraced_base_uses_only_descriptor():
+    """Base added in an earlier block: with one descriptor read in the program, LDG uses it."""
+    lo = 0x4c1080000447000c
+    ldg = 0xeed4a00000070c00               # LDG.E.32 R0, [R12]
+    fn = lift_words([lo, bra(0), ldg])
+    assert [o.attr for o in ops_of(fn) if o.op == 'sload'] == [0]
+    try:
+        lift_words([ldg])
+        raise AssertionError('LDG without a descriptor should be unsupported')
+    except lift.Unsupported:
+        pass
+
+
+def gs_sph(max_vertices=3, topology=7, invocations=1):
+    w = [0] * 20
+    w[0] = 1 | (3 << 5) | (4 << 10)
+    w[2] = invocations << 24
+    w[3] = topology << 24
+    w[4] = max_vertices
+    return struct.pack('<20I', *w)
+
+
+GS_PROLOGUE = [0xf0c8000001d7000d,     # S2R R13, SR_INVOCATION_INFO
+               0x5f047f8020d70d00,     # VMAD R0, R13.B0, R13.B2, RZ
+               0x50f41ba06ff70d07,     # VSETP P0, R13.B2, 0 (vertex count check)
+               0xefd0000000070004,     # ISBERD R4, [R0]
+               0x010800000000f004]     # @P0 MOV32I R4, 0x80000000
+
+
+@test
+def vmad_selects_bytes():
+    """VMAD U8B0 * U8B2: byte extracts at bit 0 and bit 16 of the same register."""
+    fn = lift_words(GS_PROLOGUE[:2] + [0xeff000000647ff00], stage='vs')
+    bfes = sorted(o.args[1].attr for o in ops_of(fn) if o.op == 'bfe_u' and o.args[1].op == 'const'
+                  and o.args[2].op == 'const' and o.args[2].attr == 8)
+    assert bfes[:2] == [0, 16], bfes
+
+
+@test
+def gs_vertex_reads_emit_and_cut():
+    """Geometry: ISBERD handle indexes the per-vertex inputs, OUT emits and cuts, SPH gives the modes."""
+    words = GS_PROLOGUE + [0xefd802000707ff02,    # ALD R2, a[0x70], R4  (vertex R4 position.x)
+                           0xefd800000807ff03,    # ALD R3, a[0x80], R0  (vertex R0 generic 0.x)
+                           0xeff000000707ff02,    # AST a[0x70], R2
+                           0xeff000000807ff03,    # AST a[0x80], R3
+                           0xfbe000800ff70000,    # OUT.EMIT R0, R0, RZ
+                           0xfbe001000ff70000,    # OUT.CUT  R0, R0, RZ
+                           exit_(), bra(-8)]
+    fn, info, spv, em = full(build('gs', pack_code(words), gs_sph()))
+    ops = [o.op for o in ops_of(fn)]
+    assert ops.count('gs_emit') == 1 and ops.count('gs_cut') == 1, ops
+    assert all(o.args for o in ops_of(fn) if o.op == 'in'), 'per-vertex reads must carry the vertex index'
+    g = em.manifest('t')['geometry']
+    assert g == {'input': 'triangles', 'input_vertices': 3, 'output': 'triangle_strip', 'max_vertices': 3,
+                 'invocations': 1}, g
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+
+
+@test
+def vsetp_compares_selected_bytes():
+    """VSETP of an unsigned byte against an immediate is a 32-bit unsigned compare of the extract."""
+    fn = lift_words(GS_PROLOGUE[:1] + [GS_PROLOGUE[2]], stage='vs')
+    cmps = [o for o in ops_of(fn) if o.op == 'icmp']
+    assert cmps and any(root(c.args[0]).op == 'bfe_u' or c.args[0].op == 'bfe_u' for c in cmps), cmps
+
+
+# Programs that failed in cache v1 before the burn-down (LDG, BRX, VMNMX, multisample fetch, bindless
+# spills and predicated handles, geometry). Key prefixes only; the corpus stays on A:.
+FORMER_FAILURES = """00a3127a56ecb7ee 0a926e4e9805f891 14ab224b78edb3df 14b8a203a30919b9 17ce81bc103a17f2
+18a9ec625e3c4317 198efd2699412d09 1b8226231086f574 1c021dcf39baaf3b 207944ae6da74b74 21e6ba7461c94e39
+2deb5c81b8abf8b6 3506d31023542fdc 3ae72116b177b16e 3b694c51a6caadd4 3bed69cc9538562a 430ba47efbeac560
+4897ebc31cc274c0 4bbb933cfbfee9b7 4d2ca0d97f9dba7b 5080b93472ccf5c7 56b8000eb313c522 5819fb6b8a06ddda
+591a21587474fc69 5986df6f84020d6d 64aa631ddd959f59 6850018d22a44b6f 6c2f964e07b5987a 771974a55455b021
+77d3caac1b97c19e 7964f2af655e975a 8cf3cf815abfec4c 8e98763380b00313 972008cce0b45d45 9b898d396abd82d7
+9c3d16f10d8ef0de a1b346cb6098fa21 a6b6c7e882417345 ac9850e132b11ad9 ad6eaa56175794e4 b7eeb965a481e051
+c8b12ba486d55626 c91e53beca0f0d1c cae7746810b695a4 cbeb67e62eee154e ccbb123b9a926356 d30675c262b2eaa5
+d87303d388e0f0d2 e041b634aa2a1b85 f64779e1c51c4e2c fe2691f69b7c7dde""".split()
+
+
+def former_failures(shaders):
+    corpus = Path(shaders) / 'corpus'
+    if not corpus.is_dir():
+        return [{'name': 'former failures', 'status': 'skipped', 'detail': 'no local corpus'}]
+    stages = {}
+    with open(Path(shaders) / 'variants.jsonl') as f:
+        for line in f:
+            for st, k in (json.loads(line).get('stages') or {}).items():
+                stages[k] = st
+    full_keys = {k[:16]: k for k in stages}
+    bad = []
+    for pre in FORMER_FAILURES:
+        k = full_keys.get(pre)
+        if k is None:
+            bad.append(pre + ': not in corpus')
+            continue
+        try:
+            spv, man = translate.translate(stages[k], (corpus / (k + '.ctrl')).read_bytes(),
+                                           (corpus / (k + '.data')).read_bytes())
+        except translate.Failed as e:
+            bad.append(pre + ': ' + str(e)[:100])
+            continue
+        ok, msg = spv_ok(spv)
+        if ok is False:
+            bad.append(pre + ': ' + msg[:100])
+    return [{'name': 'former failures (%d) translate and validate' % len(FORMER_FAILURES),
+             'status': 'failed' if bad else 'passed', 'detail': '; '.join(bad[:5])}]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--report', required=True)
@@ -447,6 +576,7 @@ def main():
                         'detail': '%s: %s | %s' % (type(e).__name__, e, traceback.format_exc().splitlines()[-3][:200])})
     if a.corpus:
         out += corpus_slice(a.corpus)
+        out += former_failures(a.corpus)
     Path(a.report).parent.mkdir(parents=True, exist_ok=True)
     Path(a.report).write_text(json.dumps({'tests': out}, indent=1), encoding='utf-8')
     bad = [t for t in out if t['status'] == 'failed']

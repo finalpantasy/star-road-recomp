@@ -56,14 +56,15 @@ otherwise it skips the draw and logs the key once.
  "key": "...", "stage": "fs", "spirv_version": "1.3",
  "sets": {"set": 1},
  "ubos":     [{"binding": 1, "cbuf": 3, "nvn_index": 0, "size": 256}],
- "textures": [{"binding": 2, "dim": "2d|3d|cube|2d_array|cube_array|1d|buffer",
+ "textures": [{"binding": 2, "dim": "2d|3d|cube|2d_array|cube_array|1d|buffer|2dms",
                "shadow": false, "array_len": 1,
                "handle": {"cbuf": 2, "offset": 32},
                "sampler_handle": null,
                "nvn": {"kind": "combined", "index": 0}}],
  "images":   [{"binding": 5, "dim": "2d", "format": "r32ui|...|unknown", "handle": {"cbuf": 2, "offset": 64},
                "nvn": {"kind": "image", "index": 0}}],
- "ssbos":    [{"binding": 6, "desc": {"cbuf": 0, "offset": 272}, "nvn_index": 0}],
+ "ssbos":    [{"binding": 6, "desc": {"cbuf": 0, "offset": 272}, "nvn_index": 0, "write": false,
+               "base_align": 256}],
  "inputs":   [{"location": 0, "attr": 0, "components": "xyzw", "interp": "smooth|flat|noperspective"}],
  "outputs":  [{"location": 0, "components": "xyzw"}],
  "builtins_in": ["frag_coord", "front_facing", "instance_id", "vertex_id"],
@@ -102,9 +103,22 @@ Rules the consumer can rely on:
   handle words for that draw, decodes texture id and sampler id from its own handle tables, and
   writes one combined descriptor. An NVN combined handle is `texture_id | sampler_id << 20`.
   `array_len` > 1 means an indexed handle array (`handle.offset` is element 0, stride 8).
+  The trace follows register moves and ORs across blocks and loops, spills to local memory at
+  constant addresses (`STL` then `LDL` of the same word), and predicated writes: a texture
+  instruction under predicate P sees a handle written under the opposite polarity of P only as the
+  value from before that write. Multisample fetches (`TLD.MS`, 2D only) use a multisampled image
+  (`dim` `2dms`) and pass the sample index as the `Sample` operand.
 - **Storage buffers**: global memory accesses whose address comes from an NVN storage descriptor
-  (`c[0][0x110 + 16i]`: u64 address, u32 size) become SSBO `nvn_index` i. Global accesses that
-  cannot be traced fail translation (listed with a reason) rather than guess.
+  (`c[0][0x110 + 16i]`: u64 address, u32 size) become SSBO `nvn_index` i, declared as a
+  `uint[]` runtime array (`NonWritable` when `write` is false). The shader reads the descriptor's
+  low address word from `c[0]` and indexes the SSBO with `address - (base & ~(base_align - 1))`,
+  so the runtime binds SSBO i at byte `base & ~255` of the guest buffer (256 is the largest
+  `minStorageBufferOffsetAlignment` Vulkan allows) with a range that reaches `base + size`. `c[0]`
+  is then also listed as a UBO and must hold the real descriptor words. The LDG address is traced
+  to the descriptor inside its block; when the base was added in another block and the program
+  reads exactly one descriptor, that one is used. Global accesses that cannot be traced fail
+  translation (listed with a reason) rather than guess. Out-of-range reads are not clamped: the
+  runtime enables `robustBufferAccess` (they read 0 under `robustBufferAccess2`).
 - **Vertex inputs**: generic attribute `attr` (Maxwell `a[0x80 + 16*attr]`) is `location = attr`,
   declared `vec4` of float. Only vertex-stage inputs carry `attr`; inputs of other stages are
   varyings with `location` only. Integer vertex formats are not expected from Unity on this game; the
@@ -116,6 +130,15 @@ Rules the consumer can rely on:
   task-12 reader: 61 of 26,766 (vs, fs) pairs read a location the vertex stage never writes. To match
   Maxwell, give such a pipeline a vertex output of zero at that location or bind a variant whose
   fragment input reads 0; until then the value is undefined.
+- **Geometry stage**: a geometry program reads per-vertex inputs through the `ISBERD` vertex handle;
+  the translator models one input primitive per invocation (invocation info low byte 0, as on the
+  hardware for a non-instanced draw), so the handle is the vertex index. Inputs are arrays sized to
+  the input primitive (`in<loc>[3]`, `gl_in[3].Position`). The manifest's `geometry` object gives
+  `input` (`triangles` in v1; SR invocation info reports 3 vertices), `input_vertices`, `output`
+  (`points`, `line_strip` or `triangle_strip`, from the SPH), `max_vertices` and `invocations`. The
+  consumer must draw such a pipeline with a triangle topology; any other input topology needs a new
+  variant and is logged. `OUT.EMIT`/`OUT.CUT` become `OpEmitVertex`/`OpEndPrimitive`; `Layer` and
+  `ViewportIndex` outputs need no extension in this stage.
 - **Fragment outputs**: render target `i` is `location = i`, `vec4` float. `rt_mask` has bit `i` set
   for each written target. Depth writes use `FragDepth`.
 - **Coordinates**: positions are passed through unchanged. NVN depth mode near = 0 matches Vulkan;
@@ -140,7 +163,8 @@ Rules the consumer can rely on:
   `OpDemoteToHelperInvocation`, so derivatives stay valid after a discard), subgroup basic and
   quad operations in fragment and compute stages (`SHFL` and derivative tricks), `shaderClipDistance`,
   `imageCubeArray`, `sampled1D`, `shaderImageGatherExtended`, and
-  `shaderOutputViewportIndex`/`shaderOutputLayer` when a vertex stage writes those builtins.
+  `shaderOutputViewportIndex`/`shaderOutputLayer` when a vertex stage writes those builtins,
+  and `robustBufferAccess` when a module has SSBOs.
 - **Rounding faithfulness**: half-precision ops (`HADD2`, `HMUL2`, `HFMA2`) round each result to
   fp16 when it is written to a register as a half pair, exactly as the hardware stores it.
   `FFMA.FMZ` stays one fused multiply-add with the Maxwell zero rule. These are deliberate: the
@@ -148,7 +172,9 @@ Rules the consumer can rely on:
   again, which is not what the hardware does.
 - **Oracle-compat switches**: the environment variable `SXL_COMPAT` (comma list) changes our output
   only to mirror known oracle behavior during differential tests: `ipa_mul` (literal
-  `IPA.MUL` multiply), `half_fold` (skip fp16 rounding between half ops). The shipped cache is
+  `IPA.MUL` multiply), `half_fold` (skip fp16 rounding between half ops), `no_fmz` (ignore the
+  `FMUL`/`FFMA` `.FMZ` zero rule) and `fminmax` (`FMin`/`FMax` instead of `NMin`/`NMax`, so a NaN
+  operand gives an undefined result instead of the other operand). The shipped cache is
   always built with `SXL_COMPAT` unset (`batch.py` refuses to run while it is set).
 - **Carry flag**: `IADD.CC`/`.X` carries are internal to a module and add no interface.
 
@@ -191,5 +217,10 @@ differences a reader must handle (all additive; a reader written for both caches
 - v1 (2026-11-24, additive, no reader change): `cf_mode`, `cf_fallback` manifest fields; required
   device features; rounding and oracle-compat notes. SSBOs (`LDG`/`STG` through NVN storage
   descriptors) are not emitted yet: those programs fail with reason `LDG` and use the fallback chain.
+- v1 (2026-11-24, additive): SSBOs are emitted for `LDG` (read-only); manifest `ssbos` entries add
+  `write` and `base_align`; `robustBufferAccess` joins the required features for SSBO modules.
 - v1 (2026-11-24, additive): section 5, the Phase A cache `reuse-v1` (D-009) with bound program
   constants, the support buffer, `vk_type`, `source`, `capabilities` and `extensions`.
+- v1 (2026-11-24, additive): geometry stage (`geometry` manifest object), multisample fetch
+  (`dim` `2dms`), jump-table `BRX`, `VMAD`/`VMNMX`/`VSETP`; the bindless trace follows local-memory
+  spills and predicated handle writes. Every program in the corpus now translates (0 failures).

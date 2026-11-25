@@ -24,7 +24,8 @@ for kv in a.env:
     k, v = kv.split("=", 1)
     env[k] = v
 cmd = [exe, "--max-seconds", str(a.seconds), "--log", log, "--img", os.path.join(BUILD, "img")] + a.rest
-p = subprocess.Popen(cmd, creationflags=0x4000 | 0x08000000, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+errf = open(log + ".err", "wb")          # the NVN layer and other host libraries print to stderr
+p = subprocess.Popen(cmd, creationflags=0x4000 | 0x08000000, stdout=subprocess.DEVNULL, stderr=errf, env=env)
 try:
     p.wait(timeout=a.seconds + 30)
 except subprocess.TimeoutExpired:

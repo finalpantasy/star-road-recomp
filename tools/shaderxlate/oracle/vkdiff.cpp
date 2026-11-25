@@ -27,7 +27,8 @@ static PFN_vkGetDeviceProcAddr gdpa;
 #define INST_FNS(X) \
   X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) \
   X(GetPhysicalDeviceFeatures2) X(GetPhysicalDeviceMemoryProperties) \
-  X(GetPhysicalDeviceQueueFamilyProperties) X(CreateDevice) X(GetDeviceProcAddr)
+  X(GetPhysicalDeviceQueueFamilyProperties) X(CreateDevice) X(GetDeviceProcAddr) \
+  X(EnumerateDeviceExtensionProperties)
 #define DEV_FNS(X) \
   X(DestroyDevice) X(GetDeviceQueue) X(CreateBuffer) X(DestroyBuffer) \
   X(GetBufferMemoryRequirements) X(AllocateMemory) X(FreeMemory) X(BindBufferMemory) \
@@ -38,7 +39,7 @@ static PFN_vkGetDeviceProcAddr gdpa;
   X(CreateGraphicsPipelines) X(DestroyPipeline) X(CreateDescriptorPool) X(DestroyDescriptorPool) \
   X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CreateCommandPool) X(DestroyCommandPool) \
   X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(ResetCommandBuffer) \
-  X(CmdPipelineBarrier) X(CmdCopyBufferToImage) X(CmdCopyImageToBuffer) X(CmdBeginRendering) \
+  X(CmdPipelineBarrier) X(CmdClearAttachments) X(CmdCopyBufferToImage) X(CmdCopyImageToBuffer) X(CmdBeginRendering) \
   X(CmdEndRendering) X(CmdBindPipeline) X(CmdBindDescriptorSets) X(CmdBindVertexBuffers) \
   X(CmdDraw) X(CreateFence) X(DestroyFence) X(ResetFences) X(WaitForFences) X(QueueSubmit) \
   X(DeviceWaitIdle)
@@ -46,6 +47,11 @@ static PFN_vkGetDeviceProcAddr gdpa;
 #define DECL(n) static PFN_vk##n vk##n;
 GLOBAL_FNS(DECL) INST_FNS(DECL) DEV_FNS(DECL)
 #undef DECL
+// transform feedback (geometry-shader jobs): loaded only when the device has VK_EXT_transform_feedback
+static PFN_vkCmdBindTransformFeedbackBuffersEXT vkCmdBindTransformFeedbackBuffersEXT;
+static PFN_vkCmdBeginTransformFeedbackEXT vkCmdBeginTransformFeedbackEXT;
+static PFN_vkCmdEndTransformFeedbackEXT vkCmdEndTransformFeedbackEXT;
+static bool g_xfb = false;
 static PFN_vkCreateDebugUtilsMessengerEXT pfnCreateMessenger;
 
 // ---------------------------------------------------------------- utils
@@ -194,7 +200,7 @@ static void submitWait() {
 
 // ---------------------------------------------------------------- layout
 struct Res {
-  char kind = 'u';  // 'u' ubo, 'f' ubo from file, 's' support, 't' texture
+  char kind = 'u';  // 'u' ubo, 'f' ubo from file, 's' support, 't' texture, 'b' storage buffer
   int set = 0, binding = 0, slot = 0;
   std::string dim, key; int shadow = 0;
 };
@@ -202,6 +208,7 @@ struct Layout {
   std::vector<Res> res;
   std::vector<int> attrs, rts;
   int fbw = 0, fbh = 0;
+  int xfbStride = 0, prims = 0, maxVerts = 0;  // gs jobs: capture record size, triangles drawn, GS max_vertices
 };
 
 static std::vector<std::string> splitWs(const std::string& s) {
@@ -245,6 +252,10 @@ static Layout parseLayout(const std::string& path) {
       } else if (t[0] == "ubofile" && t.size() >= 4) {
         Res r; r.kind = 'f'; r.set = std::stoi(t[1]); r.binding = std::stoi(t[2]); r.key = t[3];
         L.res.push_back(r);
+      } else if (t[0] == "ssbo" && t.size() >= 4) {
+        // ssbo <set> <binding> <nvn storage descriptor index>: same seeded bytes for both sides
+        Res r; r.kind = 'b'; r.set = std::stoi(t[1]); r.binding = std::stoi(t[2]); r.slot = std::stoi(t[3]);
+        L.res.push_back(r);
       } else if (t[0] == "support" && t.size() >= 3) {
         Res r; r.kind = 's'; r.set = std::stoi(t[1]); r.binding = std::stoi(t[2]); L.res.push_back(r);
       } else if (t[0] == "tex" && t.size() >= 6) {
@@ -256,6 +267,8 @@ static Layout parseLayout(const std::string& path) {
         L.rts.push_back(std::stoi(t[1]));
       } else if (t[0] == "fb" && t.size() >= 3) {
         L.fbw = std::stoi(t[1]); L.fbh = std::stoi(t[2]);
+      } else if (t[0] == "xfb" && t.size() >= 4) {
+        L.xfbStride = std::stoi(t[1]); L.prims = std::stoi(t[2]); L.maxVerts = std::stoi(t[3]);
       } else {
         fprintf(stderr, "warning: %s: ignoring layout line '%s'\n", path.c_str(), t[0].c_str());
       }
@@ -268,6 +281,7 @@ static Layout parseLayout(const std::string& path) {
 struct Tex { VkImage img = 0; VkDeviceMemory mem = 0; VkImageView view = 0; VkSampler samp = 0; bool shadow = false; };
 static std::map<std::pair<uint32_t, int>, Buf> g_ubo;
 static std::map<std::pair<uint32_t, int>, Buf> g_vtx;
+static std::map<std::pair<uint32_t, int>, Buf> g_ssbo;
 static std::map<std::pair<int, int>, Buf> g_support;
 static std::map<std::string, Buf> g_ubof;
 static std::map<std::string, Tex> g_tex;
@@ -284,7 +298,8 @@ static void clearInputCaches() {
   for (auto& kv : g_ubo) freeBuf(kv.second);
   for (auto& kv : g_vtx) freeBuf(kv.second);
   for (auto& kv : g_ubof) freeBuf(kv.second);
-  g_ubo.clear(); g_vtx.clear(); g_ubof.clear();
+  for (auto& kv : g_ssbo) freeBuf(kv.second);
+  g_ubo.clear(); g_vtx.clear(); g_ubof.clear(); g_ssbo.clear();
 }
 
 static VkBuffer uboBuf(uint32_t seed, int slot) {
@@ -295,6 +310,9 @@ static VkBuffer uboBuf(uint32_t seed, int slot) {
   Buf b = makeBuf(65536, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
   uint32_t* w = (uint32_t*)b.p;
   for (uint32_t i = 0; i < 16384; i++) w[i] = F2U((float)(H(seed, (uint32_t)slot, i) % 4096u) / 4096.0f);
+  // c[0] storage descriptor addresses (0x110 + 16k): 256-byte aligned, as a driver would place them
+  if (slot == 0)
+    for (uint32_t d = 0; d < 16; d++) w[(0x110 + 16 * d) / 4] &= ~0xFFu;
   g_ubo[k] = b;
   return b.b;
 }
@@ -308,6 +326,19 @@ static VkBuffer uboFileBuf(const std::string& path) {
   memset(b.p, 0, 65536);
   memcpy(b.p, d.data(), std::min<size_t>(d.size(), 65536));
   g_ubof[path] = b;
+  return b.b;
+}
+static const uint32_t kSsboBytes = 1u << 20;
+static VkBuffer ssboBuf(uint32_t seed, int index) {
+  if (g_ssbo.size() > 64) clearInputCaches();
+  auto k = std::make_pair(seed, index);
+  auto it = g_ssbo.find(k);
+  if (it != g_ssbo.end()) return it->second.b;
+  Buf b = makeBuf(kSsboBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+  uint32_t* w = (uint32_t*)b.p;
+  for (uint32_t i = 0; i < kSsboBytes / 4; i++)
+    w[i] = F2U((float)(H(seed, 1000u + (uint32_t)index, i) % 4096u) / 4096.0f);
+  g_ssbo[k] = b;
   return b.b;
 }
 static VkBuffer supportBuf(int fbw, int fbh) {
@@ -363,10 +394,67 @@ static DimInfo dimInfo(const std::string& d) {
   throw Fail{"unknown texture dim " + d};
 }
 
+// 2dms: 16x16 RGBA8 with 4 samples. Copies into multisampled images are not allowed, so the
+// texels are written with clear rects inside a render pass: every 2x2 cell gets its own seeded
+// color (all samples of a texel share it; the sample index is not exercised).
+static Tex makeMsTex(const std::string& key) {
+  const uint32_t N = 16;
+  Tex t;
+  VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ci.imageType = VK_IMAGE_TYPE_2D; ci.format = VK_FORMAT_R8G8B8A8_UNORM; ci.extent = {N, N, 1};
+  ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_4_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VKC(vkCreateImage(g_dev, &ci, nullptr, &t.img));
+  t.mem = imageMem(t.img);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = t.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ci.format;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VKC(vkCreateImageView(g_dev, &vi, nullptr, &t.view));
+  VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  si.magFilter = si.minFilter = VK_FILTER_NEAREST; si.maxAnisotropy = 1.f;
+  VKC(vkCreateSampler(g_dev, &si, nullptr, &t.samp));
+  VKC(vkResetCommandBuffer(g_cb, 0));
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  VKC(vkBeginCommandBuffer(g_cb, &bi));
+  VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  b.image = t.img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                       0, nullptr, 0, nullptr, 1, &b);
+  VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  ca.imageView = t.view; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea = {{0, 0}, {N, N}}; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+  vkCmdBeginRendering(g_cb, &ri);
+  uint32_t kh = fnv(key);
+  for (uint32_t y = 0; y < N; y += 2)
+    for (uint32_t x = 0; x < N; x += 2) {
+      uint32_t u = fmix(fmix(kh ^ (x * 0xC2B2AE3Du)) ^ (y * 0x27D4EB2Fu));
+      VkClearAttachment cl{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+      for (int c = 0; c < 4; c++) cl.clearValue.color.float32[c] = (float)((u >> (8 * c)) & 0xFF) / 255.0f;
+      VkClearRect rc{{{(int32_t)x, (int32_t)y}, {2, 2}}, 0, 1};
+      vkCmdClearAttachments(g_cb, 1, &cl, 1, &rc);
+    }
+  vkCmdEndRendering(g_cb);
+  b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                       0, nullptr, 0, nullptr, 1, &b);
+  VKC(vkEndCommandBuffer(g_cb));
+  submitWait();
+  return t;
+}
+
 static const Tex& getTex(const Res& r) {
   std::string ck = r.key + "|" + r.dim + "|" + std::to_string(r.shadow);
   auto it = g_tex.find(ck);
   if (it != g_tex.end()) return it->second;
+  if (r.dim == "2dms") return g_tex[ck] = makeMsTex(r.key);
   DimInfo di = dimInfo(r.dim);
   bool sh = r.shadow != 0;
   VkFormat fmt = sh ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
@@ -496,6 +584,7 @@ struct Job {
 
 static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layout& L, const std::string& spv, int fbw, int fbh) {
   bool fsMode = job.mode == "fs";
+  bool gsMode = job.mode == "gs";
   Scope sc;
   int maxSet = -1;
   for (auto& r : L.res) maxSet = std::max(maxSet, r.set);
@@ -503,7 +592,7 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
   std::vector<VkDescriptorSetLayout> dsl(nsets, VK_NULL_HANDLE);
   std::vector<std::vector<VkDescriptorSetLayoutBinding>> binds(nsets);
   std::vector<std::vector<const Res*>> bres(nsets);
-  uint32_t nUbo = 0, nTex = 0;
+  uint32_t nUbo = 0, nTex = 0, nSsbo = 0;
   for (auto& r : L.res) {
     if (r.set < 0 || r.set > 16) throw Fail{"descriptor set number out of range"};
     bool dup = false;
@@ -511,8 +600,9 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
     if (dup) { fprintf(stderr, "warning: duplicate binding %d.%d ignored\n", r.set, r.binding); continue; }
     VkDescriptorSetLayoutBinding b{};
     b.binding = r.binding; b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
-    b.descriptorType = r.kind == 't' ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    (r.kind == 't' ? nTex : nUbo)++;
+    b.descriptorType = r.kind == 't' ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                     : r.kind == 'b' ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    (r.kind == 't' ? nTex : r.kind == 'b' ? nSsbo : nUbo)++;
     binds[r.set].push_back(b); bres[r.set].push_back(&r);
   }
   for (int s = 0; s < nsets; s++) {
@@ -534,6 +624,7 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
     std::vector<VkDescriptorPoolSize> ps;
     if (nUbo) ps.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nUbo});
     if (nTex) ps.push_back({VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nTex});
+    if (nSsbo) ps.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nSsbo});
     if (ps.empty()) ps.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = nsets; pi.poolSizeCount = (uint32_t)ps.size(); pi.pPoolSizes = ps.data();
@@ -553,6 +644,9 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
           const Tex& t = getTex(r);
           ii.push_back({t.samp, t.view, t.shadow ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
           w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii.back();
+        } else if (r.kind == 'b') {
+          bi.push_back({ssboBuf(job.seed, r.slot), 0, kSsboBytes});
+          w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi.back();
         } else {
           VkDeviceSize range; VkBuffer b;
           if (r.kind == 'u') { b = uboBuf(job.seed, r.slot); range = std::min<uint32_t>(65536, g_maxUbo); }
@@ -584,6 +678,7 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
       si.stage = s; si.module = shaderMod(p); si.pName = "main"; st.push_back(si);
     };
     if (fsMode) { addStage(VK_SHADER_STAGE_VERTEX_BIT, job.hvs); addStage(VK_SHADER_STAGE_FRAGMENT_BIT, spv); }
+    else if (gsMode) { addStage(VK_SHADER_STAGE_VERTEX_BIT, job.hvs); addStage(VK_SHADER_STAGE_GEOMETRY_BIT, spv); }
     else { addStage(VK_SHADER_STAGE_VERTEX_BIT, spv); addStage(VK_SHADER_STAGE_GEOMETRY_BIT, job.hgs);
            addStage(VK_SHADER_STAGE_FRAGMENT_BIT, job.hfs); }
     std::vector<VkVertexInputBindingDescription> vb; std::vector<VkVertexInputAttributeDescription> va;
@@ -595,7 +690,7 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
     vis.vertexBindingDescriptionCount = (uint32_t)vb.size(); vis.pVertexBindingDescriptions = vb.data();
     vis.vertexAttributeDescriptionCount = (uint32_t)va.size(); vis.pVertexAttributeDescriptions = va.data();
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = fsMode ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    ia.topology = (fsMode || gsMode) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     VkViewport vp{0, 0, (float)fbw, (float)fbh, 0, 1};
     VkRect2D sci{{0, 0}, {(uint32_t)fbw, (uint32_t)fbh}};
     VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -603,6 +698,7 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.f;
+    rs.rasterizerDiscardEnable = gsMode ? VK_TRUE : VK_FALSE;   // gs: outputs captured by transform feedback
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     std::vector<VkPipelineColorBlendAttachmentState> cba(nAtt);
@@ -658,8 +754,28 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
     for (int a : L.attrs) vbs.push_back(vtxBuf(job.seed, a));
     vkCmdBindVertexBuffers(g_cb, 0, (uint32_t)vbs.size(), vbs.data(), offs.data());
   }
-  vkCmdDraw(g_cb, fsMode ? 3 : 64, 1, 0, 0);
+  Buf xb;
+  size_t xwords = 0;
+  if (gsMode) {
+    if (!g_xfb) throw Fail{"VK_EXT_transform_feedback not available"};
+    if (L.xfbStride <= 0 || L.prims <= 0 || L.prims * 3 > 64 || L.maxVerts <= 0) throw Fail{"bad xfb layout line"};
+    xwords = (size_t)L.xfbStride / 4 * L.prims * L.maxVerts;
+    xb = makeBuf(xwords * 4, VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT);
+    { Buf h = xb; sc.add([h]() mutable { freeBuf(h); }); }
+    for (size_t i = 0; i < xwords; i++) ((uint32_t*)xb.p)[i] = SENTINEL;
+    VkDeviceSize off = 0, sz = xwords * 4;
+    vkCmdBindTransformFeedbackBuffersEXT(g_cb, 0, 1, &xb.b, &off, &sz);
+    vkCmdBeginTransformFeedbackEXT(g_cb, 0, 0, nullptr, nullptr);
+  }
+  vkCmdDraw(g_cb, fsMode ? 3 : gsMode ? 3 * L.prims : 64, 1, 0, 0);
+  if (gsMode) vkCmdEndTransformFeedbackEXT(g_cb, 0, 0, nullptr, nullptr);
   vkCmdEndRendering(g_cb);
+  if (gsMode) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+  }
   for (int i = 0; i < nAtt; i++) {
     bars[i].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     bars[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -685,6 +801,11 @@ static std::vector<std::vector<uint32_t>> renderSide(const Job& job, const Layou
                        nAtt, bb.data(), 0, nullptr);
   VKC(vkEndCommandBuffer(g_cb));
   submitWait();
+  if (gsMode) {   // the captured vertex records are the result; the dummy attachment is never written
+    std::vector<std::vector<uint32_t>> out(1);
+    out[0].resize(xwords); memcpy(out[0].data(), xb.p, xwords * 4);
+    return out;
+  }
   std::vector<std::vector<uint32_t>> out(nAtt);
   size_t n = (size_t)fbw * fbh * 4;
   for (int i = 0; i < nAtt; i++) {
@@ -738,7 +859,7 @@ static void dumpRaw(const Job& j, const char* side, const std::vector<std::vecto
 }
 
 static void runJob(const Job& j) {
-  if (j.mode != "fs" && j.mode != "vs") throw Fail{"bad mode " + j.mode};
+  if (j.mode != "fs" && j.mode != "vs" && j.mode != "gs") throw Fail{"bad mode " + j.mode};
   Layout LA, LB;
   try { LA = parseLayout(j.alay); } catch (Fail& f) { throw Fail{"A: " + f.msg}; }
   try { LB = parseLayout(j.blay); } catch (Fail& f) { throw Fail{"B: " + f.msg}; }
@@ -817,7 +938,7 @@ static void initVulkan() {
   VkPhysicalDeviceFeatures& hf = have.features; VkPhysicalDeviceFeatures& ef = en.features;
 #define F(x) ef.x = hf.x;
   F(geometryShader) F(shaderClipDistance) F(shaderCullDistance) F(imageCubeArray) F(sampleRateShading)
-  F(fragmentStoresAndAtomics) F(vertexPipelineStoresAndAtomics) F(shaderTessellationAndGeometryPointSize)
+  F(robustBufferAccess) F(fragmentStoresAndAtomics) F(vertexPipelineStoresAndAtomics) F(shaderTessellationAndGeometryPointSize)
   F(shaderInt64) F(shaderFloat64) F(shaderInt16) F(shaderStorageImageExtendedFormats)
   F(shaderStorageImageReadWithoutFormat) F(shaderStorageImageWriteWithoutFormat) F(shaderImageGatherExtended)
   F(multiViewport) F(tessellationShader) F(fillModeNonSolid) F(independentBlend) F(largePoints)
@@ -834,10 +955,21 @@ static void initVulkan() {
   qci.queueFamilyIndex = qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.pNext = &en; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+  // VK_EXT_transform_feedback: geometry-shader jobs capture the emitted vertices
+  uint32_t nx = 0; vkEnumerateDeviceExtensionProperties(g_pd, nullptr, &nx, nullptr);
+  std::vector<VkExtensionProperties> xp(nx); vkEnumerateDeviceExtensionProperties(g_pd, nullptr, &nx, xp.data());
+  for (auto& e : xp) if (!strcmp(e.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) g_xfb = true;
+  static const char* kExt[] = {VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME};
+  VkPhysicalDeviceTransformFeedbackFeaturesEXT xf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+  if (g_xfb) {
+    xf.transformFeedback = VK_TRUE; xf.pNext = en.pNext; en.pNext = &xf;
+    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = kExt;
+  }
   VKC(vkCreateDevice(g_pd, &dci, nullptr, &g_dev));
   gdpa = vkGetDeviceProcAddr;
 #define LD(n) vk##n = (PFN_vk##n)gdpa(g_dev, "vk" #n);
   DEV_FNS(LD)
+  if (g_xfb) { LD(CmdBindTransformFeedbackBuffersEXT) LD(CmdBeginTransformFeedbackEXT) LD(CmdEndTransformFeedbackEXT) }
 #undef LD
   vkGetDeviceQueue(g_dev, qfi, 0, &g_q);
   VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};

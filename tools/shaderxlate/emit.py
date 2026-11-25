@@ -8,13 +8,14 @@ Resource layout follows docs/SHADER_CACHE.md (v1).
 import os
 import struct
 
+import lift
 from spirv import Module, GLSL
 
 SET_OF_STAGE = {'vs': 0, 'fs': 1, 'gs': 2, 'tcs': 3, 'tes': 4, 'cs': 0}
 EXEC_OF_STAGE = {'vs': 'Vertex', 'fs': 'Fragment', 'gs': 'Geometry', 'tcs': 'TessellationControl',
                  'tes': 'TessellationEvaluation', 'cs': 'GLCompute'}
-DIM_SPV = {'1d': 0, '2d': 1, '3d': 2, 'cube': 3}
-IMG_BIAS, IMG_LOD, IMG_CONSTOFF = 0x1, 0x2, 0x8
+DIM_SPV = {'1d': 0, '2d': 1, '3d': 2, 'cube': 3, '2dms': 1}
+IMG_BIAS, IMG_LOD, IMG_CONSTOFF, IMG_SAMPLE = 0x1, 0x2, 0x8, 0x40
 EXIT_STATE = 0xFFFFFFFF
 SCOPE_SUBGROUP = 3
 
@@ -32,7 +33,7 @@ EXT_U2 = {'umin': 'UMin', 'umax': 'UMax', 'smin': 'SMin', 'smax': 'SMax'}
 EXT_F1 = {'fsin': 'Sin', 'fcos': 'Cos', 'fex2': 'Exp2', 'flg2': 'Log2', 'frsq': 'InverseSqrt',
           'fsqrt': 'Sqrt', 'ffloor': 'Floor', 'fceil': 'Ceil', 'ftrunc': 'Trunc', 'fround': 'RoundEven',
           'fabs': 'FAbs'}
-STATEMENTS = {'rset', 'pset', 'out', 'stl', 'demote'}
+STATEMENTS = {'rset', 'pset', 'out', 'stl', 'demote', 'gs_emit', 'gs_cut'}
 
 
 class EmitError(Exception):
@@ -279,6 +280,8 @@ class Emitter:
         self.textures = {}
         self.manifest_tex = []
         self.manifest_ubo = []
+        self.manifest_ssbo = []
+        self.ssbos = {}
         self.c1var = None
         self.localvar = None
         self.uses_lane = False
@@ -434,6 +437,7 @@ class Emitter:
         """Assign bindings: UBOs (by c-buffer slot) then textures, compact from 1."""
         slots = {}
         texkeys = []
+        sbs = set()
         for b in blocks:
             for o in b.ops:
                 if o.n not in live:
@@ -442,6 +446,8 @@ class Emitter:
                     off = o.args[0]
                     hi = 0x10000 if off.op != 'const' else off.attr + 4
                     slots[o.attr] = max(slots.get(o.attr, 0), hi)
+                elif o.op == 'sload':
+                    sbs.add(o.attr)
                 elif o.op == 'tex':
                     k = o.attr['tkey']['key']
                     if k not in texkeys:
@@ -466,7 +472,7 @@ class Emitter:
             binding += 1
         for k in texkeys:
             (h, s), dim, arr, dc = k
-            img = m.t_image(self.T_f32, DIM_SPV[dim], 1 if dc else 0, 1 if arr else 0, 0, 1, 0)
+            img = m.t_image(self.T_f32, DIM_SPV[dim], 1 if dc else 0, 1 if arr else 0, 1 if dim == '2dms' else 0, 1, 0)
             if dim == '1d':
                 m.cap('Sampled1D')
             if dim == 'cube' and arr:
@@ -492,6 +498,25 @@ class Emitter:
                 'binding': binding, 'dim': dim + ('_array' if arr else ''), 'shadow': bool(dc),
                 'array_len': 1, 'handle': {'cbuf': h[0], 'offset': hoff},
                 'sampler_handle': ({'cbuf': s[0], 'offset': soff} if s else None), 'nvn': nvn})
+            binding += 1
+        for k in sorted(sbs):
+            # read-only storage buffer: NVN storage descriptor k (c[0][0x110 + 16k]), bound at the
+            # descriptor address rounded down to 256 bytes (the shader subtracts the same base)
+            rt = m.t_rtarray(self.T_u32)
+            if ('stride', rt) not in m._types:
+                m.deco(rt, 'ArrayStride', 4)
+                m._types[('stride', rt)] = 0
+            st = m.t_struct(('ssbo', k), rt)
+            m.deco(st, 'Block')
+            m.mdeco(st, 0, 'Offset', 0)
+            m.mdeco(st, 0, 'NonWritable')
+            var = m.gvar(m.t_ptr('StorageBuffer', st), 'StorageBuffer')
+            m.name(var, 'sb%d' % k)
+            m.deco(var, 'DescriptorSet', self.set)
+            m.deco(var, 'Binding', binding)
+            self.ssbos[k] = var
+            self.manifest_ssbo.append({'binding': binding, 'desc': {'cbuf': 0, 'offset': 0x110 + 16 * k},
+                                       'nvn_index': k, 'write': False, 'base_align': 256})
             binding += 1
 
     def c1_array(self):
@@ -562,7 +587,10 @@ class Emitter:
             elif op == 'frcp':
                 r = self.new('FDiv', self.T_f32, self.cf(1.0), self.get(o.args[0], 'f32'))
             elif op in ('fmin', 'fmax'):
-                r = self.ext(self.T_f32, 'NMin' if op == 'fmin' else 'NMax', self.get(o.args[0], 'f32'),
+                # NMin/NMax: FMNMX returns the other operand when one is NaN. The 'fminmax' oracle
+                # switch mirrors a reference translator's FMin/FMax (NaN result undefined).
+                nm = ('F' if 'fminmax' in lift.COMPAT else 'N') + ('Min' if op == 'fmin' else 'Max')
+                r = self.ext(self.T_f32, nm, self.get(o.args[0], 'f32'),
                              self.get(o.args[1], 'f32'))
             elif op == 'fcmp':
                 a, c = self.get(o.args[0], 'f32'), self.get(o.args[1], 'f32')
@@ -624,6 +652,13 @@ class Emitter:
                 r = self.new('CompositeExtract', self.T_f32, self.v[o.args[0].n], o.attr)
             elif op == 'cbuf':
                 r = self.gen_cbuf(o)
+            elif op == 'sload':
+                # out-of-range reads rely on the runtime's robustBufferAccess (they return 0 there),
+                # like hardware LDG they are not clamped into the buffer
+                var = self.ssbos[o.attr]
+                ptr = self.new('AccessChain', m.t_ptr('StorageBuffer', self.T_u32), var, self.cu(0),
+                               self.get(o.args[0], 'u32'))
+                r = self.new('Load', self.T_u32, ptr)
             elif op == 'c1_dyn':
                 var = self.c1_array()
                 idx = self.new('ShiftRightLogical', self.T_u32, self.get(o.args[0], 'u32'), self.cu(2))
@@ -657,6 +692,10 @@ class Emitter:
                              self.get(o.args[0], 'u32'), self.cu(o.attr))
             elif op == 'fswzadd':
                 r = self.gen_fswzadd(o)
+            elif op == 'gs_emit':
+                self.ins('EmitVertex')
+            elif op == 'gs_cut':
+                self.ins('EndPrimitive')
             elif op == 'demote':
                 m.cap('DemoteToHelperInvocation')
                 m.ext('SPV_EXT_demote_to_helper_invocation')
@@ -684,9 +723,40 @@ class Emitter:
             ptr = self.new('AccessChain', pu, var, self.cu(0), vi, ci)
         return self.new('Load', self.T_u32, ptr)
 
+    GS_TOPOLOGY = {1: ('points', 27), 6: ('line_strip', 28), 7: ('triangle_strip', 29)}
+    GS_IN_VERTICES = 3      # input primitive: triangles (SR29 reports 3 << 16); other draws need a variant
+
+    def gs_vertex_input(self, o):
+        """Per-vertex read in a geometry shader: in<loc>[v] or gl_in[v].Position."""
+        m = self.m
+        kind, idx, comp = o.attr
+        nv = self.GS_IN_VERTICES
+        vtx = self.ext(self.T_u32, 'UMin', self.get(o.args[0], 'u32'), self.cu(nv - 1))
+        if kind == 'gen':
+            key = ('gen_v', idx)
+            var = self.inputs.get(key)
+            if var is None:
+                var = self.io_var('Input', m.t_array(self.T_v4f, nv), 'in%d' % idx)
+                m.deco(var, 'Location', idx)
+                self.inputs[key] = var
+            ptr = self.new('AccessChain', m.t_ptr('Input', self.T_f32), var, vtx, self.cu(comp))
+            return self.new('Load', self.T_f32, ptr)
+        key = ('position_v', 0)
+        var = self.inputs.get(key)
+        if var is None:
+            blk = m.t_struct('gs_in_pervertex', self.T_v4f)
+            m.deco(blk, 'Block')
+            m.mdeco(blk, 0, 'BuiltIn', 0)
+            var = self.io_var('Input', m.t_array(blk, nv), 'gl_in')
+            self.inputs[key] = var
+        ptr = self.new('AccessChain', m.t_ptr('Input', self.T_f32), var, vtx, self.cu(0), self.cu(comp))
+        return self.new('Load', self.T_f32, ptr)
+
     def gen_in(self, o):
         m = self.m
         kind, idx, comp = o.attr
+        if o.args:
+            return self.gs_vertex_input(o)
         if kind == 'gen':
             var = self.input_var('gen', idx)
             ptr = self.new('AccessChain', m.t_ptr('Input', self.T_f32), var, self.cu(comp))
@@ -767,6 +837,7 @@ class Emitter:
         lodv = extra.pop(0) if at['has_lod'] else None
         offv = extra.pop(0) if at['has_off'] else None
         dref = extra.pop(0) if at['has_dref'] else None
+        msv = extra.pop(0) if at.get('has_ms') else None
         si = self.new('Load', simg, var)
         constoff = None
         if offv is not None:
@@ -787,12 +858,17 @@ class Emitter:
                 comps.append(self.new('Bitcast', self.T_i32, self.get(arr_idx, 'u32')))
             coord = comps[0] if nall == 1 else self.new('CompositeConstruct', self.T_ivec[nall], *comps)
             image = self.new('Image', img, si)
-            lod = self.new('Bitcast', self.T_i32, self.get(lodv, 'u32')) if lodv is not None else m.const_i32(0)
-            mask = IMG_LOD
-            ops = [lod]
+            mask, ops = 0, []
+            if dim != '2dms':
+                # multisampled images take a sample index instead of a level of detail
+                lod = self.new('Bitcast', self.T_i32, self.get(lodv, 'u32')) if lodv is not None else m.const_i32(0)
+                mask, ops = IMG_LOD, [lod]
             if constoff is not None:
                 mask |= IMG_CONSTOFF
                 ops.append(constoff)
+            if dim == '2dms':
+                mask |= IMG_SAMPLE
+                ops.append(self.new('Bitcast', self.T_i32, self.get(msv, 'u32')))
             return self.new('ImageFetch', self.T_v4f, image, coord, mask, *ops)
         comps = [self.get(c, 'f32') for c in coords]
         if arr:
@@ -1050,8 +1126,28 @@ class Emitter:
             Module.ins(m.modes, 'ExecutionMode', fid, 7)            # OriginUpperLeft
             if 'depth' in [k[0] for k in self.outputs]:
                 Module.ins(m.modes, 'ExecutionMode', fid, 12)       # DepthReplacing
+        elif self.stage == 'gs':
+            g = self.gs_modes()
+            m.cap('Geometry')
+            Module.ins(m.modes, 'ExecutionMode', fid, 22)           # Triangles
+            Module.ins(m.modes, 'ExecutionMode', fid, 0, g['invocations'])
+            Module.ins(m.modes, 'ExecutionMode', fid, 26, g['max_vertices'])
+            Module.ins(m.modes, 'ExecutionMode', fid, self.GS_TOPOLOGY[g['topo']][1])
         m.name(fid, 'main')
         return m.assemble()
+
+    def gs_modes(self):
+        """Geometry SPH: invocations (word 2 bits 24-31), output topology (word 3 bits 24-27),
+        max output vertices (word 4 bits 0-11)."""
+        sph = self.p.sph
+        topo = (sph[3] >> 24) & 0xF
+        if topo not in self.GS_TOPOLOGY:
+            raise EmitError('geometry output topology %d' % topo)
+        inv = (sph[2] >> 24) & 0xFF
+        mx = sph[4] & 0xFFF
+        if not 1 <= inv <= 32 or not 1 <= mx <= 256:
+            raise EmitError('geometry invocations %d / max vertices %d' % (inv, mx))
+        return {'topo': topo, 'invocations': inv, 'max_vertices': mx}
 
     def _exec(self):
         return {'Vertex': 0, 'TessellationControl': 1, 'TessellationEvaluation': 2, 'Geometry': 3,
@@ -1061,7 +1157,7 @@ class Emitter:
         info = self.info
         ins = []
         for (kind, idx), _ in sorted(self.inputs.items(), key=lambda kv: str(kv[0])):
-            if kind == 'gen':
+            if kind in ('gen', 'gen_v'):
                 comps = ''.join('xyzw'[c] for c in sorted(info.inputs.get(idx, ())))
                 interp = {1: 'flat', 3: 'noperspective'}.get(info.input_interp.get(idx, 2), 'smooth') \
                     if self.stage == 'fs' else None
@@ -1079,9 +1175,9 @@ class Emitter:
                 bout.append('clip_distance[%d]' % max(1, info.clip_written.bit_length()))
             else:
                 bout.append({'depth': 'frag_depth', 'viewport': 'viewport_index'}.get(kind, kind))
-        bin_ = sorted(k for (k, _) in self.inputs if k != 'gen')
+        bin_ = sorted({'position_v': 'position'}.get(k, k) for (k, _) in self.inputs if k not in ('gen', 'gen_v'))
         d = {'key': key, 'stage': self.stage, 'spirv_version': '1.3', 'sets': {'set': self.set},
-             'ubos': self.manifest_ubo, 'textures': self.manifest_tex, 'images': [], 'ssbos': [],
+             'ubos': self.manifest_ubo, 'textures': self.manifest_tex, 'images': [], 'ssbos': self.manifest_ssbo,
              'inputs': ins, 'outputs': outs, 'builtins_in': bin_, 'builtins_out': bout,
              'local_size': [1, 1, 1], 'shared_bytes': 0,
              'local_bytes': 4 * getattr(self, 'local_len', 0),
@@ -1089,6 +1185,11 @@ class Emitter:
                           'fragment_shader_interlock': False, 'geometry_passthrough': False},
              'constants_inlined': True, 'cf_mode': self.cf_mode,
              'cf_fallback': self.fallback_reason}
+        if self.stage == 'gs':
+            g = self.gs_modes()
+            d['geometry'] = {'input': 'triangles', 'input_vertices': self.GS_IN_VERTICES,
+                             'output': self.GS_TOPOLOGY[g['topo']][0], 'max_vertices': g['max_vertices'],
+                             'invocations': g['invocations']}
         if self.stage == 'fs':
             d['frag'] = {'rt_mask': info.rt_mask, 'writes_depth': info.writes_depth,
                          'early_fragment_tests': False, 'discards': info.demotes}

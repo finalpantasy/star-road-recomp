@@ -90,8 +90,8 @@ void hle_thunk(Ctx *c) {
     LONG64 n = InterlockedIncrement64(&s->count);
     rt_ring_push(s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : s->kind == SLOT_WRAP ? "WRAP" : "INT", s->name, c->x[0], c->x[1], c->x[2]);
     if (n == 1 && s->kind != SLOT_INTERNAL) {
-        rt_log("%s first call: %s (lr=%#llx x0=%#llx x1=%#llx)", s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : "WRAP", s->name,
-               (unsigned long long)c->x[30], (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
+        rt_log("%s first call: %s (lr=%#llx x0=%#llx x1=%#llx real=%#llx)", s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : "WRAP", s->name,
+               (unsigned long long)c->x[30], (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)s->real);
         /* wrapped nn:: symbols forward to the lifted sdk code, which talks to our IPC server (runtime/hle); nothing stops here */
     } else if (g_trace && s->kind != SLOT_INTERNAL) {
         rt_log("%s call #%lld %s [x19=%#llx sp=%#llx]", s->kind == SLOT_HLE ? "HLE" : s->kind == SLOT_STUB ? "STUB" : "WRAP", (long long)n, s->name, (unsigned long long)c->x[19], (unsigned long long)c->x[31]);

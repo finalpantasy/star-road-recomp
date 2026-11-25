@@ -10,7 +10,7 @@ An Op is a value (or a statement when ty == 'void'). args hold Ops; attr holds p
 
 
 class Op:
-    __slots__ = ('op', 'ty', 'args', 'attr', 'sym', 'n', 'halves')
+    __slots__ = ('op', 'ty', 'args', 'attr', 'sym', 'n', 'halves', 'psel')
 
     def __init__(self, op, ty, args=(), attr=None):
         self.op = op

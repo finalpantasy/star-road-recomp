@@ -24,7 +24,7 @@ NOP_OPS = {'nop', 'depbar', 'membar', 'votevtg', 'cctl', 'pbk', 'ssy', 'pcnt'}
 
 TEX_DIMS = {0: ('1d', False), 1: ('1d', True), 2: ('2d', False), 3: ('2d', True), 4: ('3d', False),
             5: ('3d', True), 6: ('cube', False), 7: ('cube', True)}
-DIM_COORDS = {'1d': 1, '2d': 2, '3d': 3, 'cube': 3}
+DIM_COORDS = {'1d': 1, '2d': 2, '3d': 3, 'cube': 3, '2dms': 2}
 
 
 class Program:
@@ -83,6 +83,7 @@ class Lifter:
         self.pcache = {}
         self.n = 0
         self.pcond = None
+        self.cur_pi = None
         self.vtg_cc = False
 
     # ---------- emission helpers ----------
@@ -127,6 +128,7 @@ class Lifter:
             v = self.emit('select', 'u32', self.pcond, v, old)
             # handle tracing: a predicated MOV/LOP of a handle is read under the same predicate
             v.sym = sym
+            v.psel = self.cur_pi
         self.emit('rset', 'void', v, attr=r)
         self.cache[r] = v
 
@@ -182,6 +184,8 @@ class Lifter:
             v.sym = ('imm', v.attr)
             return v
         self.info.cbufs[slot] = max(self.info.cbufs.get(slot, 0), off + 4)
+        if slot == 0 and self.SB_BASE <= off < self.SB_BASE + 16 * self.SB_COUNT and (off - self.SB_BASE) % 16 == 0:
+            self.sb_seen = getattr(self, 'sb_seen', set()) | {off}
         v = self.emit('cbuf', 'u32', self.const(off), attr=slot)
         v.sym = ('cb', slot, off)
         return v
@@ -229,7 +233,7 @@ class Lifter:
 
     def fmz_mul(self, a, b, mode):
         r = self.emit('fmul', 'f32', a, b)
-        if mode in (1, 2):   # FMZ / FMZ+FTZ: 0 * anything = 0
+        if mode in (1, 2) and 'no_fmz' not in COMPAT:   # FMZ / FMZ+FTZ: 0 * anything = 0
             z = self.fconst(0.0)
             az = self.emit('fcmp', 'bool', a, z, attr=2)
             bz = self.emit('fcmp', 'bool', b, z, attr=2)
@@ -301,6 +305,11 @@ class Lifter:
                     else:
                         raise Unsupported('%s target %#x outside code' % (i.name, t))
                 leaders.add(t)
+            if i.name == 'brx':
+                for t in self.brx_table(insts, k)[1]:
+                    if t not in by_addr:
+                        raise Unsupported('BRX target %#x outside code' % t)
+                    leaders.add(t)
             if i.name in ('bra', 'exit', 'sync', 'brk', 'cont', 'kil', 'brx', 'ret') and nx is not None:
                 leaders.add(nx)
         self.insts = insts
@@ -404,6 +413,57 @@ class Lifter:
                     o.args = [repl.get(id(a), a) if isinstance(a, Op) else a for a in o.args]
         self.fn.fold_undo = undo
 
+    NO_RD_WRITE = {'ast', 'stl', 'stg', 'sts', 'st', 'red', 'out', 'bra', 'brx', 'exit', 'kil', 'sync', 'brk',
+                   'cont', 'ssy', 'pbk', 'pcnt', 'nop', 'depbar', 'membar', 'isetp', 'fsetp', 'psetp', 'hsetp2',
+                   'vsetp', 'dsetp'}
+
+    def brx_table(self, insts, k):
+        """Jump table of the BRX at insts[k]: (entries, targets). Matches the compiler's switch
+        lowering IMNMX.U32 Rx, Ry, bound, PT; SHL Rx, Rx, 2; LDC Rt, c[1][Rx + base]; BRX Rt, imm.
+        The entries are read from the program's own constants (c[1] is part of the program)."""
+        brx = insts[k]
+        cache = getattr(self, '_brx', {})
+        if brx.addr in cache:
+            return cache[brx.addr]
+
+        def writer(j, reg):
+            while j > 0:
+                j -= 1
+                x = insts[j]
+                if x.name in ('bra', 'brx', 'exit', 'sync', 'brk', 'cont', 'ret'):
+                    return None
+                if x.rd == reg and x.name not in self.NO_RD_WRITE:
+                    return j
+            return None
+
+        bad = Unsupported('BRX at %#x without a recognized jump table' % brx.addr)
+        j = writer(k, brx.ra)
+        if j is None or insts[j].name != 'ldc' or insts[j].f(36, 5) != 1 or insts[j].f(44, 2) != 0                 or insts[j].f(48, 3) != 4 or not (insts[j].pred == PT and not insts[j].pred_neg):
+            raise bad
+        ldc = insts[j]
+        cb_off = decoder.sext(ldc.f(20, 16), 16)
+        j = writer(j, ldc.ra)
+        if j is None or insts[j].name != 'shl' or insts[j].form != 'I' or insts[j].imm20i != 2:
+            raise bad
+        j = writer(j, insts[j].ra)
+        mn = insts[j] if j is not None else None
+        if mn is None or mn.name != 'imnmx' or mn.form != 'I' or mn.b(48) or mn.f(39, 3) != PT or mn.b(42)                 or mn.f(43, 2):
+            raise bad
+        count = (mn.imm20i & 0xFFFFF) + 1
+        if count > 256 or cb_off < 0 or cb_off + 4 * count > len(self.p.consts):
+            raise bad
+        base = brx.addr + 8 + decoder.sext(brx.f(20, 24), 24)
+        entries = [struct.unpack_from('<I', self.p.consts, cb_off + 4 * n)[0] for n in range(count)]
+        targets = []
+        for e in entries:
+            t = (base + e) & 0xFFFFFFFF
+            if t % 32 == 0:
+                t += 8
+            targets.append(t)
+        cache[brx.addr] = (entries, targets)
+        self._brx = cache
+        return cache[brx.addr]
+
     def branch_target(self, i):
         t = i.addr + 8 + decoder.sext(i.f(20, 24), 24)
         if t % 32 == 0:
@@ -442,6 +502,7 @@ class Lifter:
             if name in NOP_OPS:
                 continue
             last = (k == len(ins) - 1)
+            self.cur_pi = (i.pred, i.pred_neg) if guarded else None
             if name in ('bra', 'exit', 'sync', 'brk', 'cont', 'kil', 'brx', 'ret'):
                 self.lift_flow(i, guarded, stack, ins, k)
                 if name == 'kil':
@@ -549,7 +610,28 @@ class Lifter:
             t = st[-1][1]
             tb = self.get_block(t, tuple(st[:-1]))
         elif name == 'brx':
-            raise Unsupported('BRX (indirect branch) at %#x' % i.addr)
+            # compare the loaded table entry (the branch offset itself, not the index) with each
+            # distinct entry; the last distinct target takes everything else
+            entries, targets = self.brx_table(self.insts, self.by_addr[i.addr])
+            seen, cases = set(), []
+            for e, t in zip(entries, targets):
+                if t not in seen:
+                    seen.add(t)
+                    cases.append((e, t))
+            head = self.fn.new_block()
+            if cond is None:
+                self.cur.term = ('br', head)
+            else:
+                self.cur.term = ('cbr', cond, head, fall())
+            self.set_block(head)
+            for e, t in cases[:-1]:
+                tb = self.get_block(t, tuple(stack))
+                nxt = self.fn.new_block()
+                eq = self.emit('icmp', 'bool', self.rget(i.ra), self.const(e), attr='eq')
+                self.cur.term = ('cbr', eq, tb, nxt)
+                self.set_block(nxt)
+            self.cur.term = ('br', self.get_block(cases[-1][1], tuple(stack)))
+            return
         else:
             raise Unsupported(name)
         if cond is None:
@@ -704,7 +786,7 @@ class Lifter:
             a = self.emit('fneg', 'f32', a)
         if negc:
             c = self.emit('fneg', 'f32', c)
-        if fmz in (1, 2):
+        if fmz in (1, 2) and 'no_fmz' not in COMPAT:
             # FFMA stays fused (one rounding); FMZ only changes the case where a or b is zero:
             # 0 * anything = +0, so the result is 0 + c
             z = self.fconst(0.0)
@@ -1042,6 +1124,86 @@ class Lifter:
         mn = self.emit('smin' if s else 'umin', 'u32', a, b)
         mx = self.emit('smax' if s else 'umax', 'u32', a, b)
         self.rset(i.rd, self.emit('select', 'u32', p, mn, mx))
+
+    # ---------- video ops (VMAD, VMNMX) ----------
+    def vsel(self, v, sel):
+        """Video operand select: bytes 0-3 (sel 0-3), halves (4, 5), word (6); +8 is signed."""
+        signed, s = bool(sel & 8), sel & 7
+        if s == 6:
+            return v
+        if s == 7:
+            raise Unsupported('video select %d' % sel)
+        pos, bits = (s * 8, 8) if s < 4 else ((s - 4) * 16, 16)
+        return self.emit('bfe_s' if signed else 'bfe_u', 'u32', v, self.const(pos), self.const(bits))
+
+    def video_ab(self, i):
+        asel = (i.f(48, 1) << 3) | i.f(36, 3)
+        bsel = (i.f(49, 1) << 3) | i.f(28, 3)
+        a = self.vsel(self.rget(i.ra), asel)
+        if i.b(50):
+            b = self.vsel(self.rget(i.rb), bsel)
+        else:
+            imm = i.f(20, 16)
+            if bsel & 8:
+                imm = decoder.sext(imm, 16)
+            b = self.const(imm)
+        return a, b, bool(asel & 8), bool(bsel & 8)
+
+    def i_vsetp(self, i):
+        a, b, sa, sb = self.video_ab(i)
+        asel = (i.f(48, 1) << 3) | i.f(36, 3)
+        bsel = (i.f(49, 1) << 3) | i.f(28, 3)
+        cmp = (i.f(47, 1) << 2) | i.f(43, 2)
+        if sa != sb:
+            if (asel & 7) == 6 or ((bsel & 7) == 6 and i.b(50)):
+                raise Unsupported('VSETP mixed-sign 32-bit compare')
+            signed = True      # both are extended bytes/halves: exact as signed 32-bit values
+        else:
+            signed = sa
+        r = self.icomp(a, b, cmp, signed)
+        self.setp_out(i, r, i.f(39, 3), i.b(42), i.f(45, 2))
+
+    def i_vmad(self, i):
+        a, b, _, _ = self.video_ab(i)
+        avg, scale, sat = i.f(53, 2), i.f(51, 2), i.b(55)
+        if scale or sat or i.b(47):
+            # the shifted and saturated forms need the high product word; the corpus never uses them
+            raise Unsupported('VMAD scale/sat/CC')
+        c = self.rget(i.rc)
+        if avg == 1:
+            c = self.emit('ineg', 'u32', c)
+        prod = self.emit('imul', 'u32', a, b)
+        if avg == 2:
+            prod = self.emit('ineg', 'u32', prod)
+        r = self.emit('iadd', 'u32', prod, c)
+        if avg == 3:
+            r = self.emit('iadd', 'u32', r, self.const(1))
+        self.rset(i.rd, r)
+
+    def i_vmnmx(self, i):
+        a, b, sa, sb = self.video_ab(i)
+        mx, dfmt, sat, vop = i.b(56), i.b(54), i.b(55), i.f(51, 3)
+        if sat or i.b(47):
+            raise Unsupported('VMNMX sat/CC')
+        if sa == sb:
+            r = self.emit(('s' if sa else 'u') + ('max' if mx else 'min'), 'u32', a, b)
+        else:
+            # one signed, one unsigned: a negative signed value is below every unsigned value
+            s_v, u_v = (a, b) if sa else (b, a)
+            neg = self.emit('icmp', 'bool', s_v, self.const(0), attr='slt')
+            both = self.emit('umax' if mx else 'umin', 'u32', a, b)
+            r = self.emit('select', 'u32', neg, u_v if mx else s_v, both)
+        c = self.rget(i.rc)
+        if vop == 4:
+            r = self.emit('iadd', 'u32', r, c)
+        elif vop in (5, 6):
+            r = self.emit(('s' if dfmt else 'u') + ('min' if vop == 5 else 'max'), 'u32', r, c)
+        elif vop in (0, 1, 2, 3):
+            pos, bits = {0: (16, 16), 1: (0, 16), 2: (0, 8), 3: (16, 8)}[vop]
+            r = self.emit('bfi', 'u32', c, r, self.const(pos), self.const(bits))
+        else:
+            raise Unsupported('VMNMX video op %d' % vop)
+        self.rset(i.rd, r)
 
     def lop_core(self, a, b, op):
         if op == 0:
@@ -1438,8 +1600,51 @@ class Lifter:
         new = self.emit('bfi', 'u32', old, self.rget(i.rd), self.sub_shift(addr), self.const(bits))
         self.emit('stl', 'void', widx, new)
 
+    # NVN storage buffer descriptors: 16 entries of {u64 address, u32 size, pad} at c[0][0x110].
+    SB_BASE, SB_COUNT = 0x110, 16
+    SB_ALIGN = 256      # runtime binds SSBO k at (address & ~255); 256 is Vulkan's largest offset alignment
+
+    def sb_desc(self, v, depth=0):
+        """Storage descriptor offset (in c[0]) that the low address word v was built from, or None."""
+        if v.op == 'cbuf' and v.attr == 0 and v.args[0].op == 'const':
+            off = v.args[0].attr
+            if self.SB_BASE <= off < self.SB_BASE + 16 * self.SB_COUNT and (off - self.SB_BASE) % 16 == 0:
+                return off
+            return None
+        if depth < 8 and v.op in ('iadd', 'select'):
+            for a in v.args:
+                if isinstance(a, Op):
+                    r = self.sb_desc(a, depth + 1)
+                    if r is not None:
+                        return r
+        return None
+
     def i_ldg(self, i):
-        raise Unsupported('LDG (global memory)')
+        bits, signed = self.LS_SIZE.get(i.f(48, 3), (None, None))
+        if bits is None:
+            raise Unsupported('LDG size %d' % i.f(48, 3))
+        low = self.rget(i.ra)
+        doff = self.sb_desc(low)
+        if doff is None:
+            # base built in another block: fall back to the only descriptor this program reads
+            seen = getattr(self, 'sb_seen', set())
+            if len(seen) != 1:
+                raise Unsupported('LDG address not traced to a storage descriptor')
+            doff = next(iter(seen))
+        k = (doff - self.SB_BASE) // 16
+        self.info.ssbos[k] = {'cbuf': 0, 'offset': doff, 'write': self.info.ssbos.get(k, {}).get('write', False)}
+        base = self.cbuf_const(0, doff)
+        hb = self.emit('and', 'u32', base, self.const(~(self.SB_ALIGN - 1)))
+        addr = self.emit('isub', 'u32', low, hb)
+        imm = decoder.sext(i.f(20, 24), 24)
+        if imm:
+            addr = self.emit('iadd', 'u32', addr, self.const(imm))
+        if bits >= 32:
+            for n in range(bits // 32):
+                self.rset(i.rd + n, self.emit('sload', 'u32', self.word_of(addr, n), attr=k))
+            return
+        w = self.emit('sload', 'u32', self.word_of(addr), attr=k)
+        self.rset(i.rd, self.emit('bfe_s' if signed else 'bfe_u', 'u32', w, self.sub_shift(addr), self.const(bits)))
 
     def i_stg(self, i):
         raise Unsupported('STG (global memory)')
@@ -1470,9 +1675,17 @@ class Lifter:
             return ('primitive_id', 0, 0)
         raise Unsupported('attribute %#x' % a)
 
-    def read_attr(self, a):
+    def read_attr(self, a, vtx=None):
         k = self.attr_kind(a, False)
         kind, idx, comp = k
+        if vtx is not None:
+            if kind == 'gen':
+                self.info.inputs.setdefault(idx, set()).add(comp)
+                return self.emit('in', 'f32', vtx, attr=k)
+            if kind == 'position':
+                self.info.builtins_in.add('position')
+                return self.emit('in', 'f32', vtx, attr=k)
+            raise Unsupported('per-vertex read of attribute %s' % kind)
         if kind == 'gen':
             self.info.inputs.setdefault(idx, set()).add(comp)
             return self.emit('in', 'f32', attr=k)
@@ -1498,9 +1711,44 @@ class Lifter:
             raise Unsupported('ALD indexed')
         base = i.f(20, 11)
         n = i.f(47, 2) + 1
-        for k in range(n):
-            v = self.read_attr(base + 4 * k)
+        vtx = None
+        if self.p.stage == 'gs':
+            # Rc is the ISBE vertex handle; with primitive index 0 it is the vertex index (ISBERD)
+            rc = i.f(39, 8)
+            vtx = self.rget(rc)
+        elif i.f(39, 8) != RZ:
+            raise Unsupported('ALD vertex handle in %s' % self.p.stage)
+        vals = [self.read_attr(base + 4 * k, vtx) for k in range(n)]
+        for k, v in enumerate(vals):
             self.rset(i.rd + k, v)
+
+    def i_isberd(self, i):
+        # ISBE read: the vertex handle is (primitive index * vertices per primitive) + vertex index; we
+        # model one primitive per invocation (SR29 low byte 0), so the handle is the vertex index.
+        if i.f(20, 31):
+            raise Unsupported('ISBERD mode %#x' % i.f(20, 31))
+        if self.p.stage != 'gs':
+            raise Unsupported('ISBERD in %s' % self.p.stage)
+        self.rset(i.rd, self.rget(i.ra))
+
+    def i_out(self, i):
+        if self.p.stage != 'gs':
+            raise Unsupported('OUT in %s' % self.p.stage)
+        if i.form == 'R' and i.rb != RZ:
+            raise Unsupported('OUT stream register')
+        if i.form not in ('R', 'I'):
+            raise Unsupported('OUT form %s' % i.form)
+        if i.form == 'I' and i.f(20, 19):
+            raise Unsupported('OUT stream immediate')
+        t = i.f(39, 2)
+        if t == 0:
+            raise Unsupported('OUT type 0')
+        if t & 1:
+            self.emit('gs_emit', 'void')
+            self.info.gs_emits = True
+        if t & 2:
+            self.emit('gs_cut', 'void')
+        # Rd receives the next output handle; Unity programs only pass it to the next OUT
 
     def i_ast(self, i):
         if i.b(31):
@@ -1665,6 +1913,10 @@ class Lifter:
             v = self.rget(rb)
             rb += 1
             return v
+        if ms:
+            if dim != '2d':
+                raise Unsupported('multisample fetch on %s' % dim)
+            dim = '2dms'
         array_idx = take_a() if arr else None
         handle = take_b()
         ncoord = DIM_COORDS[dim]
@@ -1673,14 +1925,12 @@ class Lifter:
         offs = take_b() if aoffi else None
         dref = take_b() if dc else None
         msv = take_b() if ms else None
-        if ms:
-            raise Unsupported('multisample fetch')
         tkey = self.texture_key(handle, dim, arr, dc, i)
         args = [handle] + coords
         attr = dict(kind=kind, dim=dim, arr=arr, lod=lod, dc=dc, comp=comp, mask=mask, tkey=tkey,
                     ncoord=ncoord, has_arr=arr, has_lod=lodv is not None, has_off=offs is not None,
-                    has_dref=dref is not None)
-        extra = [x for x in (array_idx, lodv, offs, dref) if x is not None]
+                    has_dref=dref is not None, has_ms=msv is not None)
+        extra = [x for x in (array_idx, lodv, offs, dref, msv) if x is not None]
         v = self.emit('tex', 'v4f', *(args + extra), attr=attr)
         out = rd
         for c in range(4):
@@ -1693,7 +1943,8 @@ class Lifter:
 
     def texture_key(self, handle, dim, arr, dc, i):
         self._tex_pending = getattr(self, '_tex_pending', [])
-        rec = {'handle': handle, 'dim': dim, 'arr': arr, 'dc': dc, 'addr': i.addr, 'block': self.cur}
+        rec = {'handle': handle, 'dim': dim, 'arr': arr, 'dc': dc, 'addr': i.addr, 'block': self.cur,
+               'pi': self.cur_pi}
         self._tex_pending.append(rec)
         return rec
 
@@ -1727,14 +1978,16 @@ class Lifter:
         return (kind,) + tuple(sorted([sa, sb]))
 
     def reg_sym_in(self, blk, reg, seen):
-        """Symbolic value of register `reg` at the start of IR block `blk` (None if unknown)."""
-        if blk.id in seen:
-            return seen[blk.id]
-        seen[blk.id] = 'pending'
+        """Symbolic value of register `reg` (or local word ('l', w)) at the start of IR block `blk`
+        (None if unknown)."""
+        key = (blk.id, reg)
+        if key in seen:
+            return seen[key]
+        seen[key] = 'pending'
         res = None
         vals = set()
         if not blk.preds:
-            seen[blk.id] = None
+            seen[key] = None
             return None
         for p in blk.preds:
             v = self.reg_sym_out(p, reg, seen)
@@ -1744,23 +1997,66 @@ class Lifter:
                 vals = None
                 break
             vals.add(v)
+        if vals is not None and not vals:
+            return 'pending'    # only reached around a loop so far: optimistic, the caller decides
         if vals and len(vals) == 1:
             res = vals.pop()
-        seen[blk.id] = res
+        seen[key] = res
         return res
 
     def reg_sym_out(self, blk, reg, seen):
+        if isinstance(reg, tuple):
+            return self.local_sym_before(blk, reg[1], len(blk.ops), seen)
         for o in reversed(blk.ops):
             if o.op == 'rset' and o.attr == reg:
                 v = o.args[0]
                 return self.value_sym(blk, v, seen)
         return self.reg_sym_in(blk, reg, seen)
 
+    @staticmethod
+    def const_word(v):
+        """Word index of a constant local address (shr/iadd of consts), else None."""
+        if v.op == 'const':
+            return v.attr
+        if v.op in ('shr', 'iadd') and len(v.args) == 2:
+            a, b = Lifter.const_word(v.args[0]), Lifter.const_word(v.args[1])
+            if a is None or b is None:
+                return None
+            return (a >> b) if v.op == 'shr' else (a + b) & 0xFFFFFFFF
+        return None
+
+    def local_sym_before(self, blk, w, end, seen):
+        """Symbolic value of local word `w` just before op index `end` of `blk`: the last STL to that
+        word wins; a store to a non-constant local address makes it unknown (spill tracing)."""
+        for o in reversed(blk.ops[:end]):
+            if o.op != 'stl':
+                continue
+            ow = self.const_word(o.args[0])
+            if ow is None:
+                return None
+            if ow == w:
+                return self.value_sym(blk, o.args[1], seen)
+        return self.reg_sym_in(blk, ('l', w), seen)
+
     def value_sym(self, blk, v, seen):
+        pi = seen.get('pi')
+        ps = getattr(v, 'psel', None) if v.op == 'select' else None
+        if pi and ps and ps[0] == pi[0] and v.sym is not None:
+            # a predicated write seen by an instruction under the same predicate register: the
+            # opposite polarity never sees the written value, only the old one
+            return v.sym if ps[1] == pi[1] else self.value_sym(blk, v.args[2], seen)
         if v.sym is not None:
             return v.sym
         if v.op == 'rget':
             return self.reg_sym_in(blk, v.attr, seen)
+        if v.op == 'ldl':
+            w = self.const_word(v.args[0])
+            if w is None:
+                return None
+            idx = next((n for n, o in enumerate(blk.ops) if o is v), None)
+            if idx is None:
+                return None
+            return self.local_sym_before(blk, w, idx, seen)
         if v.op == 'or':
             a = self.value_sym(blk, v.args[0], seen)
             b = self.value_sym(blk, v.args[1], seen)
@@ -1771,7 +2067,7 @@ class Lifter:
 
     def resolve_textures(self):
         for rec in getattr(self, '_tex_pending', []):
-            s = self.value_sym(rec['block'], rec['handle'], {})
+            s = self.value_sym(rec['block'], rec['handle'], {'pi': rec.get('pi')})
             loc = None
             if s and s[0] == 'cb' and s[1] == 2:
                 loc = ((2, s[2]), None)

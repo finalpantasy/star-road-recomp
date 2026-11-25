@@ -28,7 +28,7 @@ set(SMRPG_NVN_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(nvn)
 
 file(GLOB SMRPG_HLE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hle/*.c)
-set(SMRPG_RT_SOURCES rt_core.c loader.c svc.c hle_nn.c main.c rt_weak.c)
+set(SMRPG_RT_SOURCES rt_core.c loader.c svc.c hle_nn.c main.c rt_weak.c gfxcap.c nvn_host.cpp)
 # the interpreter needs the generated op tables; with no game objects there is no strong interp_run, so rt_weak.c covers it
 if(SMRPG_GAME_OBJECTS)
   list(APPEND SMRPG_RT_SOURCES interp.c crypto_a64.c eh/eh.c gc/gc.c)   # eh/ and gc/ are task-14's (exceptions, collector safepoints); interp.c calls both

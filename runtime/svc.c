@@ -567,12 +567,15 @@ static void svc_wait_pwk(Ctx *c) {
     int timed_out = 0;
     if (g_trace) rt_log("  WaitProcessWideKeyAtomic mutex=%#llx key=%#llx tag=%#x timeout=%lld", (unsigned long long)addr, (unsigned long long)key, tag, (long long)to);
     EnterCriticalSection(&g_k);
-    mutex_unlock_locked(addr);
     Waiter *w = w_add(1, addr, key, tag);
     if (!w) { LeaveCriticalSection(&g_k); c->x[0] = RES_OUT_OF_MEM; return; }
     /* The kernel keeps the condition variable word in user memory at 1 while anyone waits on it: nn::os (and libnx) Signal/Broadcast read
-     * it first and skip the svc when it is 0 (found at the thread start handshake: ReleaseSemaphore never woke the waiter). */
+     * it first and skip the svc when it is 0 (found at the thread start handshake: ReleaseSemaphore never woke the waiter).
+     * Register and set the word BEFORE releasing the mutex: a signaler takes the mutex with plain user mode compare-exchanges, so as soon as
+     * the mutex is free it can increment its count and read the word. Releasing first left a window where it read 0, skipped the svc and
+     * the wakeup was lost (the lifted boot stalled after level0 with Loading.PreloadManager parked on its semaphore). */
     st32(key, 1);
+    mutex_unlock_locked(addr);
     while (!w->woken) {
         DWORD wait = INFINITE;
         if (deadline != INFINITE) {

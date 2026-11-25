@@ -11,7 +11,7 @@ OP = dict(
     TypeImage=25, TypeSampler=26, TypeSampledImage=27, TypeArray=28, TypeRuntimeArray=29, TypeStruct=30,
     TypePointer=32, TypeFunction=33, ConstantTrue=41, ConstantFalse=42, Constant=43, ConstantComposite=44,
     ConstantNull=46, SpecConstant=50, Function=54, FunctionEnd=56, Variable=59, Load=61, Store=62,
-    AccessChain=65, Decorate=71, MemberDecorate=72, VectorShuffle=79, CompositeConstruct=80,
+    AccessChain=65, ArrayLength=68, Decorate=71, MemberDecorate=72, VectorShuffle=79, CompositeConstruct=80,
     CompositeExtract=81, CompositeInsert=82, SampledImage=86, ImageSampleImplicitLod=87,
     ImageSampleExplicitLod=88, ImageSampleDrefImplicitLod=89, ImageSampleDrefExplicitLod=90,
     ImageFetch=95, ImageGather=96, ImageDrefGather=97, ImageQuerySizeLod=103, ImageQueryLevels=106,

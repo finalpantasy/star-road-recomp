@@ -142,6 +142,8 @@ static DWORD WINAPI watchdog_main(LPVOID p) {
     return 0;
 }
 
+void gfxcap_init(void);   /* gfxcap.c */
+
 int main(int argc, char **argv) {
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     const char *logp = "smrpg_boot.log";
@@ -165,6 +167,7 @@ int main(int argc, char **argv) {
     rt_fn_tables_init();
     rt_reg(RT_SENTINEL, sentinel_fn);
     svc_init();
+    gfxcap_init();
     rt_reserve_regions();
     if (ld_load_all(img)) rt_exit(10, "load failed");
     if (g_reg_nchunks == 0) rt_log("no game library is linked (g_reg_nchunks = 0): every guest address will miss and need the interpreter");
