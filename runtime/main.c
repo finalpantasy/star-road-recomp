@@ -206,6 +206,7 @@ void gfxcap_init(void);   /* gfxcap.c */
 
 int main(int argc, char **argv) {
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    rt_reserve_early();
     const char *logp = "smrpg_boot.log";
     const char *img = getenv("SMRPG_IMG");
     if (!img || !*img) img = "A:\\AI\\Recomps\\smrpg-work\\build\\img";

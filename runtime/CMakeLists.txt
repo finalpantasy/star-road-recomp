@@ -38,6 +38,8 @@ endif()
 add_executable(smrpg_boot ${SMRPG_RT_SOURCES} ${SMRPG_HLE_SOURCES} ${SMRPG_NVN_REGISTER_SOURCE} ${SMRPG_EXTRA_SOURCES})
 target_include_directories(smrpg_boot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SMRPG_GEN_DIR})
 target_compile_definitions(smrpg_boot PRIVATE _WIN32_WINNT=0x0A00)
+# high-entropy ASLR can place the main thread stack inside the fixed guest ranges (task-14, exit 10)
+target_link_options(smrpg_boot PRIVATE -Wl,--disable-high-entropy-va)
 # same code generation settings the lifter uses for the game objects (build.py CFLAGS); -w there, warnings kept here for our own files
 target_compile_options(smrpg_boot PRIVATE $<$<COMPILE_LANGUAGE:C>:-O2 -g -march=x86-64-v3 -ffp-contract=off -fno-strict-aliasing -fno-asynchronous-unwind-tables -fno-stack-protector -Wall -Wextra -Wno-unused-parameter -Wno-comment -Wno-unused-function>)
 # NVN line 3 of 3: link the library (the LinkAnchor functions keep its objects in the static archive)

@@ -9,14 +9,117 @@ void rt_fn_commit_module(int m, uint64_t image_bytes);
 /* ------------------------------------------------------------------ regions */
 static volatile LONG64 g_stack_next;
 
-void rt_reserve_regions(void) {
+/* The guest ranges are fixed (the game sees these addresses). With high-entropy ASLR the kernel puts the main thread
+ * stack (and other bottom-up regions) anywhere in the low 1 TB before any of our code runs, so about 1 start in 10 found
+ * a guest range occupied (error 487). The root fix is linking with -Wl,--disable-high-entropy-va (lld-link: /HIGHENTROPYVA:NO), which keeps bottom-up regions in
+ * the low gigabytes. rt_reserve_early() runs first in main(): it reserves the heap and stack ranges, checks that the
+ * module slots are free, and, if a range is taken anyway (an exe still linked with high-entropy VA), relaunches the
+ * process (bounded by SMRPG_RESERVE_TRY) inside a kill-on-close job, so a fresh layout is tried. */
+static int g_reserve_ok;
+static char g_reserve_diag[1024];
+static int g_reserve_he;   /* 1 if this exe was linked with high-entropy VA */
+
+static void describe_range(char *o, size_t n, const char *what, uint64_t b, uint64_t e) {
+    ULONG_PTR slo = 0, shi = 0;
+    GetCurrentThreadStackLimits(&slo, &shi);
+    size_t k = strlen(o);
+    k += snprintf(o + k, n - k, " %s %#llx-%#llx occupied:", what, (unsigned long long)b, (unsigned long long)e);
+    int shown = 0;
+    for (uint64_t a = b; a < e && shown < 4 && k < n;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void *)a, &mi, sizeof mi)) break;
+        uint64_t rb = (uint64_t)mi.BaseAddress, re = rb + mi.RegionSize;
+        if (mi.State != MEM_FREE) {
+            const char *who = "unknown";
+            char mod[MAX_PATH] = "";
+            if (rb < shi && re > slo) who = "main thread stack";
+            else if ((HANDLE)mi.AllocationBase == GetProcessHeap()) who = "process heap";
+            else if (mi.Type == MEM_IMAGE && GetModuleFileNameA((HMODULE)mi.AllocationBase, mod, sizeof mod)) who = mod;
+            else if (mi.Type == MEM_MAPPED) who = "mapped section";
+            else if (mi.Type == MEM_PRIVATE) who = "private allocation";
+            k += snprintf(o + k, n - k, " [%#llx +%#llx alloc %#llx state %#lx type %#lx: %s]", (unsigned long long)rb,
+                          (unsigned long long)mi.RegionSize, (unsigned long long)(uintptr_t)mi.AllocationBase, mi.State, mi.Type, who);
+            shown++;
+        }
+        a = re;
+    }
+}
+
+static int range_free(uint64_t b, uint64_t e) {
+    for (uint64_t a = b; a < e;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void *)a, &mi, sizeof mi) || mi.State != MEM_FREE) return 0;
+        a = (uint64_t)mi.BaseAddress + mi.RegionSize;
+    }
+    return 1;
+}
+
+static void relaunch(void) {
+    char v[16];
+    DWORD n = GetEnvironmentVariableA("SMRPG_RESERVE_TRY", v, sizeof v);
+    int t = (n && n < sizeof v) ? atoi(v) : 0;
+    if (t >= 8) return;                                      /* 8 fresh layouts all failed: report the FATAL below */
+    snprintf(v, sizeof v, "%d", t + 1);
+    SetEnvironmentVariableA("SMRPG_RESERVE_TRY", v);
+    HANDLE job = CreateJobObjectA(NULL, NULL);               /* the child dies with us if a harness kills our PID */
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
+    }
+    STARTUPINFOW si = {0};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    HANDLE hs[3] = {si.hStdInput, si.hStdOutput, si.hStdError};
+    for (int i = 0; i < 3; i++)
+        if (hs[i] && hs[i] != INVALID_HANDLE_VALUE) SetHandleInformation(hs[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(NULL, GetCommandLineW(), NULL, NULL, TRUE, CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi))
+        return;
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD rc = 10;
+    GetExitCodeProcess(pi.hProcess, &rc);
+    ExitProcess(rc);
+}
+
+void rt_reserve_early(void) {
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)GetModuleHandleA(NULL);
+    const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)((const char *)dos + dos->e_lfanew);
+    g_reserve_he = (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0;
     void *h = VirtualAlloc((void *)GUEST_HEAP_BASE, GUEST_HEAP_SIZE, MEM_RESERVE, PAGE_READWRITE);
-    if (!h) { rt_log("FATAL cannot reserve guest heap at %#llx (error %lu)", (unsigned long long)GUEST_HEAP_BASE, GetLastError()); rt_exit(10, "heap reserve"); }
     void *s = VirtualAlloc((void *)GUEST_STACK_BASE, GUEST_STACKRGN_SIZE, MEM_RESERVE, PAGE_READWRITE);
-    if (!s) { rt_log("FATAL cannot reserve guest stack region at %#llx (error %lu)", (unsigned long long)GUEST_STACK_BASE, GetLastError()); rt_exit(10, "stack reserve"); }
+    uint64_t mb = GUEST_MOD_MAIN, me = GUEST_HLE_BASE + GUEST_MOD_SPAN;   /* main, sdk, subsdk0 and HLE slots */
+    int mods = range_free(mb, me);
+    g_reserve_ok = h && s && mods;
+    if (g_reserve_ok) return;
+    g_reserve_diag[0] = 0;
+    if (!h) describe_range(g_reserve_diag, sizeof g_reserve_diag, "heap", GUEST_HEAP_BASE, GUEST_HEAP_BASE + GUEST_HEAP_SIZE);
+    if (!s) describe_range(g_reserve_diag, sizeof g_reserve_diag, "stacks", GUEST_STACK_BASE, GUEST_STACK_BASE + GUEST_STACKRGN_SIZE);
+    if (!mods) describe_range(g_reserve_diag, sizeof g_reserve_diag, "modules", mb, me);
+    if (h) VirtualFree(h, 0, MEM_RELEASE);
+    if (s) VirtualFree(s, 0, MEM_RELEASE);
+    SetEnvironmentVariableA("SMRPG_RESERVE_DIAG", g_reserve_diag);   /* the child logs what the collision was */
+    relaunch();                                            /* returns only if relaunching is exhausted or failed */
+}
+
+void rt_reserve_regions(void) {
+    const char *t = getenv("SMRPG_RESERVE_TRY");
+    if (!g_reserve_ok) {
+        rt_log("FATAL cannot reserve guest heap at %#llx (error 487, high-entropy VA %s, relaunches %s):%s", (unsigned long long)GUEST_HEAP_BASE,
+               g_reserve_he ? "on: link with -Wl,--disable-high-entropy-va" : "off", t ? t : "0", g_reserve_diag);
+        rt_exit(10, "heap reserve");
+    }
     g_stack_next = (LONG64)GUEST_STACK_BASE;
-    rt_log("reserved guest heap/alias %#llx +%#llx, stacks %#llx +%#llx", (unsigned long long)GUEST_HEAP_BASE,
-           (unsigned long long)GUEST_HEAP_SIZE, (unsigned long long)GUEST_STACK_BASE, (unsigned long long)GUEST_STACKRGN_SIZE);
+    const char *d = getenv("SMRPG_RESERVE_DIAG");
+    if (t && d && *d) rt_log("guest range collision on the previous start (relaunched):%s", d);
+    rt_log("reserved guest heap/alias %#llx +%#llx, stacks %#llx +%#llx (high-entropy VA %s, relaunches %s)", (unsigned long long)GUEST_HEAP_BASE,
+           (unsigned long long)GUEST_HEAP_SIZE, (unsigned long long)GUEST_STACK_BASE, (unsigned long long)GUEST_STACKRGN_SIZE,
+           g_reserve_he ? "on" : "off", t ? t : "0");
 }
 
 uint64_t rt_stack_alloc(uint64_t size, uint64_t align) {

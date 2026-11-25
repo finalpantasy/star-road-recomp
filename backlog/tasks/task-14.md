@@ -50,6 +50,22 @@ The boot does not reach IL2CPP yet, so AC3 at run time stays trivially 0 until i
 - Lifter (compile time): `tools/lifter/lift.py` `poll_liveness` and dead-register zeroing (A/B switch `SMRPG_POLL_LIVE=0`); `tools/lifter/build.py` compiles biggest chunks first and prints the 5 slowest.
 - Tests: new `tests/rthard/` (mkimg.py and the AArch64 guest sources; built and lifted on A: only), new `tests/test_rthard.py`; `tools/check-config.json` (`rthard` entry).
 
+## Follow-up: guest range reservation (2026-11-25)
+Problem: exit 10 "cannot reserve guest heap at 0x1000000000 (error 487)" in about 1 of 10 starts (test exes and game).
+Cause: exes were linked with HIGH_ENTROPY_VA, so the kernel places bottom-up regions (the main thread stack, loader worker thread stacks) anywhere in the low 1 TB before any of our code runs. The fixed guest ranges (heap +48 GB, module slots, stacks +16 GB) cover about 6% of it. Early reservation alone cannot beat the main thread stack.
+Fix:
+- Link with `-Wl,--disable-high-entropy-va` (llvm-mingw; lld-link spelling `/HIGHENTROPYVA:NO`): `tests/test_rthard.py`, `tools/lifter/build.py link`. Guest addresses unchanged.
+- `runtime/loader.c` `rt_reserve_early()`, called first in `main()` (`runtime/main.c`, `runtime/rt_internal.h`): reserves heap and stack ranges and checks that the module and HLE slots are free before any other allocation; on a collision it relaunches the exe (at most 8 times, in a kill-on-close job, std handles inherited, `SMRPG_RESERVE_TRY`, `SMRPG_RESERVE_DIAG` carries the VirtualQuery dump of the occupant to the child's log). The log line `reserved guest heap ... (high-entropy VA on|off, relaunches N)` shows the case; a FATAL now names the occupant (main thread stack, process heap, module, private allocation).
+
+| Check | Result |
+|---|---|
+| Probe exe, 300 starts each | high-entropy VA: 29 starts with a guest range occupied (main thread stack in heap, module or stack range); disabled: 0 |
+| eh test exe, linked without high-entropy VA, 200 consecutive starts | 0 exit 10, 0 relaunches, 200/200 eh summaries correct |
+| Same exe with the high-entropy bit set (safety net) | 0 exit 10; 16 of 200 starts relaunched once (occupants: main thread stack or a reserved private region), all passed |
+| `test_rthard.py --real` / `test_lifter.py` | PASS / PASS (3/3, mock boot included) |
+
+Not mine to change: the game exe (`runtime/CMakeLists.txt`, task-13) still links with high-entropy VA; the relaunch covers it, and the root fix is one line after `add_executable(smrpg_boot ...)`: `target_link_options(smrpg_boot PRIVATE -Wl,--disable-high-entropy-va)`. Same for the exes in `tests/test_runtime_boot.py` and `tests/test_sync.py`.
+
 ## Task-13 hooks
 All landed (2026-11-24, smrpg-hle): CMake sources, svc.c gc include, safe region around the svc handler, svcSetThreadActivity through gc_set_activity, GetThreadContext3 stopped check, eh and gc summaries in rt_summary, rt_poll to gc_poll, old EH block in hle_nn.c removed. test_rthard.py still patches test copies only if a hook is missing.
 
@@ -66,4 +82,4 @@ Failed hypotheses and fixes:
 - Poll liveness, first try: flushing only live registers (skipping dead dirty ones) livelocked the GC stress test: a mutator spinning in alloc never calls, so the stale context values of dead registers kept old garbage reachable on every round. Fix: store 0 into dead dirty registers. Boehm in main (f_7101108040) pushes x0 to x28, fp, lr, sp and the low half of v0 to v31 from GetThreadContext, so v registers cannot be skipped.
 - `-fno-slp-vectorize` saves only about 10% of compile time and changes codegen everywhere; not applied.
 - `tools/lifter/build.py link` (legacy link) misses task-13's runtime/hle symbols (`hle_ipc_summary` and others); `tools/rtprep/build_game.py` is the working path.
-- `tests/test_runtime_boot.py` (mock game) now fails on `missing in log: FIRST NN SERVICE REQUEST`: task-13 removed that log line in hle_nn.c; the test expectation is theirs to update. Not caused by task-14 (the test does not build interp.c, eh or gc).
+- `tests/test_runtime_boot.py` (mock game) failed on `missing in log: FIRST NN SERVICE REQUEST` on 2026-11-24 (task-13 removed that log line); it passes again on 2026-11-25.

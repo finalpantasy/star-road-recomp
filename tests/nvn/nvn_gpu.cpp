@@ -141,7 +141,9 @@ static int g_checks = 0, g_fails = 0;
   X(void, nvnCommandBufferBarrier, (void*, int))                                                                         \
   X(void, nvnCommandBufferCopyBufferToBuffer, (void*, uint64_t, uint64_t, int64_t, int))                                 \
   X(void, nvnCommandBufferCopyTextureToBuffer, (void*, void*, const void*, const void*, uint64_t, int))                  \
-  X(void, nvnCommandBufferFenceSync, (void*, void*, int, int))                                                           \
+  X(void, nvnCommandBufferCopyBufferToTexture, (void*, uint64_t, void*, const void*, const void*, int))                  \
+  X(void, nvnCommandBufferCopyTextureToTexture, (void*, void*, const void*, const void*, void*, const void*, const void*, int))   \
+  X(void, nvnCommandBufferFenceSync, (void*, void*, int, int)) \
   X(void, nvnCommandBufferUpdateUniformBuffer, (void*, uint64_t, int64_t, int64_t, int64_t, const void*))                \
   X(void, nvnBlendStateSetDefaults, (void*))                                                                             \
   X(void, nvnColorStateSetDefaults, (void*))                                                                             \
@@ -575,6 +577,33 @@ int main(int argc, char** argv) {
       SubmitWait(hc);
       std::vector<uint8_t> im; Read(color, &im);
       if (im.size() == 64 * 64 * 4) { Px p = At(im, 64, 63, 63); CHECK(Near(p, {64, 128, 191, 255}, 1), "clear under an oversized scissor reached the corner, got %s", S(p)); }
+    }
+
+    // The game copies NVNtexture structs by value (the CRI movie code does) and finalizes one copy: the other keeps a dangling impl pointer. A
+    // struct that was never initialized can hold any bytes there. Commands that name either must be skipped, not followed (this crashed the
+    // Vulkan driver in vkCmdCopyBufferToImage with a null image at the first movie).
+    {
+      GuestPool p2; CHECK(MakePool(&p2, dev, 0x20000, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED), "pool for the stale-copy test");
+      GuestTex ta; CHECK(MakeTex(&ta, &p2, dev, NVN_FORMAT_RGBA8, 4, 4, 0), "texture for the stale-copy test");
+      GuestTex stale, junk;
+      memcpy(stale.blob, ta.blob, 0x80); nvnTextureFinalize(ta.blob);               // `stale` still carries the old impl pointer
+      memset(junk.blob, 0xAB, sizeof junk.blob);                                      // never initialized: garbage everywhere
+      Clear(color, 0.25f, 0.5f, 0.75f, 1.0f);
+      int region[6] = {0, 0, 0, 4, 4, 1};
+      uint64_t hs = Record([&]() {
+        GuestTex* bad[2] = {&stale, &junk};
+        for (GuestTex* t : bad) {
+          nvnCommandBufferCopyBufferToTexture(cb, nvnBufferGetAddress(cbufC), t->blob, nullptr, region, 0);
+          nvnCommandBufferCopyTextureToBuffer(cb, t->blob, nullptr, region, nvnBufferGetAddress(cbufC), 0);
+          nvnCommandBufferCopyTextureToTexture(cb, t->blob, nullptr, region, color.blob, nullptr, region, 0);
+          nvnCommandBufferCopyTextureToTexture(cb, color.blob, nullptr, region, t->blob, nullptr, region, 0);
+        }
+      });
+      SubmitWait(hs);
+      std::vector<uint8_t> im; Read(color, &im);
+      if (im.size() == 64 * 64 * 4) { Px p = At(im, 64, 1, 1); CHECK(Near(p, {64, 128, 191, 255}, 1), "copies naming stale or uninitialized textures changed nothing, got %s", S(p)); }
+      CHECK(true, "commands on a stale and an uninitialized texture did not crash");
+      nvnMemoryPoolFinalize(p2.blob);
     }
 
     // A pool is finalized before the texture and buffer that live in it (the game does this at scene changes): both finalizes must be harmless.

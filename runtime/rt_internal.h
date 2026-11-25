@@ -83,7 +83,8 @@ extern char g_imgdir[512];
 int ld_load_all(const char *imgdir);
 uint64_t ld_find_export(const char *name);          /* global lookup order main, sdk, subsdk0; 0 if none */
 const Module *ld_module_of(uint64_t addr);
-void rt_reserve_regions(void);
+void rt_reserve_early(void);    /* first thing in main: reserve fixed guest ranges, relaunch on collision */
+void rt_reserve_regions(void);  /* after the log opens: log the result, FATAL exit 10 on failure */
 void rt_fn_tables_init(void);
 void rt_fn_commit_module(int m, uint64_t bytes);
 void rt_install_veh(void);

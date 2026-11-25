@@ -504,7 +504,7 @@ def cmd_link(a):
         f.write("\n".join(o.replace("\\", "/") for o in objs))
     exe = os.path.join(BIN, "smrpg.exe")
     t = time.time()
-    p = subprocess.run([CLANG, "@" + rsp, "-o", exe, "-g"], capture_output=True, text=True,
+    p = subprocess.run([CLANG, "@" + rsp, "-o", exe, "-g", "-Wl,--disable-high-entropy-va"], capture_output=True, text=True,
                        creationflags=BELOW_NORMAL | NO_WINDOW)
     print("link rc %d %.1fs -> %s" % (p.returncode, time.time() - t, exe))
     if p.returncode:

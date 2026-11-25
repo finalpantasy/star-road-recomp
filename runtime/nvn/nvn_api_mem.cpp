@@ -171,7 +171,7 @@ NVN_API(nvnTextureInitialize, bool, (void* tex, const TextureBuilderG* b)) {
   TextureImpl* t = new TextureImpl;
   t->pool = p; t->poolOffset = b->offset; t->storageSize = g->storageSize;
   if (!TextureCreate(g, t)) { delete t; memset(g, 0, kSizeTexture); return false; }
-  g->impl = t;
+  g->impl = t; LiveAdd(t);
   p->textures.push_back(t);
   return true;
 }
@@ -183,6 +183,7 @@ NVN_API(nvnTextureFinalize, void, (void* tex)) {
   // Texture pool slots that still name it must not keep the pointer: the game frees the texture while the slot stays in the pool.
   for (auto& r : t->poolRefs) if (IsLive(r.first) && r.second < r.first->ents.size() && r.first->ents[r.second].tex == t) r.first->ents[r.second] = TexPool::Ent{};
   QueueScrub(t);
+  LiveDel(t);
   TextureDestroy(t);
   g->impl = nullptr; g->magic = 0;
   // The impl struct is released with the deferred destroy of its Vulkan objects (it keeps no references afterwards).

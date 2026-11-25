@@ -16,17 +16,19 @@ nvn_unit: 2161 checks, 0 failed
 ```
 
 ## nvn_gpu (clear, textured quad, RGBA4, depth range, sync, copies, hidden window, validation)
-Result: PASS (exit 0, 1.3 s)
+Result: PASS (exit 0, 1.2 s)
 
 ```
 [nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=1 validation=1
 [nvn] device initialized on NVIDIA GeForce RTX 4090
 device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=on present=yes depthClipControl=1 4444=1 hostImport=1
 [nvn] draw with no program bound (skipped)
+[nvn] CopyBufferToTexture with unresolved address
+[nvn] CopyTextureToBuffer with unresolved address
 depth mode NEAR_IS_ZERO: colors (255,0,0,255) (0,0,0,255) (0,0,0,255) (255,255,255,255)  depths 0.5000 1.0000 1.0000 0.2500
 depth mode NEAR_IS_MINUS_W: colors (255,0,0,255) (0,255,0,255) (0,0,0,255) (255,255,255,255)  depths 0.7500 0.2500 1.0000 0.6250
 validation: 0 errors, 0 warnings
-nvn_gpu: 96 checks, 0 failed
+nvn_gpu: 101 checks, 0 failed
 ```
 
 ## nvn_cache pipelines (support buffer and c[1] pixel check, 600 real variants built and drawn, validation on)
@@ -60,29 +62,29 @@ nvn_cache: 32 checks, 0 failed
 ```
 
 ## nvn_cache sweep (every stage program: capability check, shader module, descriptor set layout; vs/fs pairing)
-Result: PASS (exit 0, 9.3 s)
+Result: PASS (exit 0, 8.5 s)
 
 ```
-[nvn] shader cache: 25754 ok, 0 failed (A:/AI/Recomps/smrpg-work/shaders/cache/v1)
-cache A:/AI/Recomps/smrpg-work/shaders/cache/v1: 25754 index entries, 25754 ok, 0 failed in the index
-  stage vs       1304
-  stage fs       24446
+  stage vs       1306
+  stage fs       24452
   stage gs       4
-static sample: 614 stage programs, 614 with SPIR-V magic, 0 with a support buffer, 0 with c[1] constants (0 loaded), 0 with capabilities, 613 with inputs
+  stage cs       1
+static sample: 614 stage programs, 614 with SPIR-V magic, 0 with a support buffer, 0 with c[1] constants (0 loaded), 0 with capabilities, 612 with inputs
 [nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=0 validation=0
 [nvn] device initialized on NVIDIA GeForce RTX 4090
 device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=off subgroupSize=32
-sweep progress: 4000 of 25754 stage programs after 1 s (load 1 s of which file reads 1 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 8000 of 25754 stage programs after 2 s (load 2 s of which file reads 2 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 12000 of 25754 stage programs after 4 s (load 3 s of which file reads 3 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 16000 of 25754 stage programs after 5 s (load 5 s of which file reads 4 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 20000 of 25754 stage programs after 7 s (load 6 s of which file reads 5 s and manifest parse 1 s, device check 0 s, module and layout 0 s)
-sweep progress: 24000 of 25754 stage programs after 8 s (load 7 s of which file reads 7 s and manifest parse 1 s, device check 0 s, module and layout 1 s)
-sweep time: 8.6 s (load 8.0 s, device check 0.0 s, module and layout 0.6 s)
-sweep: 25754 stage programs: 25754 ready (module and set layout built), 0 rejected by the device check, 0 not loaded, 0 module or layout failures
-  ready vs       1304
-  ready fs       24446
+sweep progress: 4000 of 25763 stage programs after 1 s (load 1 s of which file reads 1 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 8000 of 25763 stage programs after 2 s (load 2 s of which file reads 2 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 12000 of 25763 stage programs after 3 s (load 3 s of which file reads 3 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 16000 of 25763 stage programs after 5 s (load 4 s of which file reads 4 s and manifest parse 0 s, device check 0 s, module and layout 1 s)
+sweep progress: 20000 of 25763 stage programs after 6 s (load 5 s of which file reads 5 s and manifest parse 0 s, device check 0 s, module and layout 1 s)
+sweep progress: 24000 of 25763 stage programs after 7 s (load 6 s of which file reads 6 s and manifest parse 1 s, device check 0 s, module and layout 1 s)
+sweep time: 7.8 s (load 6.8 s, device check 0.0 s, module and layout 0.9 s)
+sweep: 25763 stage programs: 25763 ready (module and set layout built), 0 rejected by the device check, 0 not loaded, 0 module or layout failures
+  ready vs       1306
+  ready fs       24452
   ready gs       4
+  ready cs       1
 pairing: 61 of 26766 distinct (vs, fs) pairs have fragment inputs the vertex shader does not write (61 locations in all); first: Universal Render Pipeline/Nature/SpeedTree7 Billboard vs 127139400b95 fs 42a79163f83c
   61 pairs miss 1 location(s)
 validation: 0 errors (0 known layer false positives), 0 warnings; by message id:

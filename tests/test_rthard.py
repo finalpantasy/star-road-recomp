@@ -216,7 +216,7 @@ def compile_link(cdir, srcs, jobs=8):
             if rc:
                 raise SystemExit("compile failed: %s\n%s" % (p, out[-3000:]))
     exe = os.path.join(WORK, "smrpg_rthard.exe")
-    rc, out = run(["clang"] + [o for _p, o, _f in work] + ["-o", exe, "-g"])
+    rc, out = run(["clang"] + [o for _p, o, _f in work] + ["-o", exe, "-g", "-Wl,--disable-high-entropy-va"])   # fixed guest ranges: keep bottom-up ASLR low (loader.c)
     if rc:
         raise SystemExit("link failed\n" + out[-4000:])
     return exe

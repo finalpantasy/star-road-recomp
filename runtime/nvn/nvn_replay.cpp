@@ -237,7 +237,19 @@ static void EndRendering(RS& s) {
   GlobalBarrier(s.cb);
 }
 
+// Crash breadcrumb: where the replay was when the process faulted (a Vulkan driver fault is otherwise anonymous). Written under the Vulkan lock.
+struct Crumb { const char* where = "idle"; int op = -1; size_t index = 0; int depth = 0; bool active = false; uint64_t a = 0, b = 0; };
+static Crumb g_crumb;
+static LONG CALLBACK CrumbVeh(EXCEPTION_POINTERS* ep) {
+  if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && g_crumb.active)
+    fprintf(stderr, "[nvn] access violation during replay (a crash unless handled later): where=%s op=%d cmd#%zu depth=%d a=0x%llx b=0x%llx fault=%p rip=%p\n", g_crumb.where, g_crumb.op, g_crumb.index,
+            g_crumb.depth, (unsigned long long)g_crumb.a, (unsigned long long)g_crumb.b,
+            ep->ExceptionRecord->NumberParameters > 1 ? (void*)ep->ExceptionRecord->ExceptionInformation[1] : nullptr, ep->ExceptionRecord->ExceptionAddress), fflush(stderr);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void ToGeneral(RS& s, TextureImpl* t) {
+  g_crumb.where = "ToGeneral"; g_crumb.a = (uint64_t)t; g_crumb.b = t ? (uint64_t)t->image : 0;
   if (t->layoutInit || !t->image) return;
   EndRendering(s);
   VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -251,8 +263,17 @@ static void ToGeneral(RS& s, TextureImpl* t) {
   t->layoutInit = true;
 }
 
+// The live TextureImpl behind a guest NVNtexture, or null. The game copies NVNtexture structs by value (CRI does, for its movie textures), so a
+// struct can keep an impl pointer after another copy was finalized: a recorded command must never follow it blindly.
+static TextureImpl* TexOf(const TextureG* g) {
+  if (!g) return nullptr;
+  TextureImpl* t = g->impl;
+  return t && IsLive(t) && t->image ? t : nullptr;
+}
+
 // Copy swizzled guest texels into the image (task-11 deswizzle, decode when the GPU cannot take the format).
 static void UploadTexture(RS& s, TextureImpl* t, TextureG* g) {
+  g_crumb.where = "UploadTexture";
   Pool* pool = t->pool;
   t->uploaded = true;                 // one attempt per guest write; FlushMappedRange clears it
   if (!pool || !pool->memory) return;
@@ -295,7 +316,7 @@ static void UploadTexture(RS& s, TextureImpl* t, TextureG* g) {
 }
 
 static void PrepareSampled(RS& s, TextureG* g) {
-  TextureImpl* t = g->impl;
+  TextureImpl* t = TexOf(g);
   if (!t) return;
   ToGeneral(s, t);
   if (!t->uploaded && !t->gpuWritten) UploadTexture(s, t, g);
@@ -393,12 +414,14 @@ static bool Topology(uint32_t prim, VkPrimitiveTopology* t) {
 }
 
 static VkFormat RtFormat(const RtBind& r) {
-  TextureImpl* t = r.tex->impl;
+  TextureImpl* t = TexOf(r.tex);
+  if (!t) return VK_FORMAT_UNDEFINED;
   if (r.view.flags & 2) { int a, b; VkImageAspectFlags c; VkFormat f = VkFormatFromNvn(r.view.format, &a, &b, &c); if (f != VK_FORMAT_UNDEFINED) return f; }
   return t->vkFormat;
 }
 
 static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
+  g_crumb.where = "BuildGraphics";
   auto& F = g_vk.f;
   ProgramImpl* p = s.prog;
   VkPrimitiveTopology topo;
@@ -514,6 +537,7 @@ static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
 }
 
 static VkPipeline BuildCompute(RS& s) {
+  g_crumb.where = "BuildCompute";
   ProgramImpl* p = s.prog; StageProgram* cs = p->byStage[NVN_SHADER_STAGE_COMPUTE];
   std::string key; Put(key, p->id); Put(key, 'C');
   auto it = g_pipes.find(key);
@@ -544,6 +568,7 @@ static void FillSupportBuffer(const RS& s, uint8_t* p, uint32_t size) {
 }
 
 static bool BindDescriptors(RS& s, bool compute) {
+  g_crumb.where = "BindDescriptors";
   auto& F = g_vk.f;
   ProgramImpl* p = s.prog;
   InitDummies(s);
@@ -649,6 +674,7 @@ static bool BindDescriptors(RS& s, bool compute) {
 
 // ---- render pass handling ---------------------------------------------------------------------------------------------
 static bool BeginRendering(RS& s) {
+  g_crumb.where = "BeginRendering";
   auto& F = g_vk.f;
   if (s.rendering && !s.rtDirty) return true;
   EndRendering(s);
@@ -657,7 +683,8 @@ static bool BeginRendering(RS& s) {
   uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1; bool haveDepth = false, haveStencil = false;
   for (uint32_t i = 0; i < s.nColor; i++) if (!s.color[i].tex) { LogOnce("rtgone", "draw with a color target that was finalized or is missing (skipped)"); return false; }
   for (uint32_t i = 0; i < s.nColor; i++) {
-    TextureG* g = s.color[i].tex; TextureImpl* t = g->impl;
+    TextureG* g = s.color[i].tex; TextureImpl* t = TexOf(g);
+    if (!t) { LogOnce("rtstale", "draw with a color target whose texture is gone (skipped)"); return false; }
     ToGeneral(s, t); t->gpuWritten = true; t->lastUse = s.value;
     VkImageView v = GetView(t, g, &s.color[i].view, true);
     ca[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; ca[i].imageView = v; ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -667,7 +694,8 @@ static bool BeginRendering(RS& s) {
     layers = (s.color[i].view.flags & 16) ? std::max<uint32_t>(1, s.color[i].view.numLayers) : 1;
   }
   if (s.depth.tex) {
-    TextureG* g = s.depth.tex; TextureImpl* t = g->impl;
+    TextureG* g = s.depth.tex; TextureImpl* t = TexOf(g);
+    if (!t) { LogOnce("rtstale", "draw with a depth target whose texture is gone (skipped)"); return false; }
     ToGeneral(s, t); t->gpuWritten = true; t->lastUse = s.value;
     da.imageView = GetView(t, g, &s.depth.view, true); da.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -685,6 +713,7 @@ static bool BeginRendering(RS& s) {
 }
 
 static void SetDynamic(RS& s) {
+  g_crumb.where = "SetDynamic";
   auto& F = g_vk.f;
   VkViewport v;
   int32_t x = s.vpSet ? s.viewport[0] : 0, y = s.vpSet ? s.viewport[1] : 0, vw = s.vpSet ? s.viewport[2] : (int32_t)s.area.width, vh = s.vpSet ? s.viewport[3] : (int32_t)s.area.height;
@@ -710,6 +739,7 @@ static void SetDynamic(RS& s) {
 // Layout transitions, uploads and the dummy images are recorded outside a render pass, so every texture the draw can sample is
 // made ready here, before BeginRendering. BindDescriptors then finds them ready.
 static void PrepareResources(RS& s) {
+  g_crumb.where = "PrepareResources";
   InitDummies(s);
   for (int st = 0; st < 6; st++) {
     StageProgram* sp = s.prog->byStage[st];
@@ -755,6 +785,7 @@ static bool BindExpanded(RS& s, const std::vector<uint32_t>& idx) {
 }
 
 static bool PrepareDraw(RS& s, uint32_t prim, bool* skip) {
+  g_crumb.where = "PrepareDraw";
   *skip = true;
   if (!s.prog) { g_stats.noProgNull++; LogOnce("noprog", "draw with no program bound (skipped)"); return false; }
   if (!s.prog->complete) {
@@ -799,6 +830,7 @@ static void ClampToArea(VkRect2D& r, VkExtent2D area) {
 static TextureView ViewAt(const uint8_t* p) { TextureView v; memcpy(&v, p, sizeof v); return v; }
 
 static void DoClearColor(RS& s, const Cmd& c) {
+  g_crumb.where = "DoClearColor";
   uint32_t idx = (uint32_t)c.i[0];
   if (idx >= s.nColor || !s.color[idx].tex) { LogOnce("clr", "ClearColor of target %u that is not bound", idx); return; }
   if (!BeginRendering(s)) return;
@@ -812,9 +844,10 @@ static void DoClearColor(RS& s, const Cmd& c) {
 }
 
 static void DoClearDepth(RS& s, const Cmd& c) {
+  g_crumb.where = "DoClearDepth";
   if (!s.depth.tex) { LogOnce("clrd", "ClearDepthStencil with no depth target bound"); return; }
   if (!BeginRendering(s)) return;
-  VkImageAspectFlags a = 0; TextureImpl* t = s.depth.tex->impl;
+  VkImageAspectFlags a = 0; TextureImpl* t = TexOf(s.depth.tex);
   if (c.i[0] && (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) a |= VK_IMAGE_ASPECT_DEPTH_BIT;
   if (c.i[2] && (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) a |= VK_IMAGE_ASPECT_STENCIL_BIT;
   if (!a) return;
@@ -833,6 +866,7 @@ static VkImageSubresourceLayers SubLayers(TextureImpl* t, const TextureView& v, 
 }
 
 static void DoCopy(RS& s, const Cmd& c) {
+  g_crumb.where = "DoCopy";
   auto& F = g_vk.f;
   EndRendering(s); GlobalBarrier(s.cb);
   switch (c.op) {
@@ -842,7 +876,7 @@ static void DoCopy(RS& s, const Cmd& c) {
       VkBufferCopy r{oa, ob, (VkDeviceSize)c.l[2]}; F.vkCmdCopyBuffer(s.cb, a, b, 1, &r); break;
     }
     case Op::CopyBufToTex: {
-      TextureG* g = (TextureG*)c.obj[0]; TextureImpl* t = g->impl; TextureView v = ViewAt(c.blob.data()); const int32_t* rg = (const int32_t*)(c.blob.data() + 16);
+      TextureG* g = (TextureG*)c.obj[0]; TextureImpl* t = TexOf(g); TextureView v = ViewAt(c.blob.data()); const int32_t* rg = (const int32_t*)(c.blob.data() + 16);
       VkBuffer b; uint64_t o; if (!t || !ResolveBuffer((uint64_t)c.l[0], 1, &b, &o)) { LogOnce("cpbt", "CopyBufferToTexture with unresolved address"); break; }
       ToGeneral(s, t); t->gpuWritten = true; t->uploaded = true; t->lastUse = s.value;
       VkBufferImageCopy r{}; r.bufferOffset = o; r.imageSubresource = SubLayers(t, v, v.flags != 0);
@@ -851,7 +885,7 @@ static void DoCopy(RS& s, const Cmd& c) {
       F.vkCmdCopyBufferToImage(s.cb, b, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r); break;
     }
     case Op::CopyTexToBuf: {
-      TextureG* g = (TextureG*)c.obj[0]; TextureImpl* t = g->impl; TextureView v = ViewAt(c.blob.data()); const int32_t* rg = (const int32_t*)(c.blob.data() + 16);
+      TextureG* g = (TextureG*)c.obj[0]; TextureImpl* t = TexOf(g); TextureView v = ViewAt(c.blob.data()); const int32_t* rg = (const int32_t*)(c.blob.data() + 16);
       VkBuffer b; uint64_t o; if (!t || !ResolveBuffer((uint64_t)c.l[0], 1, &b, &o)) { LogOnce("cptb", "CopyTextureToBuffer with unresolved address"); break; }
       ToGeneral(s, t); PrepareSampled(s, g);
       VkBufferImageCopy r{}; r.bufferOffset = o; r.imageSubresource = SubLayers(t, v, v.flags != 0);
@@ -860,7 +894,7 @@ static void DoCopy(RS& s, const Cmd& c) {
       F.vkCmdCopyImageToBuffer(s.cb, t->image, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r); break;
     }
     case Op::CopyTexToTex: {
-      TextureG* sg = (TextureG*)c.obj[0]; TextureG* dg = (TextureG*)c.obj[1]; TextureImpl* st = sg->impl; TextureImpl* dt = dg->impl;
+      TextureG* sg = (TextureG*)c.obj[0]; TextureG* dg = (TextureG*)c.obj[1]; TextureImpl* st = TexOf(sg); TextureImpl* dt = TexOf(dg);
       TextureView sv = ViewAt(c.blob.data()); const int32_t* sr = (const int32_t*)(c.blob.data() + 16);
       TextureView dv = ViewAt(c.blob.data() + 40); const int32_t* dr = (const int32_t*)(c.blob.data() + 56);
       if (!st || !dt) break;
@@ -886,7 +920,9 @@ static void DoCopy(RS& s, const Cmd& c) {
 
 static void Exec(RS& s, const CmdList& l, int depth) {
   auto& F = g_vk.f;
+  size_t cmdIndex = 0;
   for (const Cmd& c : l.cmds) {
+    g_crumb.op = (int)c.op; g_crumb.index = cmdIndex++; g_crumb.depth = depth; g_crumb.where = "exec";
     switch (c.op) {
       case Op::BindBlend: { BlendStateG b; memcpy(&b, c.st, sizeof b); if (b.target < 8) s.blend[b.target] = b; break; }
       case Op::BindColor: memcpy(&s.colorState, c.st, sizeof s.colorState); break;
@@ -911,12 +947,12 @@ static void Exec(RS& s, const CmdList& l, int depth) {
         const uint8_t* b = c.blob.data();
         for (uint32_t i = 0; i < 8; i++) {
           TextureG* t = nullptr; memcpy(&t, b + 8 * i, 8);
-          if (t && !(t->magic == kMagicTexture && t->impl)) t = nullptr;        // finalized since it was recorded
+          if (t && !(t->magic == kMagicTexture && TexOf(t))) t = nullptr;        // finalized since it was recorded
           s.color[i].tex = i < n ? t : nullptr;
           s.color[i].view = ViewAt(b + 64 + 16 * i);
         }
         memcpy(&s.depth.tex, b + 64 + 128, 8); s.depth.view = ViewAt(b + 64 + 128 + 8);
-        if (s.depth.tex && !(s.depth.tex->magic == kMagicTexture && s.depth.tex->impl)) s.depth.tex = nullptr;
+        if (s.depth.tex && !(s.depth.tex->magic == kMagicTexture && TexOf(s.depth.tex))) s.depth.tex = nullptr;
         s.rtDirty = true; s.pipeDirty = true; EndRendering(s); break;
       }
       case Op::SetViewport: memcpy(s.viewport, c.i, 16); s.vpSet = true; break;
@@ -990,11 +1026,11 @@ static void Exec(RS& s, const CmdList& l, int depth) {
       case Op::ClearDepthStencil: DoClearDepth(s, c); break;
       case Op::CopyBufToBuf: case Op::CopyBufToTex: case Op::CopyTexToBuf: case Op::CopyTexToTex: DoCopy(s, c); break;
       case Op::Downsample: {
-        TextureG* sg = (TextureG*)c.obj[0]; TextureG* dg = (TextureG*)c.obj[1]; if (!sg || !dg || !sg->impl || !dg->impl) break;
-        EndRendering(s); ToGeneral(s, sg->impl); ToGeneral(s, dg->impl); dg->impl->gpuWritten = true; GlobalBarrier(s.cb);
-        VkImageResolve r{}; r.srcSubresource = {sg->impl->aspect, 0, 0, 1}; r.dstSubresource = {dg->impl->aspect, 0, 0, 1};
-        r.extent = {sg->impl->width, sg->impl->height, 1};
-        F.vkCmdResolveImage(s.cb, sg->impl->image, VK_IMAGE_LAYOUT_GENERAL, dg->impl->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r); GlobalBarrier(s.cb); break;
+        TextureG* sg = (TextureG*)c.obj[0]; TextureG* dg = (TextureG*)c.obj[1]; TextureImpl* ds = TexOf(sg); TextureImpl* dd = TexOf(dg); if (!ds || !dd) break;
+        EndRendering(s); ToGeneral(s, ds); ToGeneral(s, dd); dd->gpuWritten = true; GlobalBarrier(s.cb);
+        VkImageResolve r{}; r.srcSubresource = {ds->aspect, 0, 0, 1}; r.dstSubresource = {dd->aspect, 0, 0, 1};
+        r.extent = {ds->width, ds->height, 1};
+        F.vkCmdResolveImage(s.cb, ds->image, VK_IMAGE_LAYOUT_GENERAL, dd->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r); GlobalBarrier(s.cb); break;
       }
       case Op::Barrier: EndRendering(s); GlobalBarrier(s.cb); break;
       case Op::FenceSync: { Sync* y = (Sync*)c.p[0]; if (y) { y->value = s.value; y->signaled = false; y->eventId = 1; } break; }
@@ -1074,24 +1110,31 @@ void QueueSubmit(QueueImpl* q, uint32_t n, const uint64_t* handles) {
   s.cb = cb; s.value = value; s.scratch = sc.get(); s.dpools = dp.get(); s.keep = keep.get(); s.q = q; s.dev = q->dev;
   if (q->dev) { s.depthMode = q->dev->depthMode; s.originMode = q->dev->originMode; }
   s.rendering = false; s.rtDirty = true; s.pipeDirty = true; s.curPipe = VK_NULL_HANDLE;    // the Vulkan side starts empty in every submission
+  static bool vehDone = false; if (!vehDone) { vehDone = true; AddVectoredExceptionHandler(1, CrumbVeh); }
+  g_crumb.active = true; g_crumb.where = "submit"; g_crumb.index = 0; g_crumb.op = -1;
   for (uint32_t i = 0; i < n; i++) {
     auto l = FindList(handles[i]);
     if (!l) { LogOnce("badh", "SubmitCommands with an unknown command handle 0x%llx", (unsigned long long)handles[i]); continue; }
     keep->push_back(l);
     Exec(s, *l, 0);
   }
+  g_crumb.where = "submit end";
   EndRendering(s);
   s.cb = VK_NULL_HANDLE; s.scratch = nullptr; s.dpools = nullptr; s.keep = nullptr; s.rendering = false; s.rtDirty = true; s.pipeDirty = true;
   F.vkEndCommandBuffer(cb);
   VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}; cbi.commandBuffer = cb;
   VkSemaphoreSubmitInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}; sig.semaphore = g_vk.timeline; sig.value = value; sig.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
   VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2}; si.commandBufferInfoCount = 1; si.pCommandBufferInfos = &cbi; si.signalSemaphoreInfoCount = 1; si.pSignalSemaphoreInfos = &sig;
+  g_crumb.where = "vkQueueSubmit2";
   VkResult r = F.vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
   if (r != VK_SUCCESS) Err("vkQueueSubmit2 failed (%d)", r);
+  g_crumb.where = "after submit";
   q->lastSignal = value; g_stats.submits++;
   VkCommandPool pool = q->pool;
   DeferUntil(value, [=]() { FinishSubmission(pool, cb, sc, dp, keep); });
+  g_crumb.where = "RunDeferred";
   RunDeferred();
+  g_crumb.active = false;
 }
 
 void QueueFinish(QueueImpl* q) {
