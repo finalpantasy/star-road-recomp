@@ -59,7 +59,7 @@ def build(exe):
     clang = shutil.which("clang")
     if not clang:
         raise SystemExit("clang not on PATH")
-    srcs = [SRC / f for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "main.c", "rt_weak.c")] + sorted((SRC / "hle").glob("*.c")) + sorted((SRC / "eh").glob("*.c")) + sorted((SRC / "gc").glob("*.c"))
+    srcs = [SRC / f for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "main.c", "rt_weak.c")] + sorted((SRC / "hle").glob("*.c")) + sorted((SRC / "eh").glob("*.c")) + sorted((SRC / "gc").glob("*.c")) + sorted((SRC / "mods").glob("*.c"))
     cmd = [clang, "-std=c11", "-O1", "-g", "-Wall", "-Wno-comment", "-D_WIN32_WINNT=0x0A00", "-I", str(SRC)] + [str(s) for s in srcs] + \
           [str(ROOT / "tests" / "runtime" / "mock_game.c"), "-o", str(exe)]
     r = subprocess.run(cmd, capture_output=True, text=True)
