@@ -14,6 +14,7 @@ Original: Unity 2021.3.15f1, IL2CPP, NVN, CRIWARE movies. Target: Windows x64 fi
 - Both Claude and Codex read these project rules; the same task/state/evidence applies in either host.
 - "The owner" means the project owner (the person running this port). One lead owns integration (the coordinator chat). Use current host delegation/model policy.
 - On entry or handoff, read the coordination record in STATE. Reconcile changed policy/tools; do not make the owner repeat setup.
+- Two leads (Claude and Codex) may run at once: read your inbox in `A:\AI\Recomps\smrpg-work\mailbox\` (README there) each turn, and take `heavy.lock` for heavy work.
 - Continue routine authorized work; ask only for missing consequential choices or required gates.
 - Tasks live in `backlog/tasks/`. Only met dependencies make a task Ready. Verified is technical; Accepted adds the owner's decision.
 - Keep STATE current and decisions in docs/DECISIONS.md. Preserve unrelated work and rejected directions.
