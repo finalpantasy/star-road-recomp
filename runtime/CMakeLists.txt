@@ -17,6 +17,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+list(APPEND SMRPG_RT_SOURCES mods/postgame.c)   # task-24: unlock_postgame (the save view hle/hle_fs.c serves)
 set(SMRPG_WORK "A:/AI/Recomps/smrpg-work" CACHE PATH "work data root (extraction, build, saves)")
 set(SMRPG_GEN_DIR "${SMRPG_WORK}/build/gen_game" CACHE PATH "generated headers (ops_gen.h, interp_gen.inc, prelude.h)")
 set(SMRPG_GAME_OBJECTS "" CACHE FILEPATH "response file listing the lifted objects (build.py link.rsp); empty = runtime only")

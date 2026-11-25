@@ -6,6 +6,7 @@
  * Save data: IFileSystem objects over a host directory under hle_save_dir() on A:.
  * Layouts (RomFS header, entry formats, DirectoryEntry) are the documented Horizon formats (switchbrew "RomFS"). */
 #include "hle.h"
+#include "mods/postgame.h"   /* task-24: unlock_postgame patches the save as the game reads it */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -291,10 +292,10 @@ IFACE(g_storage_iface, "nn::fssrv::sf::IStorage", g_storage_cmds);
 
 /* ------------------------------------------------------------------ host backed IFileSystem / IFile / IDirectory */
 typedef struct HostFs { char root[512]; } HostFs;
-typedef struct HostFile { HANDLE h; int writable; } HostFile;
+typedef struct HostFile { HANDLE h; int writable; uint8_t *mem; size_t mem_n; /* task-24: patched save image served instead of the host file */ } HostFile;
 typedef struct HostDir { wchar_t dir[1024]; int filter; WIN32_FIND_DATAW *ents; int n, pos; } HostDir;
 
-static void file_dtor(void *s) { HostFile *f = s; if (f) { if (f->h != INVALID_HANDLE_VALUE) CloseHandle(f->h); free(f); } }
+static void file_dtor(void *s) { HostFile *f = s; if (f) { if (f->h != INVALID_HANDLE_VALUE) CloseHandle(f->h); free(f->mem); free(f); } }
 static void dir_dtor(void *s) { HostDir *d = s; if (d) { free(d->ents); free(d); } }
 static void fs_dtor(void *s) { free(s); }
 
@@ -306,6 +307,11 @@ static void file_read(IpcCtx *x) {
     if (!f || !b) { x->result = RES_FS_INVALID_ARG; return; }
     if (len > b->size) len = b->size;
     uint64_t got = 0;
+    if (f->mem) {   /* task-24: patched save image */
+        if (off < f->mem_n) { got = f->mem_n - off < len ? f->mem_n - off : len; memcpy((uint8_t *)b->addr, f->mem + off, (size_t)got); }
+        out_u64(x, 0, got);
+        return;
+    }
     while (got < len) {
         OVERLAPPED ov;
         memset(&ov, 0, sizeof ov);
@@ -346,6 +352,7 @@ static void file_get_size(IpcCtx *x) {
     HostFile *f = self_file(x);
     LARGE_INTEGER li = {0};
     if (f) GetFileSizeEx(f->h, &li);
+    if (f && f->mem) li.QuadPart = (LONGLONG)f->mem_n;
     out_u64(x, 0, (uint64_t)li.QuadPart);
 }
 CMD_TABLE(g_file_cmds) = {CMD(0, file_read), CMD(1, file_write), CMD(2, file_flush), CMD(3, file_set_size), CMD(4, file_get_size)};
@@ -448,6 +455,39 @@ static void fsys_entry_type(IpcCtx *x) {
     if (a == INVALID_FILE_ATTRIBUTES) { x->result = RES_FS_PATH_NOT_FOUND; return; }
     out_u32(x, 0, (a & FILE_ATTRIBUTE_DIRECTORY) ? 0 : 1);
 }
+/* task-24 unlock_postgame: a save file opened for reading is served from memory with the post-game flags set; the file on disk is not touched.
+ * The option is read once (SMRPG_UNLOCK_POSTGAME, else [gameplay] unlock_postgame in SMRPG_OPTIONS or options.ini beside the exe). Off: no read, no copy. */
+static void pg_log(void *ud, const char *line) { (void)ud; rt_log("%s", line); }
+static int pg_enabled(void) {
+    static int state = -1;
+    if (state < 0) {
+        char ini[MAX_PATH] = "";
+        const char *e = getenv("SMRPG_OPTIONS");
+        if (e && *e) snprintf(ini, sizeof ini, "%s", e);
+        else if (GetModuleFileNameA(0, ini, sizeof ini)) { char *s = strrchr(ini, 92); if (s) strcpy(s + 1, "options.ini"); else ini[0] = 0; }
+        state = postgame_enabled(ini);
+        if (state) rt_log("hle fs: unlock_postgame is ON");
+    }
+    return state;
+}
+static void save_unlock_view(HostFile *f, const wchar_t *wpath) {
+    if (!pg_enabled()) return;
+    const wchar_t *base = wcsrchr(wpath, 92), *base2 = wcsrchr(wpath, L'/');
+    if (!base || (base2 && base2 > base)) base = base2;
+    char name[260];
+    if (!wide_to_utf8(base ? base + 1 : wpath, name, sizeof name) || !postgame_is_save_name(name)) return;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(f->h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (64 << 20)) return;
+    uint8_t *in = malloc((size_t)sz.QuadPart);
+    DWORD rd = 0;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    if (!in || !ReadFile(f->h, in, (DWORD)sz.QuadPart, &rd, &ov) || rd != (DWORD)sz.QuadPart) { free(in); return; }
+    size_t n = 0;
+    uint8_t *out = postgame_filter_save(1, in, rd, &n, pg_log, 0);
+    free(in);
+    if (out) { f->mem = out; f->mem_n = n; rt_log("hle fs: save %s served with the post-game flags set (%zu bytes)", name, n); }
+}
 static void fsys_open_file(IpcCtx *x) {
     wchar_t w[1024];
     if (!path_arg(x, 0, w, 1024)) { x->result = RES_FS_INVALID_ARG; return; }
@@ -460,6 +500,7 @@ static void fsys_open_file(IpcCtx *x) {
     HostFile *f = calloc(1, sizeof *f);
     f->h = h;
     f->writable = wr;
+    if (!wr) save_unlock_view(f, w);
     out_obj(x, &g_file_iface, f);
 }
 static void fsys_open_dir(IpcCtx *x) {
