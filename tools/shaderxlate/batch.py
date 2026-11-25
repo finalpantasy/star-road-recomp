@@ -2,7 +2,9 @@
 
     python batch.py --shaders A:/AI/Recomps/smrpg-work/shaders [--jobs 16] [--limit N] [--no-val]
 
-Input: <shaders>/corpus/<key>.data|.ctrl and <shaders>/variants.jsonl (written by scan.py).
+Input: <shaders>/corpus/<key>.data|.ctrl and <shaders>/variants.jsonl (written by scan.py), plus the
+programs the game binds outside the Unity bundles, dumped by the runtime into <shaders>/missing
+(NVN_DUMP_MISSING; same layout, stage from the control section).
 Output: <shaders>/cache/v1/ as in docs/SHADER_CACHE.md (index.jsonl, spv/, meta/, variants.jsonl,
 report.json). Runs at BelowNormal priority.
 """
@@ -39,8 +41,8 @@ def _write_atomic(path, data, mode='wb'):
 
 
 def work(item):
-    key, stage = item
-    corpus, out = G['corpus'], G['out']
+    key, stage, corpus = item
+    corpus, out = corpus or G['corpus'], G['out']
     t0 = time.perf_counter()
     rec = {'key': key, 'stage': stage, 'translator': translate.TRANSLATOR}
     try:
@@ -111,6 +113,9 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--no-val', action='store_true')
     ap.add_argument('--keys', help='file with one key per line (subset run)')
+    ap.add_argument('--extra', action='append',
+                    help='directory of programs the game binds outside the Unity bundles (corpus layout, '
+                         'stage from the control section); default <shaders>/missing when it exists')
     a = ap.parse_args()
     container.below_normal()
     corpus = os.path.join(a.shaders, 'corpus')
@@ -122,6 +127,19 @@ def main():
             v = json.loads(line)
             for st, k in (v.get('stages') or {}).items():
                 stages[k] = st
+    # programs dumped at run time (NVN_DUMP_MISSING, task-12): keyed by the same SHA-256 of the data
+    # section, stage from control word 0x714
+    src = {}
+    extra = a.extra if a.extra is not None else [d for d in [os.path.join(a.shaders, 'missing')] if os.path.isdir(d)]
+    for d in extra:
+        for f in sorted(os.listdir(d)):
+            if not f.endswith('.data'):
+                continue
+            k = f[:-5]
+            st = translate.nvn_stage(open(os.path.join(d, k + '.ctrl'), 'rb').read())
+            if st and k not in stages:
+                stages[k] = st
+                src[k] = d
     keys = sorted(stages)
     if a.keys:
         want = [x.strip() for x in open(a.keys) if x.strip()]
@@ -131,7 +149,7 @@ def main():
     t0 = time.time()
     recs = []
     with mp.Pool(a.jobs, _init, (corpus, out, not a.no_val)) as pool:
-        for k, rec in enumerate(pool.imap_unordered(work, [(k, stages[k]) for k in keys], chunksize=8)):
+        for k, rec in enumerate(pool.imap_unordered(work, [(k, stages[k], src.get(k)) for k in keys], chunksize=8)):
             recs.append(rec)
             if (k + 1) % 2000 == 0:
                 print('%d/%d %.0fs' % (k + 1, len(keys), time.time() - t0), flush=True)
@@ -141,6 +159,8 @@ def main():
     with open(os.path.join(out, idx_name), 'w') as f:
         for r in recs:
             line = {k: r.get(k) for k in ('key', 'stage', 'status', 'reason', 'spv', 'meta', 'insns', 'translator')}
+            if r['key'] in src:
+                line['source'] = 'nvn_dump'
             f.write(json.dumps(line) + '\n')
     if full:
         shutil.copyfile(os.path.join(a.shaders, 'variants.jsonl'), os.path.join(out, 'variants.jsonl'))
@@ -174,6 +194,8 @@ def main():
                       'fail': sum(r.get('spirv_val') == 'fail' for r in recs),
                       'tool': translate.SPIRV_VAL, 'target_env': 'vulkan1.3'},
         'variants': {'total': vtot, 'all_stages_ok': vok},
+        'nvn_dump_programs': {'total': sum(r['key'] in src for r in recs),
+                              'ok': sum(r['key'] in src and r['status'] == 'ok' for r in recs)},
         'failure_reasons': [{'reason': k, 'count': n, 'example_key': examples[k]} for k, n in reasons.most_common()],
         'seconds': round(time.time() - t0, 1), 'jobs': a.jobs, 'full_run': full,
     }
@@ -184,7 +206,7 @@ def main():
         for r in recs:
             if r['status'] == 'failed':
                 f.write(json.dumps(r) + '\n')
-    print(json.dumps({k: report[k] for k in ('programs', 'ok', 'failed', 'cf_mode', 'spirv_val', 'variants', 'seconds')}))
+    print(json.dumps({k: report[k] for k in ('programs', 'ok', 'failed', 'cf_mode', 'spirv_val', 'variants', 'nvn_dump_programs', 'seconds')}))
     for x in report['failure_reasons'][:25]:
         print('%6d  %s  %s' % (x['count'], x['reason'], x['example_key'][:16]))
 

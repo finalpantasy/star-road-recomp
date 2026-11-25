@@ -33,7 +33,7 @@ EXT_U2 = {'umin': 'UMin', 'umax': 'UMax', 'smin': 'SMin', 'smax': 'SMax'}
 EXT_F1 = {'fsin': 'Sin', 'fcos': 'Cos', 'fex2': 'Exp2', 'flg2': 'Log2', 'frsq': 'InverseSqrt',
           'fsqrt': 'Sqrt', 'ffloor': 'Floor', 'fceil': 'Ceil', 'ftrunc': 'Trunc', 'fround': 'RoundEven',
           'fabs': 'FAbs'}
-STATEMENTS = {'rset', 'pset', 'out', 'stl', 'demote', 'gs_emit', 'gs_cut'}
+STATEMENTS = {'rset', 'pset', 'out', 'stl', 'demote', 'gs_emit', 'gs_cut', 'sust'}
 
 
 class EmitError(Exception):
@@ -90,7 +90,7 @@ def analyze(fn):
                     live.add(o.attr)
                 elif o.op == 'pget':
                     live.add(('p', o.attr))
-                args = o.args[1:] if o.op == 'tex' else o.args
+                args = o.args[1:] if o.op in ('tex', 'txq', 'sust') else o.args
                 for a in args:
                     need.add(a.n)
         if mark is not None:
@@ -279,6 +279,8 @@ class Emitter:
         self.ubos = {}
         self.textures = {}
         self.manifest_tex = []
+        self.manifest_img = []
+        self.images = {}
         self.manifest_ubo = []
         self.manifest_ssbo = []
         self.ssbos = {}
@@ -341,9 +343,18 @@ class Emitter:
             self.m.name(v, 'P%s' % p)
         return v
 
+    @property
+    def T_v3u(self):
+        return self.m.t_vec(self.T_u32, 3)
+
     def io_var(self, sc, ty, name, init=False):
         m = self.m
-        if init:
+        if init == 'w1':
+            # Pre-rasterization outputs a program never writes read as (0, 0, 0, 1), as on hardware
+            # (an unwritten position.w of 0 would clip every primitive away).
+            z = m.const_f32(0.0)
+            v = m.gvar(m.t_ptr(sc, ty), sc, m.const_composite(ty, z, z, z, m.const_f32(1.0)))
+        elif init:
             v = m.gvar(m.t_ptr(sc, ty), sc, m.const_null(ty))
         else:
             v = m.gvar(m.t_ptr(sc, ty), sc)
@@ -381,6 +392,9 @@ class Emitter:
         elif kind == 'instance_id':
             v = self.io_var('Input', self.T_i32, 'InstanceIndex')
             m.deco(v, 'BuiltIn', 43)
+        elif kind in ('local_invocation_id', 'workgroup_id'):
+            v = self.io_var('Input', self.T_v3u, 'LocalInvocationId' if kind[0] == 'l' else 'WorkgroupId')
+            m.deco(v, 'BuiltIn', 27 if kind[0] == 'l' else 26)
         elif kind == 'lane_id':
             m.cap('GroupNonUniform')
             v = self.io_var('Input', self.T_u32, 'SubgroupLocalInvocationId')
@@ -399,7 +413,7 @@ class Emitter:
             return v
         m = self.m
         if kind == 'gen':
-            v = self.io_var('Output', self.T_v4f, 'out%d' % idx, init=True)
+            v = self.io_var('Output', self.T_v4f, 'out%d' % idx, init=True if 'gen_null' in lift.COMPAT else 'w1')
             m.deco(v, 'Location', idx)
         elif kind == 'frag':
             v = self.io_var('Output', self.T_v4f, 'rt%d' % idx, init=True)
@@ -408,7 +422,7 @@ class Emitter:
             v = self.io_var('Output', self.T_f32, 'FragDepth')
             m.deco(v, 'BuiltIn', 22)
         elif kind == 'position':
-            v = self.io_var('Output', self.T_v4f, 'Position', init=True)
+            v = self.io_var('Output', self.T_v4f, 'Position', init='w1')
             m.deco(v, 'BuiltIn', 0)
             m.deco(v, 'Invariant')
         elif kind == 'point_size':
@@ -437,6 +451,7 @@ class Emitter:
         """Assign bindings: UBOs (by c-buffer slot) then textures, compact from 1."""
         slots = {}
         texkeys = []
+        imgkeys = set()
         sbs = set()
         for b in blocks:
             for o in b.ops:
@@ -448,9 +463,11 @@ class Emitter:
                     slots[o.attr] = max(slots.get(o.attr, 0), hi)
                 elif o.op == 'sload':
                     sbs.add(o.attr)
-                elif o.op == 'tex':
+                elif o.op in ('tex', 'txq', 'sust'):
                     k = o.attr['tkey']['key']
-                    if k not in texkeys:
+                    if k[0] == 'img':
+                        imgkeys.add(k[1])
+                    elif k not in texkeys:
                         texkeys.append(k)
         m = self.m
         binding = 1
@@ -498,6 +515,30 @@ class Emitter:
                 'binding': binding, 'dim': dim + ('_array' if arr else ''), 'shadow': bool(dc),
                 'array_len': 1, 'handle': {'cbuf': h[0], 'offset': hoff},
                 'sampler_handle': ({'cbuf': s[0], 'offset': soff} if s else None), 'nvn': nvn})
+            if dim == '2dms':
+                self.manifest_tex[-1]['multisample'] = True
+            binding += 1
+        for loc in sorted(imgkeys):
+            # storage image, format unknown (written as float texels): NVN image slot k at
+            # c[2][0x120 + 8k], after the 32 combined texture handles at 0x20 + 8k
+            d = self.info.images[loc]
+            dim, arr = d['dim'], d['arr']
+            img = m.t_image(self.T_f32, DIM_SPV[dim], 0, 1 if arr else 0, 0, 2, 0)
+            if dim == '1d':
+                m.cap('Image1D')
+            m.cap('StorageImageWriteWithoutFormat')
+            var = m.gvar(m.t_ptr('UniformConstant', img), 'UniformConstant')
+            m.name(var, 'img%d' % binding)
+            m.deco(var, 'DescriptorSet', self.set)
+            m.deco(var, 'Binding', binding)
+            self.images[loc] = (var, img, dim, arr)
+            off = loc[1]
+            if loc[0] == 2 and 0x120 <= off < 0x160 and (off - 0x120) % 8 == 0:
+                nvn = {'kind': 'image', 'index': (off - 0x120) // 8}
+            else:
+                nvn = {'kind': 'raw', 'index': -1}
+            self.manifest_img.append({'binding': binding, 'dim': dim + ('_array' if arr else ''), 'format': 'unknown',
+                                      'handle': {'cbuf': loc[0], 'offset': off}, 'nvn': nvn})
             binding += 1
         for k in sorted(sbs):
             # read-only storage buffer: NVN storage descriptor k (c[0][0x110 + 16k]), bound at the
@@ -685,6 +726,17 @@ class Emitter:
                     self.ins('Store', ptr, self.get(o.args[1], 'u32'))
             elif op == 'tex':
                 r = self.gen_tex(o)
+            elif op == 'txq':
+                r = self.gen_txq(o)
+            elif op == 'sust':
+                at = o.attr
+                var, img, _, _ = self.images[at['tkey']['key'][1]]
+                nc = at['ncoord']
+                args = o.args[1:]
+                ci = [self.new('Bitcast', self.T_i32, self.get(c, 'u32')) for c in args[:nc]]
+                coord = ci[0] if nc == 1 else self.new('CompositeConstruct', self.T_ivec[nc], *ci)
+                texel = self.new('CompositeConstruct', self.T_v4f, *[self.get(t, 'f32') for t in args[nc:nc + 4]])
+                self.ins('ImageWrite', self.new('Load', img, var), coord, texel)
             elif op == 'quad_bcast':
                 m.cap('GroupNonUniform')
                 m.cap('GroupNonUniformQuad')
@@ -780,6 +832,11 @@ class Emitter:
         if o.attr == 'lane_id':
             self.uses_lane = True
             return self.new('Load', self.T_u32, self.input_var('lane_id', 0))
+        if self.stage == 'cs' and o.attr[:-1] in ('tid', 'ctaid'):
+            # S2R SR_TID.X/Y/Z, SR_CTAID.X/Y/Z
+            kind = 'local_invocation_id' if o.attr[:-1] == 'tid' else 'workgroup_id'
+            vec = self.new('Load', self.T_v3u, self.input_var(kind, 0))
+            return self.new('CompositeExtract', self.T_u32, vec, int(o.attr[-1]))
         raise EmitError('builtin %s' % o.attr)
 
     def gen_out(self, o):
@@ -822,6 +879,41 @@ class Emitter:
         r = self.new('FAdd', self.T_f32, av, bv)
         self.noc.append(r)
         return r
+
+    TXQ_DIMS = {'1d': 1, '2d': 2, '3d': 3, 'cube': 2, '2dms': 2}
+
+    def gen_txq(self, o):
+        """TXQ dimension query, one component: 0..2 size at the given level (width, height, depth or
+        layers), 3 the mip level count. A component the image type does not have reads 1."""
+        m = self.m
+        m.cap('ImageQuery')
+        at = o.attr
+        key = at['tkey']['key']
+        comp = at['comp']
+        if key[0] == 'img':
+            var, img, dim, arr = self.images[key[1]]
+            image = self.new('Load', img, var)
+            storage = True
+        else:
+            var, img, simg = self.textures[key]
+            (_, dim, arr, _) = key
+            image = self.new('Image', img, self.new('Load', simg, var))
+            storage = False
+        n = self.TXQ_DIMS[dim] + (1 if arr else 0)
+        if comp == 3:
+            if storage or dim == '2dms':
+                return self.cu(1)
+            return self.new('Bitcast', self.T_u32, self.new('ImageQueryLevels', self.T_i32, image))
+        if comp >= n:
+            return self.cu(1)
+        if storage or dim == '2dms':
+            size = self.new('ImageQuerySize', self.T_ivec[n], image)
+        else:
+            lod = self.new('Bitcast', self.T_i32, self.get(o.args[1], 'u32'))
+            size = self.new('ImageQuerySizeLod', self.T_ivec[n], image, lod)
+        if n > 1:
+            size = self.new('CompositeExtract', self.T_i32, size, comp)
+        return self.new('Bitcast', self.T_u32, size)
 
     def gen_tex(self, o):
         m = self.m
@@ -1133,6 +1225,13 @@ class Emitter:
             Module.ins(m.modes, 'ExecutionMode', fid, 0, g['invocations'])
             Module.ins(m.modes, 'ExecutionMode', fid, 26, g['max_vertices'])
             Module.ins(m.modes, 'ExecutionMode', fid, self.GS_TOPOLOGY[g['topo']][1])
+        elif self.stage == 'cs':
+            # The NVN dispatch gives the workgroup size; the runtime passes it as specialization
+            # constants 0..2 (defaults: the size in the program's control section).
+            ls = self.local_size()
+            Module.ins(m.modes, 'ExecutionMode', fid, 17, *ls)      # LocalSize
+            wg = m.spec_composite(self.T_v3u, *[m.spec_u32(k, ls[k]) for k in range(3)])
+            m.deco(wg, 'BuiltIn', 25)                               # WorkgroupSize
         m.name(fid, 'main')
         return m.assemble()
 
@@ -1177,9 +1276,9 @@ class Emitter:
                 bout.append({'depth': 'frag_depth', 'viewport': 'viewport_index'}.get(kind, kind))
         bin_ = sorted({'position_v': 'position'}.get(k, k) for (k, _) in self.inputs if k not in ('gen', 'gen_v'))
         d = {'key': key, 'stage': self.stage, 'spirv_version': '1.3', 'sets': {'set': self.set},
-             'ubos': self.manifest_ubo, 'textures': self.manifest_tex, 'images': [], 'ssbos': self.manifest_ssbo,
+             'ubos': self.manifest_ubo, 'textures': self.manifest_tex, 'images': self.manifest_img, 'ssbos': self.manifest_ssbo,
              'inputs': ins, 'outputs': outs, 'builtins_in': bin_, 'builtins_out': bout,
-             'local_size': [1, 1, 1], 'shared_bytes': 0,
+             'local_size': list(self.local_size()), 'shared_bytes': 0,
              'local_bytes': 4 * getattr(self, 'local_len', 0),
              'requires': {'subgroup_size_32': self.uses_lane and not self._lane_quad_only(),
                           'fragment_shader_interlock': False, 'geometry_passthrough': False},
@@ -1194,6 +1293,9 @@ class Emitter:
             d['frag'] = {'rt_mask': info.rt_mask, 'writes_depth': info.writes_depth,
                          'early_fragment_tests': False, 'discards': info.demotes}
         return d
+
+    def local_size(self):
+        return tuple(getattr(self.p, 'local_size', None) or (1, 1, 1))
 
     def _lane_quad_only(self):
         return False

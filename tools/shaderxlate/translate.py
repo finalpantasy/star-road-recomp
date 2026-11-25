@@ -4,6 +4,7 @@
 """
 import argparse
 import os
+import struct
 import subprocess
 import sys
 
@@ -23,7 +24,25 @@ class Failed(Exception):
 
 def program_of(stage, control, data):
     st = NvnStage(stage, control, data)
-    return lift.Program(stage, st.code, st.sph, st.consts, st.key)
+    prog = lift.Program(stage, st.code, st.sph, st.consts, st.key)
+    if stage == 'cs':
+        prog.local_size = local_size(control)
+    return prog
+
+
+def nvn_stage(control):
+    """Stage named by the control section (word 0x714: NVN shader stage 0 vertex, 1 fragment,
+    2 geometry, 3 tess control, 4 tess evaluation, 5 compute)."""
+    v = struct.unpack_from('<I', control, 0x714)[0]
+    return {0: 'vs', 1: 'fs', 2: 'gs', 3: 'tcs', 4: 'tes', 5: 'cs'}.get(v)
+
+
+def local_size(control):
+    """Compute workgroup size from the control section (words 0x748, 0x74c, 0x750)."""
+    ls = struct.unpack_from('<3I', control, 0x748)
+    if not all(1 <= x <= 1024 for x in ls) or ls[0] * ls[1] * ls[2] > 1024:
+        raise Failed('compute local size %r out of range' % (ls,))
+    return ls
 
 
 def translate(stage, control, data, mode='structured'):
@@ -57,7 +76,7 @@ def main():
     a = ap.parse_args()
     data = open(os.path.join(a.corpus, a.key + '.data'), 'rb').read()
     ctrl = open(os.path.join(a.corpus, a.key + '.ctrl'), 'rb').read()
-    stage = a.stage or 'fs'
+    stage = a.stage or nvn_stage(ctrl) or 'fs'
     if a.dump:
         fn, info = lift.lift(program_of(stage, ctrl, data))
         print(fn.dump())

@@ -15,7 +15,7 @@ OP = dict(
     CompositeExtract=81, CompositeInsert=82, SampledImage=86, ImageSampleImplicitLod=87,
     ImageSampleExplicitLod=88, ImageSampleDrefImplicitLod=89, ImageSampleDrefExplicitLod=90,
     ImageFetch=95, ImageGather=96, ImageDrefGather=97, ImageQuerySizeLod=103, ImageQueryLevels=106,
-    Image=100, ImageQueryLod=105,
+    Image=100, ImageQueryLod=105, ImageQuerySize=104, ImageRead=98, ImageWrite=99, SpecConstantComposite=51,
     ConvertFToU=109, ConvertFToS=110, ConvertSToF=111, ConvertUToF=112, UConvert=113, SConvert=114,
     FConvert=115, Bitcast=124, SNegate=126, FNegate=127, IAdd=128, FAdd=129, ISub=130, FSub=131,
     IMul=132, FMul=133, UDiv=134, SDiv=135, FDiv=136, UMod=137, IAddCarry=149,
@@ -231,6 +231,11 @@ class Module:
         c = self.id()
         self.ins(self.globals, 'SpecConstant', self.t_u32(), c, default)
         self.deco(c, 'SpecId', spec_id)
+        return c
+
+    def spec_composite(self, t, *parts):
+        c = self.id()
+        self.ins(self.globals, 'SpecConstantComposite', t, c, *parts)
         return c
 
     def gvar(self, ptr_t, sc, init=None):

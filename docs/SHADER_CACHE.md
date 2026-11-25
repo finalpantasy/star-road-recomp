@@ -45,6 +45,12 @@ as present only when the index line says `ok` and both files load.
 ```
 
 `failed` entries name the reason (for example an unsupported opcode with its address). For a
+Programs the game binds that are not in its Unity shader bundles (library shaders, dumped by the
+runtime with `NVN_DUMP_MISSING=<shaders>/missing`, same `<key>.data` plus `<key>.ctrl` layout and
+the same key) are translated by every full `batch.py` run and their lines add `"source":
+"nvn_dump"`; their stage comes from control section word `+0x714` (NVN stage: 0 vertex, 1 fragment,
+2 geometry, 3 tess control, 4 tess evaluation, 5 compute).
+
 failed key the runtime uses the fallback chain in RECOMPILER.md section 5: a hand-written
 replacement at `replace/<key>.spv` plus `replace/<key>.json` (same manifest format) if present,
 otherwise it skips the draw and logs the key once.
@@ -107,7 +113,18 @@ Rules the consumer can rely on:
   constant addresses (`STL` then `LDL` of the same word), and predicated writes: a texture
   instruction under predicate P sees a handle written under the opposite polarity of P only as the
   value from before that write. Multisample fetches (`TLD.MS`, 2D only) use a multisampled image
-  (`dim` `2dms`) and pass the sample index as the `Sample` operand.
+  (`dim` `2dms`, entry adds `"multisample": true`) and pass the sample index as the `Sample` operand.
+  Size queries (`TXQ.B`, and bound `TXQ` whose handle is word `TidB` of `c[2]`, query 1 only:
+  width, height, depth or layers at the given level, and the level count) use the binding of another
+  access to the same handle (a storage image first, then a sampled texture); a query with no other
+  access gets a 2D texture binding, 3D when it asks for depth. A component the image type does not
+  have reads 1.
+- **Images**: `SUST.B` (formatted store, full RGBA mask, ignore-out-of-range clamp) writes a storage
+  image declared with format `Unknown` (`shaderStorageImageWriteWithoutFormat`) and float texels.
+  `handle` is the `c[2]` word of the bindless handle; `nvn.kind` `image` with `index = (offset -
+  0x120) / 8` (NVN image slots follow the 32 combined texture handles at `0x20 + 8k`), or `raw` with
+  `index` -1 outside that range. The runtime binds the image the program's `nvnCommandBufferBindImage`
+  slot names as `STORAGE_IMAGE`.
 - **Storage buffers**: global memory accesses whose address comes from an NVN storage descriptor
   (`c[0][0x110 + 16i]`: u64 address, u32 size) become SSBO `nvn_index` i, declared as a
   `uint[]` runtime array (`NonWritable` when `write` is false). The shader reads the descriptor's
@@ -150,10 +167,11 @@ Rules the consumer can rely on:
   (`VK_EXT_subgroup_size_control`); on a device without it the runtime logs the key once.
 - **Local memory**: `local_bytes` is the per-invocation local array size the translator sized from
   the program (largest `LDL`/`STL` offset plus width); nothing to bind.
-- **Compute**: `local_size` from the dispatch parameters NVN gives at dispatch time is not in the
-  program; v1 emits `LocalSize` from a specialization constant triple (ids 0, 1, 2, default 1)
-  which the consumer sets to the NVN `ComputeLocalSize`. `shared_bytes` likewise is the size the
-  program can address.
+- **Compute**: `local_size` is the workgroup size in the program's control section (words
+  `+0x748`, `+0x74c`, `+0x750`). The module declares `LocalSize` with those values and a
+  `WorkgroupSize` built-in made of specialization constants ids 0, 1, 2 (same defaults), which the
+  consumer may override. `S2R` `SR_TID` and `SR_CTAID` read `LocalInvocationId` and `WorkgroupId`.
+  `shared_bytes` is the size the program can address.
 - **Control flow**: `cf_mode` is `structured` (Maxwell branches rebuilt as SPIR-V selection and
   loop constructs) or `dispatcher` (a block-index loop with a switch, used when the CFG cannot be
   structured; `cf_fallback` gives the reason, null otherwise). Both are valid SPIR-V; dispatcher
@@ -174,7 +192,9 @@ Rules the consumer can rely on:
   only to mirror known oracle behavior during differential tests: `ipa_mul` (literal
   `IPA.MUL` multiply), `half_fold` (skip fp16 rounding between half ops), `no_fmz` (ignore the
   `FMUL`/`FFMA` `.FMZ` zero rule) and `fminmax` (`FMin`/`FMax` instead of `NMin`/`NMax`, so a NaN
-  operand gives an undefined result instead of the other operand). The shipped cache is
+  operand gives an undefined result instead of the other operand) and `gen_null` (generic
+  outputs start at 0 instead of (0, 0, 0, 1); Ryubing initializes only the components the next
+  stage reads, so with no next stage in the harness the rest read 0). The shipped cache is
   always built with `SXL_COMPAT` unset (`batch.py` refuses to run while it is set).
 - **Carry flag**: `IADD.CC`/`.X` carries are internal to a module and add no interface.
 
@@ -224,3 +244,9 @@ differences a reader must handle (all additive; a reader written for both caches
 - v1 (2026-11-24, additive): geometry stage (`geometry` manifest object), multisample fetch
   (`dim` `2dms`), jump-table `BRX`, `VMAD`/`VMNMX`/`VSETP`; the bindless trace follows local-memory
   spills and predicated handle writes. Every program in the corpus now translates (0 failures).
+- v1 (2026-11-25, additive): `TXQ`/`TXQ.B` size queries, `SUST.B` storage images (`images`
+  entries), compute modules (workgroup size from the control section), `"multisample": true` on
+  `2dms` textures, and index lines with `"source": "nvn_dump"` for the library programs the runtime
+  dumps into `<shaders>/missing`. Changes every module with vertex outputs: position and generic
+  outputs now start at (0, 0, 0, 1) instead of 0, so components a program never writes read as on
+  hardware (the built-in blit VS writes only position .xy; w of 0 clipped everything).

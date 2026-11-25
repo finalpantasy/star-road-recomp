@@ -25,6 +25,7 @@ NOP_OPS = {'nop', 'depbar', 'membar', 'votevtg', 'cctl', 'pbk', 'ssy', 'pcnt'}
 TEX_DIMS = {0: ('1d', False), 1: ('1d', True), 2: ('2d', False), 3: ('2d', True), 4: ('3d', False),
             5: ('3d', True), 6: ('cube', False), 7: ('cube', True)}
 DIM_COORDS = {'1d': 1, '2d': 2, '3d': 3, 'cube': 3, '2dms': 2}
+SU_DIMS = {0: ('1d', False), 2: ('1d', True), 3: ('2d', False), 4: ('2d', True), 5: ('3d', False)}  # 1: buffer
 
 
 class Program:
@@ -41,7 +42,8 @@ class Program:
 class Info:
     def __init__(self):
         self.textures = {}      # key -> dict
-        self.inputs = {}        # location -> set of comps; plus interp
+        self.images = {}        # handle location (cbuf, offset) -> dict (storage images, SUST/SULD)
+        self.inputs = {}      # location -> set of comps; plus interp
         self.input_interp = {}  # location -> mode
         self.outputs = {}       # location -> set comps
         self.builtins_in = set()
@@ -1957,6 +1959,81 @@ class Lifter:
     def i_tld4_b(self, i):
         self.tex_common(i, 'tld4')
 
+    def txq_common(self, i, bindless):
+        """TXQ / TXQ.B: texture header queries. Query 1 (dimension) writes, for each set mask bit in
+        order, width, height, depth or layers, and the mip level count to rd, rd+1, ... (rd = RZ: no
+        write). Sources: Ra = handle (bindless only), then the level of detail. A bound TXQ names its
+        handle by word index TidB in the texture binding buffer c[2]."""
+        query = i.f(22, 6)
+        mask = i.f(31, 4)
+        if query != 1:
+            raise Unsupported('TXQ query %d' % query)
+        rd = i.rd
+        if rd == RZ or not mask:
+            return
+        ra = i.ra
+
+        def take_a():
+            nonlocal ra
+            if ra == RZ:
+                return self.const(0)
+            v = self.rget(ra)
+            ra += 1
+            return v
+        handle = take_a() if bindless else self.const(0)
+        lod = take_a()
+        self._tex_pending = getattr(self, '_tex_pending', [])
+        rec = {'handle': handle, 'dim': None, 'arr': False, 'dc': False, 'addr': i.addr, 'block': self.cur,
+               'pi': self.cur_pi, 'query': True, 'qmask': mask}
+        if not bindless:
+            rec['loc'] = ((2, 4 * i.f(36, 13)), None)
+        self._tex_pending.append(rec)
+        out = rd
+        for c in range(4):
+            if mask & (1 << c):
+                self.rset(out, self.emit('txq', 'u32', handle, lod, attr=dict(comp=c, tkey=rec)))
+                out += 1
+                if out >= RZ:
+                    break
+
+    def i_sust_b(self, i):
+        """SUST.B formatted store: coordinates from Ra (x, y, z, then the array layer), the RGBA
+        texel from Rd.., the bindless image handle in Rc (bits 39-46). Only the full RGBA mask and the
+        ignore-out-of-range clamp mode are handled."""
+        dc = i.f(33, 3)
+        if dc not in SU_DIMS:
+            raise Unsupported('SUST dimension %d' % dc)
+        dim, arr = SU_DIMS[dc]
+        mask = i.f(20, 4)
+        if mask != 0xF:
+            raise Unsupported('SUST component mask %#x' % mask)
+        if i.f(49, 2) != 0:
+            raise Unsupported('SUST clamp mode %d' % i.f(49, 2))
+        rc = i.f(39, 8)
+        handle = self.const(0) if rc == RZ else self.rget(rc)
+        regs = {'a': i.ra, 'd': i.rd}
+
+        def take(k):
+            r = regs[k]
+            if r == RZ:
+                return self.const(0)
+            regs[k] = r + 1
+            return self.rget(r)
+        n = DIM_COORDS[dim]
+        coords = [take('a') for _ in range(n + (1 if arr else 0))]
+        texel = [take('d') for _ in range(4)]
+        self._tex_pending = getattr(self, '_tex_pending', [])
+        rec = {'handle': handle, 'dim': dim, 'arr': arr, 'dc': False, 'addr': i.addr, 'block': self.cur,
+               'pi': self.cur_pi, 'image': True}
+        self._tex_pending.append(rec)
+        self.emit('sust', 'void', handle, *(coords + texel), attr=dict(tkey=rec, dim=dim, arr=arr, ncoord=len(coords)))
+
+    def i_txq_b(self, i):
+        self.txq_common(i, True)
+
+    def i_txq(self, i):
+        self.txq_common(i, False)
+
     def i_tex(self, i):
         raise Unsupported('TEX (bound)')
 
@@ -2066,16 +2143,42 @@ class Lifter:
         return None
 
     def resolve_textures(self):
-        for rec in getattr(self, '_tex_pending', []):
-            s = self.value_sym(rec['block'], rec['handle'], {'pi': rec.get('pi')})
-            loc = None
-            if s and s[0] == 'cb' and s[1] == 2:
+        pend = getattr(self, '_tex_pending', [])
+        # sampling ops first, so a size query can share the binding of a sample of the same handle
+        for rec in [r for r in pend if not r.get('query')] + [r for r in pend if r.get('query')]:
+            s = None if 'loc' in rec else self.value_sym(rec['block'], rec['handle'], {'pi': rec.get('pi')})
+            loc = rec.get('loc')
+            if loc is not None:
+                pass
+            elif s and s[0] == 'cb' and s[1] == 2:
                 loc = ((2, s[2]), None)
             elif s and s[0] == 'or' and s[1][0] == 'cb' and s[2][0] == 'cb' and s[1][1] == 2 and s[2][1] == 2:
                 t, smp = sorted([s[1][2], s[2][2]])
                 loc = ((2, t), (2, smp))
             if loc is None:
                 raise Unsupported('bindless texture handle not traced to c[2] (sym %r) at %#x' % (s, rec['addr']))
+            if rec.get('image'):
+                if loc[1] is not None:
+                    raise Unsupported('image handle with a sampler part at %#x' % rec['addr'])
+                prev = self.info.images.get(loc[0])
+                if prev and (prev['dim'], prev['arr']) != (rec['dim'], rec['arr']):
+                    raise Unsupported('image %r used with two dimensions' % (loc[0],))
+                self.info.images[loc[0]] = {'handle': loc[0], 'dim': rec['dim'], 'arr': rec['arr']}
+                rec['key'] = ('img', loc[0])
+                continue
+            if rec.get('query'):
+                # The header query needs an image type the instruction does not give. Use the type of
+                # another access to the same handle (a storage image first, then a sample); with none, a
+                # 2D texture, or 3D when depth is asked for.
+                img = self.info.images.get(loc[0]) if loc[1] is None else None
+                if img is not None:
+                    rec['key'] = ('img', loc[0])
+                    continue
+                same = [k for k in self.info.textures if k[0] == loc]
+                if same:
+                    rec['key'] = min(same, key=lambda k: (k[3], str(k)))
+                    continue
+                rec['dim'] = '3d' if rec['qmask'] & 4 else '2d'
             key = (loc, rec['dim'], rec['arr'], rec['dc'])
             rec['key'] = key
             self.info.textures.setdefault(key, {'handle': loc[0], 'sampler': loc[1], 'dim': rec['dim'],

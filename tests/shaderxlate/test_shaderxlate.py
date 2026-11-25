@@ -198,6 +198,38 @@ def vs_position_invariant():
 
 
 @test
+def vs_unwritten_outputs_default_w1():
+    # Position and generic outputs start at (0, 0, 0, 1): a blit VS that writes only .xy (the game's
+    # built-in MSAA resolve VS) must still give w = 1, or every primitive is clipped.
+    ast = lambda src, a, n: ins('ast', '-', rd=src, ra=0xFF, b20=(a, 11), b47=(n - 1, 2), b39=(0xFF, 8))
+    code = pack_code([mov32i(0, 0), mov32i(1, 0), ast(0, 0x70, 2), ast(0, 0x80, 2), exit_(), bra(-8)])
+    fn, info, spv, em = full(build('vs', code, vs_sph()))
+    w = struct.unpack('<%dI' % (len(spv) // 4), spv)
+    i, consts, comps, init, builtin, names = 5, {}, {}, {}, {}, {}
+    while i < len(w):
+        n, op = w[i] >> 16, w[i] & 0xFFFF
+        if op == 43 and n == 4:
+            consts[w[i + 2]] = w[i + 3]
+        elif op == 44:
+            comps[w[i + 2]] = w[i + 3:i + n]
+        elif op == 59 and n == 5 and w[i + 3] == 3:
+            init[w[i + 2]] = w[i + 4]
+        elif op == 71 and w[i + 2] == 11:
+            builtin[w[i + 1]] = w[i + 3]
+        elif op == 71 and w[i + 2] == 30:
+            names[w[i + 1]] = w[i + 3]
+        i += n
+    pos = [v for v, b in builtin.items() if b == 0 and v in init]
+    gen = [v for v, l in names.items() if l == 0 and v in init]
+    assert pos and gen, (builtin, names, init)
+    for v in (pos[0], gen[0]):
+        parts = comps[init[v]]
+        assert [consts[c] for c in parts] == [0, 0, 0, 0x3F800000], parts
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+
+
+@test
 def vtg_cull_exit_not_taken():
     """VOTE.VTG then EXIT with a condition-code test: a cull hint, never an unconditional exit."""
     ast = lambda src, a, n: ins('ast', '-', rd=src, ra=0xFF, b20=(a, 11), b47=(n - 1, 2), b39=(0xFF, 8))
@@ -519,6 +551,150 @@ def vsetp_compares_selected_bytes():
     assert cmps and any(root(c.args[0]).op == 'bfe_u' or c.args[0].op == 'bfe_u' for c in cmps), cmps
 
 
+def spv_opcodes(spv):
+    w = struct.unpack('<%dI' % (len(spv) // 4), spv)
+    out, k = [], 5
+    while k < len(w):
+        out.append(w[k] & 0xFFFF)
+        k += w[k] >> 16
+    return out
+
+
+def c2_handle(rd, tex_off, smp_off=None):
+    """MOV rd, c[2][tex_off] (then LOP.OR rd, rd, c[2][smp_off])."""
+    out = [ins('mov', 'C', rd=rd, ra=0, b20=(tex_off >> 2, 14), b34=(2, 5), b39=(0xF, 4))]
+    if smp_off is not None:
+        out.append(ins('lop', 'C', rd=rd, ra=rd, b20=(smp_off >> 2, 14), b34=(2, 5), b41=(1, 2), b48=(7, 3)))
+    return out
+
+
+TXQ_B = 0xdf50000180470000        # TXQ.B R0, R0, TEX_HEADER_DIMENSION, mask xy
+TXQ_BOUND = 0xdf48048380470000    # TXQ R0, R0, TidB 0x48 (c[2][0x120]), TEX_HEADER_DIMENSION, mask xyz
+SUST_B_3D = 0xeb20038a00f70400    # SUST.B.3D.P.RGBA [R4], R0, R7
+
+
+def txq_mask(w, mask):
+    return (w & ~(0xF << 31)) | (mask << 31)
+
+
+@test
+def txq_b_size_query():
+    """TXQ.B dimension query with mask xy: width and height of the level in Ra+1 into R0, R1, through
+    a 2D binding for the separate texture and sampler words of the handle."""
+    txq = TXQ_B | 4 << 8
+    code = pack_code(c2_handle(4, 0x168, 0x568) + [mov32i(5, 0), txq, exit_(), bra(-8)])
+    fn, info, spv, em = full(build('fs', code, fs_sph()))
+    q = [o for o in ops_of(fn) if o.op == 'txq']
+    assert sorted(o.attr['comp'] for o in q) == [0, 1], q
+    t = em.manifest('k')['textures']
+    assert len(t) == 1 and t[0]['dim'] == '2d' and t[0]['nvn'] == {'kind': 'separate', 'index': 0, 'sampler_index': 0}, t
+    assert 103 in spv_opcodes(spv), 'no OpImageQuerySizeLod'
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+
+
+@test
+def txq_b_levels_and_absent_depth():
+    """Mask zw. Alone, the query takes a 3D binding (depth asked for). With a 2D TLD.B of the same
+    handle it takes that binding: depth reads 1 and the level count is OpImageQueryLevels."""
+    txq = txq_mask(TXQ_B | 4 << 8, 0xC)
+    code = pack_code(c2_handle(4, 0x168, 0x568) + [mov32i(5, 0), txq, exit_(), bra(-8)])
+    fn, info, spv, em = full(build('fs', code, fs_sph()))
+    assert sorted(o.attr['comp'] for o in ops_of(fn) if o.op == 'txq') == [2, 3]
+    assert [t['dim'] for t in em.manifest('k')['textures']] == ['3d']
+    ops = spv_opcodes(spv)
+    assert 106 in ops and 103 in ops, ops
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+    tld = ins('tld_b', '-', rd=8, ra=0, rb=4, b28=(2, 3), b31=(0xF, 4))
+    code = pack_code(c2_handle(4, 0x168, 0x568) + [mov32i(5, 0), txq, tld, exit_(), bra(-8)])
+    fn, info, spv, em = full(build('fs', code, fs_sph()))
+    assert [t['dim'] for t in em.manifest('k')['textures']] == ['2d']
+    ops = spv_opcodes(spv)
+    assert 106 in ops and 103 not in ops, ops
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+
+
+@test
+def txq_b_shares_fetch_binding():
+    """A size query and a TLD.B of the same handle use one binding of the fetch's type (2D)."""
+    tld = ins('tld_b', '-', rd=8, ra=0, rb=4, b28=(2, 3), b31=(0xF, 4))      # TLD.B.LZ 2D
+    code = pack_code(c2_handle(4, 0x170, 0x570) + [mov32i(5, 0), TXQ_B | 4 << 8, tld, exit_(), bra(-8)])
+    fn, info, spv, em = full(build('fs', code, fs_sph()))
+    t = em.manifest('k')['textures']
+    assert len(t) == 1 and t[0]['nvn'] == {'kind': 'separate', 'index': 1, 'sampler_index': 1}, t
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+
+
+@test
+def compute_bound_txq_and_sust_image():
+    """Compute: bound TXQ (TidB 0x48 = c[2][0x120]) queries the storage image a SUST.B writes through
+    the same handle; image slot 0, 3D, size via OpImageQuerySize; workgroup size from the program as
+    specialization constants 0..2."""
+    code = pack_code([mov32i(0, 0), TXQ_BOUND] + c2_handle(7, 0x120) +
+                     [mov32i(4, 1), mov32i(5, 2), mov32i(6, 3), SUST_B_3D, exit_(), bra(-8)])
+    prog = build('cs', code, b'')
+    prog.local_size = (4, 4, 4)
+    fn, info, spv, em = full(prog)
+    man = em.manifest('k')
+    assert man['images'] == [{'binding': man['images'][0]['binding'], 'dim': '3d', 'format': 'unknown',
+                              'handle': {'cbuf': 2, 'offset': 0x120}, 'nvn': {'kind': 'image', 'index': 0}}], man['images']
+    assert not man['textures'] and man['local_size'] == [4, 4, 4], man
+    ops = spv_opcodes(spv)
+    assert 104 in ops and 99 in ops and 51 in ops, 'need OpImageQuerySize, OpImageWrite, OpSpecConstantComposite'
+    ok, msg = spv_ok(spv)
+    assert ok is not False, msg
+
+
+@test
+def control_section_stage_and_local_size():
+    """NVN control section: word 0x714 names the stage, 0x748..0x750 the compute workgroup size."""
+    c = bytearray(0x880)
+    struct.pack_into('<I', c, 0x714, 5)
+    struct.pack_into('<3I', c, 0x748, 8, 8, 1)
+    assert translate.nvn_stage(bytes(c)) == 'cs' and translate.local_size(bytes(c)) == (8, 8, 1)
+    struct.pack_into('<I', c, 0x714, 1)
+    assert translate.nvn_stage(bytes(c)) == 'fs'
+    struct.pack_into('<3I', c, 0x748, 64, 64, 1)
+    try:
+        translate.local_size(bytes(c))
+    except translate.Failed:
+        pass
+    else:
+        raise AssertionError('4096 invocations accepted')
+
+
+# Library programs the game binds that are not in the Unity bundles (task-12 NVN_DUMP_MISSING, kept in
+# <shaders>/missing): 2 VS, 6 multisample resolve FS (TXQ.B), 1 compute 3D downsample (TXQ, SUST.B).
+BUILTIN_PROGRAMS = """296bf434e3fd 3112cc6fd2f2 43094543406a 5db5e878fff0 68d5e0b3aa2d ad89da88c92d
+b3913c5cf577 b8fa73d443d8 f6ef73e109cd""".split()
+
+
+def builtin_programs(shaders):
+    d = Path(shaders) / 'missing'
+    if not d.is_dir():
+        return [{'name': 'built-in programs', 'status': 'skipped', 'detail': 'no shaders/missing'}]
+    bad = []
+    for pre in BUILTIN_PROGRAMS:
+        f = sorted(d.glob(pre + '*.data'))
+        if len(f) != 1:
+            bad.append(pre + ': not found')
+            continue
+        ctrl = f[0].with_suffix('.ctrl').read_bytes()
+        try:
+            spv, man = translate.translate(translate.nvn_stage(ctrl), ctrl, f[0].read_bytes())
+        except translate.Failed as e:
+            bad.append(pre + ': ' + str(e)[:100])
+            continue
+        ok, msg = spv_ok(spv)
+        if ok is False:
+            bad.append(pre + ': ' + msg[:100])
+    return [{'name': 'built-in programs (%d) translate and validate' % len(BUILTIN_PROGRAMS),
+             'status': 'failed' if bad else 'passed', 'detail': '; '.join(bad[:5])}]
+
+
 # Programs that failed in cache v1 before the burn-down (LDG, BRX, VMNMX, multisample fetch, bindless
 # spills and predicated handles, geometry). Key prefixes only; the corpus stays on A:.
 FORMER_FAILURES = """00a3127a56ecb7ee 0a926e4e9805f891 14ab224b78edb3df 14b8a203a30919b9 17ce81bc103a17f2
@@ -577,6 +753,7 @@ def main():
     if a.corpus:
         out += corpus_slice(a.corpus)
         out += former_failures(a.corpus)
+        out += builtin_programs(a.corpus)
     Path(a.report).parent.mkdir(parents=True, exist_ok=True)
     Path(a.report).write_text(json.dumps({'tests': out}, indent=1), encoding='utf-8')
     bad = [t for t in out if t['status'] == 'failed']

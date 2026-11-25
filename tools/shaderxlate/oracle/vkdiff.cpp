@@ -394,22 +394,22 @@ static DimInfo dimInfo(const std::string& d) {
   throw Fail{"unknown texture dim " + d};
 }
 
-// 2dms: 16x16 RGBA8 with 4 samples. Copies into multisampled images are not allowed, so the
-// texels are written with clear rects inside a render pass: every 2x2 cell gets its own seeded
-// color (all samples of a texel share it; the sample index is not exercised).
-static Tex makeMsTex(const std::string& key) {
+// 2dms: 16x16 RGBA8 with 4 samples (2dms_array: 4 layers). Copies into multisampled images are not
+// allowed, so the texels are written with clear rects inside a render pass: every 2x2 cell of every
+// layer gets its own seeded color (all samples of a texel share it; the sample index is not exercised).
+static Tex makeMsTex(const std::string& key, uint32_t L) {
   const uint32_t N = 16;
   Tex t;
   VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ci.imageType = VK_IMAGE_TYPE_2D; ci.format = VK_FORMAT_R8G8B8A8_UNORM; ci.extent = {N, N, 1};
-  ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_4_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ci.mipLevels = 1; ci.arrayLayers = L; ci.samples = VK_SAMPLE_COUNT_4_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
   ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VKC(vkCreateImage(g_dev, &ci, nullptr, &t.img));
   t.mem = imageMem(t.img);
   VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  vi.image = t.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ci.format;
-  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vi.image = t.img; vi.viewType = L > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+  vi.format = ci.format; vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, L};
   VKC(vkCreateImageView(g_dev, &vi, nullptr, &t.view));
   VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   si.magFilter = si.minFilter = VK_FILTER_NEAREST; si.maxAnisotropy = 1.f;
@@ -419,7 +419,7 @@ static Tex makeMsTex(const std::string& key) {
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   VKC(vkBeginCommandBuffer(g_cb, &bi));
   VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-  b.image = t.img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  b.image = t.img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, L};
   b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -429,17 +429,19 @@ static Tex makeMsTex(const std::string& key) {
   ca.imageView = t.view; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-  ri.renderArea = {{0, 0}, {N, N}}; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+  ri.renderArea = {{0, 0}, {N, N}}; ri.layerCount = L; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
   vkCmdBeginRendering(g_cb, &ri);
   uint32_t kh = fnv(key);
-  for (uint32_t y = 0; y < N; y += 2)
-    for (uint32_t x = 0; x < N; x += 2) {
-      uint32_t u = fmix(fmix(kh ^ (x * 0xC2B2AE3Du)) ^ (y * 0x27D4EB2Fu));
-      VkClearAttachment cl{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
-      for (int c = 0; c < 4; c++) cl.clearValue.color.float32[c] = (float)((u >> (8 * c)) & 0xFF) / 255.0f;
-      VkClearRect rc{{{(int32_t)x, (int32_t)y}, {2, 2}}, 0, 1};
-      vkCmdClearAttachments(g_cb, 1, &cl, 1, &rc);
-    }
+  for (uint32_t l = 0; l < L; l++)
+    for (uint32_t y = 0; y < N; y += 2)
+      for (uint32_t x = 0; x < N; x += 2) {
+        uint32_t u = fmix(fmix(kh ^ (x * 0xC2B2AE3Du)) ^ (y * 0x27D4EB2Fu));
+        if (l) u = fmix(u ^ (l * 0x165667B1u));  // layer 0 keeps the 2dms colors
+        VkClearAttachment cl{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+        for (int c = 0; c < 4; c++) cl.clearValue.color.float32[c] = (float)((u >> (8 * c)) & 0xFF) / 255.0f;
+        VkClearRect rc{{{(int32_t)x, (int32_t)y}, {2, 2}}, l, 1};
+        vkCmdClearAttachments(g_cb, 1, &cl, 1, &rc);
+      }
   vkCmdEndRendering(g_cb);
   b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -454,7 +456,8 @@ static const Tex& getTex(const Res& r) {
   std::string ck = r.key + "|" + r.dim + "|" + std::to_string(r.shadow);
   auto it = g_tex.find(ck);
   if (it != g_tex.end()) return it->second;
-  if (r.dim == "2dms") return g_tex[ck] = makeMsTex(r.key);
+  if (r.dim == "2dms") return g_tex[ck] = makeMsTex(r.key, 1);
+  if (r.dim == "2dms_array") return g_tex[ck] = makeMsTex(r.key, 4);
   DimInfo di = dimInfo(r.dim);
   bool sh = r.shadow != 0;
   VkFormat fmt = sh ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
