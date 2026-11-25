@@ -12,11 +12,11 @@ proc table: 535 names, 332 implemented, 203 logged stubs; 0 implemented have no 
 USED STUB nvnCommandBufferBindStorageBuffersDeferred : deferred storage buffer binding has no Vulkan equivalent worth emulating until a translated shader uses it
 USED STUB nvnCommandBufferSetViewportSwizzles : viewport swizzle (NV_viewport_swizzle) is not available on the Vulkan target; the game only sets identity
 used list: 265 names, 263 implemented, 2 stubbed
-nvn_unit: 2161 checks, 0 failed
+nvn_unit: 2177 checks, 0 failed
 ```
 
 ## nvn_gpu (clear, textured quad, RGBA4, depth range, sync, copies, hidden window, validation)
-Result: PASS (exit 0, 1.2 s)
+Result: PASS (exit 0, 1.1 s)
 
 ```
 [nvn] vulkan: NVIDIA GeForce RTX 4090 api 1.4.357 hostImport=1 depthClipControl=1 4444=1 swapchain=1 validation=1
@@ -32,13 +32,9 @@ nvn_gpu: 101 checks, 0 failed
 ```
 
 ## nvn_cache pipelines (support buffer and c[1] pixel check, 600 real variants built and drawn, validation on)
-Result: PASS (exit 0, 4.0 s)
+Result: PASS (exit 0, 3.8 s)
 
 ```
-[nvn] draw samples texture id 0 that is not registered in the bound texture pool
-[nvn] stage vs storage buffer 0 is not bound
-[nvn] stage vs storage buffer 0 is not bound
-[nvn] stage vs storage buffer 0 is not bound
 [nvn] stage vs storage buffer 0 is not bound
 [nvn] stage vs storage buffer 0 is not bound
 [nvn] ERROR: VALIDATION ERROR: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
@@ -49,20 +45,24 @@ The Vulkan spec states: Any user-defined variables shared between the OpEntryPoi
 The input variable is:
   pointer to Input -> vec4 of float32
 The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding...
-variants: 600 sampled (6 with a geometry stage), 0 skipped (a stage failed the device check or did not translate), 0 incomplete
-variants: 600 draws recorded, replay executed 600 draws and skipped 0, built 600 pipelines, 0 pipeline failures
-variants: 647 stage programs use textures (437 shadow), 0 have a support buffer, 0 have c[1] constants files, 2 write more than one target
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+variants: 608 sampled (6 with a geometry stage), 0 skipped (a stage failed the device check or did not translate), 0 incomplete
+variants: 608 draws recorded, replay executed 608 draws and skipped 0, built 608 pipelines, 0 pipeline failures
+variants: 655 stage programs use textures (437 shadow), 0 have a support buffer, 0 have c[1] constants files, 2 write more than one target
 validation: 2 errors (2 known layer false positives), 0 warnings; by message id:
   known VUID-RuntimeSpirv-OpEntryPoint-08743                       x2  # a fragment input the vertex shader does not write (61 pairs in the cache, undefined value)
       first: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
 The input variable is:
   pointer to Input -> vec4 of float32
 The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding...
-nvn_cache: 32 checks, 0 failed
+nvn_cache: 38 checks, 0 failed
 ```
 
 ## nvn_cache sweep (every stage program: capability check, shader module, descriptor set layout; vs/fs pairing)
-Result: PASS (exit 0, 8.5 s)
+Result: PASS (exit 0, 8.0 s)
 
 ```
   stage vs       1306
@@ -76,10 +76,10 @@ device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=off subgroupSize=32
 sweep progress: 4000 of 25763 stage programs after 1 s (load 1 s of which file reads 1 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
 sweep progress: 8000 of 25763 stage programs after 2 s (load 2 s of which file reads 2 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
 sweep progress: 12000 of 25763 stage programs after 3 s (load 3 s of which file reads 3 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 16000 of 25763 stage programs after 5 s (load 4 s of which file reads 4 s and manifest parse 0 s, device check 0 s, module and layout 1 s)
-sweep progress: 20000 of 25763 stage programs after 6 s (load 5 s of which file reads 5 s and manifest parse 0 s, device check 0 s, module and layout 1 s)
+sweep progress: 16000 of 25763 stage programs after 4 s (load 4 s of which file reads 4 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 20000 of 25763 stage programs after 6 s (load 5 s of which file reads 5 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
 sweep progress: 24000 of 25763 stage programs after 7 s (load 6 s of which file reads 6 s and manifest parse 1 s, device check 0 s, module and layout 1 s)
-sweep time: 7.8 s (load 6.8 s, device check 0.0 s, module and layout 0.9 s)
+sweep time: 7.4 s (load 6.7 s, device check 0.0 s, module and layout 0.6 s)
 sweep: 25763 stage programs: 25763 ready (module and set layout built), 0 rejected by the device check, 0 not loaded, 0 module or layout failures
   ready vs       1306
   ready fs       24452

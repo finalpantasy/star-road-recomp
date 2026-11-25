@@ -222,6 +222,28 @@ static void TestFormats() {
   Device d; CHECK(d.depthMode == NVN_DEPTH_MODE_NEAR_IS_ZERO, "Device default depth mode");
 }
 
+// Shader cache manifests: every texture dimension the cache emits maps to its own DimKind, and 2dms bindings carry the multisample flag.
+static void TestManifestDims() {
+  struct { const char* s; int dim; } cases[] = {{"1d", DIM_1D}, {"2d", DIM_2D}, {"3d", DIM_3D}, {"cube", DIM_CUBE}, {"2d_array", DIM_2D_ARRAY},
+                                                {"cube_array", DIM_CUBE_ARRAY}, {"buffer", DIM_BUFFER}, {"2dms", DIM_2DMS}, {"2dms_array", DIM_2DMS_ARRAY}};
+  for (auto& c : cases) CHECK(ShaderDimFromString(c.s) == c.dim, "manifest dim '%s' -> %d, expected %d", c.s, ShaderDimFromString(c.s), c.dim);
+  CHECK(ShaderDimFromString("nonsense") == DIM_2D, "unknown dim falls back to 2d");
+  CHECK(DIM_2DMS != DIM_2D && DIM_2DMS_ARRAY != DIM_2D_ARRAY && DIM_2DMS_ARRAY < DIM_COUNT, "multisample dims are distinct from the single-sample ones");
+  const char* js =
+      "{\"key\": \"k\", \"stage\": \"fs\", \"textures\": ["
+      "{\"binding\": 2, \"dim\": \"2dms\", \"shadow\": false, \"array_len\": 1, \"handle\": {\"cbuf\": 2, \"offset\": 360}, \"sampler_handle\": {\"cbuf\": 2, \"offset\": 1384}, \"nvn\": {\"kind\": \"separate\", \"index\": 0, \"sampler_index\": 0}, \"multisample\": true},"
+      "{\"binding\": 3, \"dim\": \"2dms_array\", \"shadow\": false, \"array_len\": 1, \"handle\": {\"cbuf\": 2, \"offset\": 368}, \"multisample\": true},"
+      "{\"binding\": 4, \"dim\": \"2dms\", \"shadow\": false, \"array_len\": 1, \"handle\": {\"cbuf\": 2, \"offset\": 376}},"
+      "{\"binding\": 5, \"dim\": \"2d\", \"shadow\": false, \"array_len\": 1, \"handle\": {\"cbuf\": 2, \"offset\": 384}, \"multisample\": false}]}";
+  Manifest m; CHECK(ShaderManifestFromJson(js, &m) && m.texs.size() == 4, "manifest with 2dms bindings parses");
+  if (m.texs.size() == 4) {
+    CHECK(m.texs[0].dim == DIM_2DMS && m.texs[0].multisample, "2dms binding: dim %d ms %d", m.texs[0].dim, (int)m.texs[0].multisample);
+    CHECK(m.texs[1].dim == DIM_2DMS_ARRAY && m.texs[1].multisample, "2dms_array binding: dim %d ms %d", m.texs[1].dim, (int)m.texs[1].multisample);
+    CHECK(m.texs[2].dim == DIM_2DMS && m.texs[2].multisample, "a manifest without the flag still marks a 2dms binding multisample");
+    CHECK(m.texs[3].dim == DIM_2D && !m.texs[3].multisample, "a 2d binding stays single-sample");
+  }
+}
+
 int main(int argc, char** argv) {
   const char* used = argc > 1 ? argv[1] : (getenv("NVN_USED_LIST") ? getenv("NVN_USED_LIST") : "A:/AI/Recomps/smrpg-work/nvn/used_list.json");
   TestSizes();
@@ -229,6 +251,7 @@ int main(int argc, char** argv) {
   TestProcTable(used);
   TestThunkAbi();
   TestFormats();
+  TestManifestDims();
   printf("nvn_unit: %d checks, %d failed\n", g_checks, g_fails);
   return g_fails ? 1 : 0;
 }

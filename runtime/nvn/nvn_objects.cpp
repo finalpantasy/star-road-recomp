@@ -165,13 +165,14 @@ bool TextureCreate(TextureG* g, TextureImpl* t) {
     default: break;   // 2D, rectangle, multisample
   }
   t->layers = layers; t->depth = depth; t->levels = std::max(1u, g->levels); t->samples = std::max(1u, g->samples);
+  if (t->samples > 1) t->levels = 1;                 // a multisample image has one mip level
   VkFormatProperties fp; F.vkGetPhysicalDeviceFormatProperties(g_vk.phys, t->vkFormat, &fp);
   VkFormatFeatureFlags feat = fp.optimalTilingFeatures;
   VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   if (feat & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
   if (feat & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   if (feat & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-  if (feat & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  if ((feat & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (t->samples <= 1 || g_vk.feat.features.shaderStorageImageMultisample)) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
   t->renderTarget = (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0;
   VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ci.flags = flags; ci.imageType = type; ci.format = t->vkFormat;

@@ -75,6 +75,8 @@ static int g_checks = 0, g_fails = 0;
   X(void, nvnTextureBuilderSetTarget, (void*, int))                                                                      \
   X(void, nvnTextureBuilderSetSize2D, (void*, int, int))                                                                 \
   X(void, nvnTextureBuilderSetFormat, (void*, int))                                                                      \
+  X(void, nvnTextureBuilderSetSamples, (void*, int))                                                                     \
+  X(void, nvnTextureBuilderSetDepth, (void*, int))                                                                       \
   X(void, nvnTextureBuilderSetFlags, (void*, int))                                                                       \
   X(void, nvnTextureBuilderSetStorage, (void*, void*, int64_t))                                                          \
   X(int64_t, nvnTextureBuilderGetStorageSize, (const void*))                                                             \
@@ -172,10 +174,12 @@ struct GuestTex {
   TextureG* g() { return (TextureG*)blob; }
   uint64_t off = 0;
 };
-static bool MakeTex(GuestTex* t, GuestPool* pool, void* dev, int format, int w, int h, int flags) {
+static bool MakeTex(GuestTex* t, GuestPool* pool, void* dev, int format, int w, int h, int flags, int target = NVN_TEXTURE_TARGET_2D, int samples = 0, int layers = 0) {
   alignas(16) uint8_t b[0x100]; memset(b, 0, sizeof b);
-  nvnTextureBuilderSetDefaults(b); nvnTextureBuilderSetDevice(b, dev); nvnTextureBuilderSetTarget(b, NVN_TEXTURE_TARGET_2D);
+  nvnTextureBuilderSetDefaults(b); nvnTextureBuilderSetDevice(b, dev); nvnTextureBuilderSetTarget(b, target);
   nvnTextureBuilderSetSize2D(b, w, h); nvnTextureBuilderSetFormat(b, format); nvnTextureBuilderSetFlags(b, flags);
+  if (samples) nvnTextureBuilderSetSamples(b, samples);
+  if (layers) nvnTextureBuilderSetDepth(b, layers);
   int64_t size = nvnTextureBuilderGetStorageSize(b), align = nvnTextureBuilderGetStorageAlignment(b);
   t->off = Bump(pool, (uint64_t)size, (uint64_t)std::max<int64_t>(align, 0x1000));
   nvnTextureBuilderSetStorage(b, pool->blob, (int64_t)t->off);
@@ -324,11 +328,14 @@ int main(int argc, char** argv) {
     GuestPool data, shaderPool;
     CHECK(MakePool(&data, dev, 8u << 20, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED), "data pool");
     CHECK(MakePool(&shaderPool, dev, 0x10000, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED | NVN_MEMORY_POOL_FLAGS_SHADER_CODE), "shader pool");
-    static GuestTex color[8], depth, texColor, texDepth;
+    static GuestTex color[8], depth, texColor, texDepth, texMs, texMsArr;
     for (auto& c : color) CHECK(MakeTex(&c, &data, dev, NVN_FORMAT_RGBA8, 64, 64, 0), "color target");
     CHECK(MakeTex(&depth, &data, dev, NVN_FORMAT_DEPTH32F, 64, 64, 0), "depth target");
     CHECK(MakeTex(&texColor, &data, dev, NVN_FORMAT_RGBA8, 4, 4, 0), "sample texture");
     CHECK(MakeTex(&texDepth, &data, dev, NVN_FORMAT_DEPTH32F, 4, 4, 0), "shadow sample texture");
+    CHECK(MakeTex(&texMs, &data, dev, NVN_FORMAT_RGBA8, 4, 4, 0, NVN_TEXTURE_TARGET_2D_MULTISAMPLE, 4), "2dms sample texture");
+    CHECK(MakeTex(&texMsArr, &data, dev, NVN_FORMAT_RGBA8, 4, 4, 0, NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY, 4, 2), "2dms array sample texture");
+    CHECK(texMs.g()->impl && texMs.g()->impl->samples == 4 && texMsArr.g()->impl && texMsArr.g()->impl->samples == 4 && texMsArr.g()->impl->layers == 2, "multisample textures keep their sample count and layers");
     alignas(16) static uint8_t sampB[0x80], sampPlain[0x30 + 0x40], sampCmp[0x30 + 0x40], texPool[0x20 + 0x40], sampPool[0x20 + 0x40];
     nvnSamplerBuilderSetDefaults(sampB); nvnSamplerBuilderSetDevice(sampB, dev);
     nvnSamplerBuilderSetMinMagFilter(sampB, NVN_MIN_FILTER_NEAREST, NVN_MAG_FILTER_NEAREST);
@@ -336,12 +343,14 @@ int main(int argc, char** argv) {
     CHECK(nvnSamplerInitialize(sampPlain, sampB), "sampler");
     nvnSamplerBuilderSetCompare(sampB, NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE, NVN_DEPTH_FUNC_LESS);
     CHECK(nvnSamplerInitialize(sampCmp, sampB), "compare sampler");
-    const int kTexColor = 256, kTexDepth = 257, kSampPlain = 256, kSampCmp = 257;
+    const int kTexColor = 256, kTexDepth = 257, kTexMs = 258, kTexMsArr = 259, kSampPlain = 256, kSampCmp = 257;
     uint64_t tpOff = Bump(&data, 0x8000), spOff = Bump(&data, 0x2000);
     CHECK(nvnTexturePoolInitialize(texPool, data.blob, (int64_t)tpOff, 512), "texture pool");
     CHECK(nvnSamplerPoolInitialize(sampPool, data.blob, (int64_t)spOff, 512), "sampler pool");
     nvnTexturePoolRegisterTexture(texPool, kTexColor, texColor.blob, nullptr);
     nvnTexturePoolRegisterTexture(texPool, kTexDepth, texDepth.blob, nullptr);
+    nvnTexturePoolRegisterTexture(texPool, kTexMs, texMs.blob, nullptr);
+    nvnTexturePoolRegisterTexture(texPool, kTexMsArr, texMsArr.blob, nullptr);
     nvnSamplerPoolRegisterSampler(sampPool, kSampPlain, sampPlain);
     nvnSamplerPoolRegisterSampler(sampPool, kSampCmp, sampCmp);
 
@@ -444,6 +453,43 @@ int main(int argc, char** argv) {
       for (size_t k = 0; k < wantGs; k++) picks.push_back(all[gsIdx[k * gsIdx.size() / wantGs]]);
       for (size_t k = 0; k < std::min(wantPlain, plainIdx.size()); k++) picks.push_back(all[plainIdx[k * plainIdx.size() / std::min(wantPlain, plainIdx.size())]]);
     }
+    // The cache's 2dms and 2dms_array fragment programs (cache v1 has 5 and 3, by the first 12 hex digits of the stage key) are always drawn: their
+    // bindings must parse as multisample, and the draws exercise the multisample dummies, a real multisample texture (even ordinals) and a
+    // single-sample texture bound to a multisample binding (odd ordinals, which the replay must refuse and replace with the dummy).
+    std::map<std::string, int> msOrdinal;
+    {
+      static const char* kMsFs[] = {"3bed69cc9538", "43094543406a", "5db5e878fff0", "68d5e0b3aa2d", "ad89da88c92d", "b8fa73d443d8", "cae7746810b6", "f6ef73e109cd"};
+      // Full keys from the index. A program no variant uses gets a vertex stage from the cache that writes every location it reads.
+      std::vector<std::string> msKeys;
+      for (auto& k : okKeys) for (auto* pre : kMsFs) if (k.compare(0, 12, pre) == 0) msKeys.push_back(k);
+      std::vector<std::string> vsKeys; { std::set<std::string> seenVs; for (auto& v : all) if (seenVs.insert(v.vs).second) vsKeys.push_back(v.vs); }
+      for (auto& fsKey : msKeys) {
+        Variant pick; bool found = false;
+        for (auto& v : all) if (v.fs == fsKey) { pick = v; found = true; break; }
+        if (!found) {
+          StageProgram* fsp = ShaderCacheGet(fsKey);
+          if (!fsp->ok) continue;
+          for (size_t i = 0; i < vsKeys.size() && i < 3000 && !found; i++) {
+            StageProgram* vsp = ShaderCacheGet(vsKeys[i]);
+            bool covers = vsp->ok;
+            if (covers) for (auto& in : fsp->man.inputs) if (std::find(vsp->man.outLocs.begin(), vsp->man.outLocs.end(), in.location) == vsp->man.outLocs.end()) { covers = false; break; }
+            if (covers) { pick.vs = vsKeys[i]; pick.fs = fsKey; pick.shader = "multisample test"; found = true; }
+            else ShaderCacheDrop(vsKeys[i]);
+          }
+        }
+        if (found) { picks.push_back(pick); int o = (int)msOrdinal.size(); msOrdinal[pick.fs] = o; }
+      }
+      int n2 = 0, n2a = 0, flagged = 0;
+      for (auto& kv : msOrdinal) {
+        StageProgram* sp = ShaderCacheGet(kv.first);
+        if (!sp->ok) continue;
+        for (auto& t : sp->man.texs) { if (t.dim == DIM_2DMS) n2++; if (t.dim == DIM_2DMS_ARRAY) n2a++; if ((t.dim == DIM_2DMS || t.dim == DIM_2DMS_ARRAY) && t.multisample) flagged++; }
+      }
+      printf("multisample programs: %zu variants, %d 2dms bindings, %d 2dms_array bindings, %d flagged multisample\n", msOrdinal.size(), n2, n2a, flagged);
+      CHECK(msOrdinal.size() == 8, "expected the 8 multisample fragment programs of cache v1 in variants.jsonl, found %zu", msOrdinal.size());
+      CHECK(n2 >= 1 && n2a >= 1, "the cache's manifests must produce 2dms (%d) and 2dms_array (%d) bindings", n2, n2a);
+      CHECK(flagged == n2 + n2a, "%d of %d multisample bindings lack the multisample flag", n2 + n2a - flagged, n2 + n2a);
+    }
     size_t built = 0, notOk = 0, incomplete = 0, drawn = 0, withGs = 0, withTex = 0, withShadow = 0, withSupport = 0, withConsts = 0, multiRt = 0;
     std::map<std::string, int> rejected;
     Stats s0 = GetStats();
@@ -504,10 +550,15 @@ int main(int argc, char** argv) {
             for (auto& t : sp->man.texs) {
               if (!t.hasSampler || t.hCbuf != 2 || t.sCbuf != 2 || t.hOff < 0x168 || t.sOff < 0x568) continue;
               bool real = t.dim == 1 && t.res != RES_SAMPLER;
+              int realId = t.shadow ? kTexDepth : kTexColor;
+              if (t.dim == DIM_2DMS || t.dim == DIM_2DMS_ARRAY) {
+                auto mo = msOrdinal.find(sp->key);
+                real = t.res != RES_SAMPLER; realId = (mo != msOrdinal.end() && (mo->second & 1)) ? kTexColor : t.dim == DIM_2DMS ? kTexMs : kTexMsArr;
+              }
               for (uint32_t k = 0; k < std::max(1u, t.arrayLen); k++) {
                 int ti = (int)((t.hOff - 0x168) / 8 + k), si = (int)((t.sOff - 0x568) / 8 + k);
                 if (ti > 63 || si > 63) break;
-                nvnCommandBufferBindSeparateTexture(cb, sp->man.stage, ti, nvnDeviceGetSeparateTextureHandle(dev, real ? (t.shadow ? kTexDepth : kTexColor) : 0));
+                nvnCommandBufferBindSeparateTexture(cb, sp->man.stage, ti, nvnDeviceGetSeparateTextureHandle(dev, real ? realId : 0));
                 nvnCommandBufferBindSeparateSampler(cb, sp->man.stage, si, nvnDeviceGetSeparateSamplerHandle(dev, t.shadow ? kSampCmp : kSampPlain));
               }
             }
@@ -536,7 +587,7 @@ int main(int argc, char** argv) {
     nvnBufferFinalize(vbuf); nvnBufferFinalize(ubuf);
     nvnTexturePoolFinalize(texPool); nvnSamplerPoolFinalize(sampPool); nvnSamplerFinalize(sampPlain); nvnSamplerFinalize(sampCmp);
     for (auto& c : color) nvnTextureFinalize(c.blob);
-    nvnTextureFinalize(depth.blob); nvnTextureFinalize(texColor.blob); nvnTextureFinalize(texDepth.blob);
+    nvnTextureFinalize(depth.blob); nvnTextureFinalize(texColor.blob); nvnTextureFinalize(texDepth.blob); nvnTextureFinalize(texMs.blob); nvnTextureFinalize(texMsArr.blob);
     nvnMemoryPoolFinalize(data.blob); nvnMemoryPoolFinalize(shaderPool.blob);
   }
 

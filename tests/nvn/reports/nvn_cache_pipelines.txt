@@ -10,6 +10,7 @@ static sample: 614 stage programs, 614 with SPIR-V magic, 0 with a support buffe
 device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=on subgroupSize=32
 support/constants pixel: (255,255,191,96), expected (255,255,191,96)
 variants.jsonl: 26766 distinct (vs, fs, gs) combinations
+multisample programs: 8 variants, 5 2dms bindings, 3 2dms_array bindings, 8 flagged multisample
 [nvn] draw samples texture id 0 that is not registered in the bound texture pool
 [nvn] stage vs storage buffer 0 is not bound
 [nvn] stage vs storage buffer 0 is not bound
@@ -24,13 +25,17 @@ The Vulkan spec states: Any user-defined variables shared between the OpEntryPoi
 The input variable is:
   pointer to Input -> vec4 of float32
 The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding shader stage's OpEntryPoint with Output as the Storage Class (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-OpEntryPoint-08743)
-variants: 600 sampled (6 with a geometry stage), 0 skipped (a stage failed the device check or did not translate), 0 incomplete
-variants: 600 draws recorded, replay executed 600 draws and skipped 0, built 600 pipelines, 0 pipeline failures
-variants: 647 stage programs use textures (437 shadow), 0 have a support buffer, 0 have c[1] constants files, 2 write more than one target
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+[nvn] stage fs binding 1 is multisample but texture id 256 has 1 samples (dummy used)
+variants: 608 sampled (6 with a geometry stage), 0 skipped (a stage failed the device check or did not translate), 0 incomplete
+variants: 608 draws recorded, replay executed 608 draws and skipped 0, built 608 pipelines, 0 pipeline failures
+variants: 655 stage programs use textures (437 shadow), 0 have a support buffer, 0 have c[1] constants files, 2 write more than one target
 validation: 2 errors (2 known layer false positives), 0 warnings; by message id:
   known VUID-RuntimeSpirv-OpEntryPoint-08743                       x2  # a fragment input the vertex shader does not write (61 pairs in the cache, undefined value)
       first: vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at Location 8 Component 0  but the previous stage ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
 The input variable is:
   pointer to Input -> vec4 of float32
 The Vulkan spec states: Any user-defined variables shared between the OpEntryPoint of two shader stages, and declared with Input as its Storage Class for the subsequent shader stage, must have all Location slots and Component words declared in the preceding shader stage's OpEntryPoint with Output as the Storage Class (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-OpEntryPoint-
-nvn_cache: 32 checks, 0 failed
+nvn_cache: 38 checks, 0 failed

@@ -176,6 +176,8 @@ enum UboSource : int { UBO_NVN = 0, UBO_DRIVER_C0, UBO_HANDLES_C2, UBO_PROGRAM_C
 // Descriptor kind of a resource (manifest `vk_type`); 0 means the manifest did not say and the section 4 defaults apply.
 enum ResKind : int { RES_DEFAULT = 0, RES_UNIFORM_BUFFER, RES_COMBINED_IMAGE_SAMPLER, RES_SAMPLED_IMAGE, RES_SAMPLER, RES_UNIFORM_TEXEL_BUFFER,
                      RES_STORAGE_IMAGE, RES_STORAGE_TEXEL_BUFFER, RES_STORAGE_BUFFER };
+// Manifest `dim` as an index (also the index of the replay's dummy image for that dimension).
+enum DimKind : int { DIM_1D = 0, DIM_2D, DIM_3D, DIM_CUBE, DIM_2D_ARRAY, DIM_CUBE_ARRAY, DIM_BUFFER, DIM_2DMS, DIM_2DMS_ARRAY, DIM_COUNT };
 struct ManifestUbo { uint32_t binding; int cbuf; int nvnIndex; uint32_t size; int source = UBO_NVN; };
 struct ManifestTex { uint32_t binding; int dim; bool shadow; uint32_t arrayLen; int hCbuf; uint32_t hOff; bool hasSampler; int sCbuf; uint32_t sOff;
                      int kind; int index; int samplerIndex; int res = RES_DEFAULT; bool multisample = false; };
@@ -208,6 +210,8 @@ struct ProgramImpl {
 };
 
 // shader cache API (host and runtime)
+int ShaderDimFromString(const std::string& dim);                         // manifest `dim` text to a DimKind (unknown text is DIM_2D)
+bool ShaderManifestFromJson(const std::string& text, Manifest* out);     // parse one manifest (tests)
 bool ShaderCacheLoad(const std::string& root);                            // index.jsonl loader
 void ShaderCacheAdd(const std::string& key, int stage, const std::vector<uint32_t>& spv, const Manifest& m);   // tests, replace/
 StageProgram* ShaderCacheGet(const std::string& key);

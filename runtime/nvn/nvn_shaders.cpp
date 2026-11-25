@@ -111,9 +111,9 @@ std::string ReadFile(const std::string& path) {
   std::ifstream f(path, std::ios::binary); std::stringstream ss; ss << f.rdbuf(); return ss.str();
 }
 int DimFromStr(const std::string& d) {
-  static const char* n[] = {"1d", "2d", "3d", "cube", "2d_array", "cube_array", "buffer"};
-  for (int i = 0; i < 7; i++) if (d == n[i]) return i;
-  return 1;
+  static const char* n[DIM_COUNT] = {"1d", "2d", "3d", "cube", "2d_array", "cube_array", "buffer", "2dms", "2dms_array"};
+  for (int i = 0; i < DIM_COUNT; i++) if (d == n[i]) return i;
+  return DIM_2D;
 }
 int StageFromStr(const std::string& s) {
   for (int i = 0; i < 6; i++) if (s == StageName(i)) return i;
@@ -152,7 +152,7 @@ bool ParseManifest(const J& j, Manifest& m) {
     auto* sh = t.get("sampler_handle"); x.hasSampler = sh && sh->t == J::Obj; if (x.hasSampler) ReadLoc(sh, &x.sCbuf, &x.sOff);
     auto* nv = t.get("nvn"); x.kind = 0; x.index = 0; x.samplerIndex = 0;
     if (nv) { std::string k = nv->gets("kind"); x.kind = k == "combined" ? 0 : k == "separate" ? 1 : 2; x.index = nv->geti("index"); x.samplerIndex = nv->geti("sampler_index"); }
-    x.res = ResFromStr(t.gets("vk_type")); x.multisample = t.getb("multisample");
+    x.res = ResFromStr(t.gets("vk_type")); x.multisample = t.getb("multisample") || x.dim == DIM_2DMS || x.dim == DIM_2DMS_ARRAY;   // the dim alone implies it (older manifests)
     m.texs.push_back(x);
   }
   if (auto* a = j.get("images")) for (auto& t : a->a) {
@@ -185,6 +185,12 @@ bool ParseManifest(const J& j, Manifest& m) {
   return !m.key.empty();
 }
 }  // namespace
+
+int ShaderDimFromString(const std::string& dim) { return DimFromStr(dim); }
+bool ShaderManifestFromJson(const std::string& text, Manifest* out) {
+  J j; if (!ParseJson(text, j)) return false;
+  return ParseManifest(j, *out);
+}
 
 // ---- cache ----------------------------------------------------------------------------------------------------
 namespace {
@@ -333,8 +339,8 @@ bool ShaderCacheCheckDevice(StageProgram* sp) {
     else LogOnce(("spvext" + e).c_str(), "shader cache: SPIR-V extension %s is not checked against the device", e.c_str());
   }
   if (sp->ok) {
-    for (auto& t : sp->man.texs) if (t.res == RES_UNIFORM_TEXEL_BUFFER || t.res == RES_STORAGE_TEXEL_BUFFER || t.dim == 6) { sp->ok = false; sp->reason = "uses texel buffers (not supported)"; break; }
-    for (auto& i : sp->man.imgs) if (i.res == RES_STORAGE_TEXEL_BUFFER || i.dim == 6) { sp->ok = false; sp->reason = "uses texel buffer images (not supported)"; break; }
+    for (auto& t : sp->man.texs) if (t.res == RES_UNIFORM_TEXEL_BUFFER || t.res == RES_STORAGE_TEXEL_BUFFER || t.dim == DIM_BUFFER) { sp->ok = false; sp->reason = "uses texel buffers (not supported)"; break; }
+    for (auto& i : sp->man.imgs) if (i.res == RES_STORAGE_TEXEL_BUFFER || i.dim == DIM_BUFFER) { sp->ok = false; sp->reason = "uses texel buffer images (not supported)"; break; }
   }
   if (sp->ok && sp->man.subgroup32 && g_vk.p11.subgroupSize != 32 && !(g_vk.f13.subgroupSizeControl && g_vk.p13.minSubgroupSize <= 32 && g_vk.p13.maxSubgroupSize >= 32))
     LogOnce("sg32", "shader cache: the device subgroup size is %u and cannot be forced to 32; lane based shader math may differ", g_vk.p11.subgroupSize);

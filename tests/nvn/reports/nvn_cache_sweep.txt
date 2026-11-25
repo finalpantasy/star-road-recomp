@@ -11,10 +11,10 @@ device: NVIDIA GeForce RTX 4090 (Vulkan 1.4.357)  validation=off subgroupSize=32
 sweep progress: 4000 of 25763 stage programs after 1 s (load 1 s of which file reads 1 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
 sweep progress: 8000 of 25763 stage programs after 2 s (load 2 s of which file reads 2 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
 sweep progress: 12000 of 25763 stage programs after 3 s (load 3 s of which file reads 3 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
-sweep progress: 16000 of 25763 stage programs after 5 s (load 4 s of which file reads 4 s and manifest parse 0 s, device check 0 s, module and layout 1 s)
-sweep progress: 20000 of 25763 stage programs after 6 s (load 5 s of which file reads 5 s and manifest parse 0 s, device check 0 s, module and layout 1 s)
+sweep progress: 16000 of 25763 stage programs after 4 s (load 4 s of which file reads 4 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
+sweep progress: 20000 of 25763 stage programs after 6 s (load 5 s of which file reads 5 s and manifest parse 0 s, device check 0 s, module and layout 0 s)
 sweep progress: 24000 of 25763 stage programs after 7 s (load 6 s of which file reads 6 s and manifest parse 1 s, device check 0 s, module and layout 1 s)
-sweep time: 7.8 s (load 6.8 s, device check 0.0 s, module and layout 0.9 s)
+sweep time: 7.4 s (load 6.7 s, device check 0.0 s, module and layout 0.6 s)
 sweep: 25763 stage programs: 25763 ready (module and set layout built), 0 rejected by the device check, 0 not loaded, 0 module or layout failures
   ready vs       1306
   ready fs       24452

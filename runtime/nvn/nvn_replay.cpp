@@ -74,7 +74,9 @@ static std::unordered_map<std::string, VkPipelineLayout> g_layouts;
 static VkDescriptorSetLayout g_emptySet = VK_NULL_HANDLE;
 static VkBuffer g_nullVb = VK_NULL_HANDLE; static Buf g_nullVbBuf;
 struct Dummy { VkImage img = VK_NULL_HANDLE; MemAlloc mem; VkImageView view = VK_NULL_HANDLE; };
-static Dummy g_dummy[7];                 // by manifest dim: 1d 2d 3d cube 2d_array cube_array buffer
+static Dummy g_dummy[DIM_COUNT];         // by manifest dim: 1d 2d 3d cube 2d_array cube_array buffer 2dms 2dms_array
+// The dummy a binding of this dimension falls back to (a texel buffer has none and reads the cube array's).
+static int DummyIdx(int dim) { return dim == DIM_BUFFER ? DIM_CUBE_ARRAY : std::max(0, std::min(dim, (int)DIM_COUNT - 1)); }
 static VkSampler g_dummySampler = VK_NULL_HANDLE;
 static bool g_dummyInit = false;
 
@@ -319,7 +321,7 @@ static void PrepareSampled(RS& s, TextureG* g) {
   TextureImpl* t = TexOf(g);
   if (!t) return;
   ToGeneral(s, t);
-  if (!t->uploaded && !t->gpuWritten) UploadTexture(s, t, g);
+  if (!t->uploaded && !t->gpuWritten && t->samples <= 1) UploadTexture(s, t, g);     // a multisample image is only ever rendered to
   t->lastUse = s.value;
 }
 
@@ -328,14 +330,16 @@ static void InitDummies(RS& s) {
   g_dummyInit = true;
   EndRendering(s);                    // the clears and layout changes below are not allowed inside a render pass
   auto& F = g_vk.f;
-  struct D { int dim; VkImageType type; VkImageViewType vt; uint32_t layers; VkImageCreateFlags fl; } ds[7] = {
+  struct D { int dim; VkImageType type; VkImageViewType vt; uint32_t layers; VkImageCreateFlags fl; VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT; } ds[DIM_COUNT] = {
     {0, VK_IMAGE_TYPE_1D, VK_IMAGE_VIEW_TYPE_1D, 1, 0}, {1, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 1, 0}, {2, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D, 1, 0},
     {3, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT}, {4, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 2, 0},
-    {5, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT}, {6, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 1, 0}};
+    {5, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT}, {6, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 1, 0},
+    {DIM_2DMS, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 1, 0, VK_SAMPLE_COUNT_4_BIT}, {DIM_2DMS_ARRAY, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 2, 0, VK_SAMPLE_COUNT_4_BIT}};
   for (auto& d : ds) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.flags = d.fl; ci.imageType = d.type; ci.format = VK_FORMAT_R8G8B8A8_UNORM; ci.extent = {1, 1, 1}; ci.mipLevels = 1; ci.arrayLayers = d.layers;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL; ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    ci.samples = d.samples; ci.tiling = VK_IMAGE_TILING_OPTIMAL; ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    if (d.samples != VK_SAMPLE_COUNT_1_BIT && !g_vk.feat.features.shaderStorageImageMultisample) ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;     // multisample storage images are a device feature
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     Dummy& m = g_dummy[d.dim];
     F.vkCreateImage(g_vk.dev, &ci, nullptr, &m.img);
@@ -351,6 +355,7 @@ static void InitDummies(RS& s) {
     b.image = m.img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, d.layers};
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &b;
     F.vkCmdPipelineBarrier2(s.cb, &di);
+    if (d.samples != VK_SAMPLE_COUNT_1_BIT) continue;       // a multisample image cannot be cleared by vkCmdClearColorImage; its contents stay undefined
     VkClearColorValue white{{1, 1, 1, 1}}; VkImageSubresourceRange rg{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, d.layers};
     F.vkCmdClearColorImage(s.cb, m.img, VK_IMAGE_LAYOUT_GENERAL, &white, 1, &rg);
   }
@@ -628,13 +633,15 @@ static bool BindDescriptors(RS& s, bool compute) {
         uint32_t tw = t.hCbuf == 2 ? s.c2[st][std::min<uint32_t>(0x3FF, (t.hOff + 8 * k) / 4)] : 0;
         uint32_t sw = t.hasSampler && t.sCbuf == 2 ? s.c2[st][std::min<uint32_t>(0x3FF, (t.sOff + 8 * k) / 4)] : 0;
         uint32_t tid = tw & 0xFFFFF, sid = t.hasSampler ? (sw & 0xFFFFF) : (tw >> 20); uint32_t h = tw | sw;
-        VkDescriptorImageInfo di{g_dummySampler, g_dummy[std::min(t.dim, 5)].view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo di{g_dummySampler, g_dummy[DummyIdx(t.dim)].view, VK_IMAGE_LAYOUT_GENERAL};
         if (t.res == RES_SAMPLER) { tid = UINT32_MAX; sid = tw & 0xFFFFF; }      // a pure sampler word carries only the sampler id
         if (s.texPool && tid < s.texPool->ents.size() && s.texPool->ents[tid].tex) {
           auto& e = s.texPool->ents[tid];
           PrepareSampled(s, e.texG);
-          VkImageView v = GetView(e.tex, e.texG, e.hasView ? &e.view : nullptr, false);
-          if (v) di.imageView = v;
+          // A shader binding and the texture bound to it must agree on multisampling: an image of the wrong sample count behind a
+          // 2dms (or non-2dms) variable is invalid, so the dummy of the binding's own dimension stays in place.
+          if ((e.tex->samples > 1) != t.multisample) LogOnce(("msmix" + sp->key + std::to_string(t.binding)).c_str(), "stage %s binding %u is %s but texture id %u has %u samples (dummy used)", StageName(st), t.binding, t.multisample ? "multisample" : "single-sample", tid, e.tex->samples);
+          else { VkImageView v = GetView(e.tex, e.texG, e.hasView ? &e.view : nullptr, false); if (v) di.imageView = v; }
         } else if (t.res != RES_SAMPLER) LogOnce(("tex" + std::to_string(tid)).c_str(), "draw samples texture id %u that is not registered in the bound texture pool", tid);
         if (s.sampPool && sid < s.sampPool->ents.size() && s.sampPool->ents[sid] && s.sampPool->ents[sid]->sampler) di.sampler = s.sampPool->ents[sid]->sampler;
         else if (sid || h) LogOnce(("smp" + std::to_string(sid)).c_str(), "draw uses sampler id %u that is not registered", sid);
@@ -646,13 +653,14 @@ static bool BindDescriptors(RS& s, bool compute) {
       x.descriptorType = TexDescType(t); x.pImageInfo = &ii[first]; w.push_back(x);
     }
     for (auto& im : m.imgs) {
-      VkDescriptorImageInfo di{VK_NULL_HANDLE, g_dummy[1].view, VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo di{VK_NULL_HANDLE, g_dummy[DummyIdx(im.dim)].view, VK_IMAGE_LAYOUT_GENERAL};
       uint64_t h = (im.index >= 0 && im.index < 32) ? s.img[st][im.index] : 0;
       uint32_t tid = (uint32_t)h & 0xFFFFF;
       if (h && s.texPool && tid < s.texPool->ents.size() && s.texPool->ents[tid].tex) {
         auto& e = s.texPool->ents[tid]; PrepareSampled(s, e.texG);
         TextureImpl* ti = e.tex; ti->gpuWritten = true;
-        VkImageView v = GetView(ti, e.texG, e.hasView ? &e.view : nullptr, false); if (v) di.imageView = v;
+        bool imMs = im.dim == DIM_2DMS || im.dim == DIM_2DMS_ARRAY;
+        if ((ti->samples > 1) == imMs) { VkImageView v = GetView(ti, e.texG, e.hasView ? &e.view : nullptr, false); if (v) di.imageView = v; }
       }
       ii.push_back(di);
       VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; x.dstSet = set; x.dstBinding = im.binding; x.descriptorCount = 1;
