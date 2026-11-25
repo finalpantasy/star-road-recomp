@@ -27,3 +27,8 @@ Mark unresolved choices OPEN. Defaults are provisional unless explicitly approve
 - Rejected: our own VP9 decoder (cost, risk); answering the nvdec ioctls with a full NVDEC emulation (more surface than the 31 `nn::movie` imports).
 - Revisit if: the owner wants zero third-party binaries in the release, or LGPL terms conflict with how the release is packaged.
 - Update 2026-11-25: the owner: "ffmpeg inclusion is fine - just include it". Development uses the FFmpeg DLLs already on A: (MSYS2) for speed; the minimal LGPL-only build is deferred to release packaging (a release card), so the shipped DLL does not pull GPL terms onto our code.
+
+## D-012: Third-party libraries now, replaced over time
+- Date: 2026-11-25. Decided by: the owner ("include 3rd party things for now, we'll slowly replace them"; "ffmpeg inclusion is fine - just include it").
+- Decision: to reach a playable build fast, the runtime may use third-party libraries (first: FFmpeg for movies). Each one is listed in `docs/REUSE_LEDGER.md` with its license and a replacement card, and is replaced by our own code over time, tested against the library as the oracle. Binaries are not committed; they are loaded at run time from A: during development and shipped beside the exe at release with their license files.
+- Unchanged: D-009 still keeps copied third-party source out of Git unless the owner says otherwise.
