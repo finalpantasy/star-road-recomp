@@ -19,7 +19,7 @@ Execution: subchat smrpg-overlay, Sonnet high; design review by the owner.
 | AC3 | Controller only | Every item is reachable and changeable with the d-pad and A/B alone (scripted run) | log of the scripted run, captures | PASS: one scripted run of d-pad, L/R, X and B presses (`ac3_script.txt`) visits all 5 pages and all 10 rows and changes every value row; reset-all (A twice) and "Close menu" in `t16_ac3b.log`. No keyboard or mouse used. |
 | AC4 | Faithful when closed | With the overlay closed, the present is byte-identical to the build without it at the same frame | hashes | PASS: `ref-blit=equal` at frames 290, 520 and 600 (closed, before and after an open) and `DIFFERENT` only at 350 and 470 (open). Game frames are not deterministic run to run (the same frame hashes differ between two runs), so equality is shown against the plain blit redone in the same command buffer, not against a second build. `PlatOverlayDraw` returns on its first line when closed. |
 | AC5 | No regressions | platform, NVN tests, game_check | outputs | see Log |
-| AC6 (next round) | Pages inside the game's own Settings menu with controller only | Run | Capture | NOT_RUN |
+| AC6 | Open the overlay from the guest Settings entry with a controller | Choose Settings, change an option, close, and return focus | Composited frame checks and runtime log | PASS. The Settings selector opened the overlay and B returned to the guest Settings page. |
 ## Human gates
 The owner approves look and feel (docs/ART_DIRECTION.md); technical PASS does not approve appearance.
 ## Recovery and return condition
@@ -43,3 +43,9 @@ Record measured numbers and screenshots on A:.
 - AC5 result: platform tests PASS (392 checks, options 144 checks). NVN tests: nvn_unit, nvn_gpu and nvn_cache pipelines PASS; the cache sweep timed out twice at 245 s (exit 124) while every sweep line showed 0 failures: the shader-cache file reads slowed from 2 s to 140 s per 4000 files with 100+ python processes and Defender active on the PC (52 s when quiet), not a test failure and no NVN file is mine. Re-run it when the PC is quiet; the committed NVN report now holds the timed-out run. `game_check`: FAIL at the lifter check: runtime boot test (mock game) fails linking: `hle_fs.c:478` (`fsys_open_file`, `save_unlock_view` calling `postgame_is_save_name`) has an undefined symbol because the mock-game link lacks the task-24 postgame sources (another worker's uncommitted edit), not in my files; the instruction oracle and lift smoke pass.
 - Known: ImGui's Vulkan backend uploads its font texture with its own queue submit and wait idle (first open, new glyphs); the hook contract says record only. Documented in PLATFORM.md.
 - Known: look is a first pass in the game's menu colors for the owner to judge (docs/ART_DIRECTION.md).
+
+### Round 2 verification
+
+Guest Settings starts the ConfigSubMain coroutine. The hook opens the host overlay on the first successful MoveNext and keeps the native Settings page underneath it. The controller-only replay changed the performance cap to 30, saved it, and closed the overlay with B. A second B returned to the System menu.
+
+Composited frames 4915 and 5190 include the host overlay. Frame 5365 shows the native Settings page after closing, and 5550 shows the System menu. Text recognition and present hashes verified the frames without displaying the gameplay captures. Both the platform suite (392 checks) and options suite (201 checks) passed. The playback and captures are private under codex_t16_settings_02 in the work directory on A:.

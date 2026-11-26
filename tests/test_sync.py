@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "runtime"
 WORK = Path(os.environ.get("SMRPG_TEST_DIR", r"A:\AI\Recomps\smrpg-work\build\test_sync"))
 GEN = Path(os.environ.get("SMRPG_GEN_DIR", r"A:\AI\Recomps\smrpg-work\build\gen_game"))
+TEST_PROCESS_FLAGS = subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
 
 
 def main():
@@ -30,14 +31,13 @@ def main():
     srcs = [SRC / f for f in ("rt_core.c", "loader.c", "svc.c", "hle_nn.c", "rt_weak.c")] + sorted((SRC / "hle").glob("*.c")) + sorted((SRC / "eh").glob("*.c")) + sorted((SRC / "gc").glob("*.c")) + sorted((SRC / "mods").glob("*.c")) + [SRC / "platform" / "overlay" / "options.c", ROOT / "tools" / "datatbl" / "nrbf.c"]
     cmd = [clang, "-std=gnu11", "-O2", "-g", "-march=x86-64-v3", "-ffp-contract=off", "-fno-strict-aliasing", "-w", "-D_WIN32_WINNT=0x0A00",
            "-I", str(SRC), "-I", str(GEN)] + [str(s) for s in srcs] + [str(ROOT / "tests" / "runtime" / "test_sync.c"), "-o", str(exe)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, creationflags=TEST_PROCESS_FLAGS)
     tests = []
     if r.returncode:
         tests.append({"name": "build test_sync", "status": "failed", "detail": (r.stderr or r.stdout)[-1500:]})
     else:
-        creation = 0x00004000 | 0x00000010   # no window
         try:
-            p = subprocess.run([str(exe)], capture_output=True, text=True, timeout=400, creationflags=0x00004000)
+            p = subprocess.run([str(exe)], capture_output=True, text=True, timeout=400, creationflags=TEST_PROCESS_FLAGS)
             out = p.stdout
             if p.returncode not in (0, 1):
                 tests.append({"name": "test_sync process", "status": "failed", "detail": "exit %d\n%s" % (p.returncode, (out + p.stderr)[-800:])})

@@ -4,11 +4,33 @@
  * guest the way rtld does: nn::init::Start(thread handle, rtld end, flag fn, run-init fn, run-fini fn).
  * Stops with a clear log line once the first nn service request is logged. Our own code. */
 #include "rt_internal.h"
+#include "platform/overlay/overlay.h"
 #include "platform/plat.h"
 int svc_thread_registry(RtThread **out, int max);   /* svc.c */
 
 static int g_no_init;
 static int g_max_seconds = 60;
+
+#ifdef SMRPG_OVERLAY
+static GuestFn g_settings_move_next;
+
+static void settings_move_next(Ctx *c) {
+    /* IL2CPP SystemMenu/<ConfigSubMain>d__24: state zero is the first MoveNext after Settings is selected. */
+    const uintptr_t self = (uintptr_t)c->x[0];
+    const int starting = self && *(const int32_t *)(self + 0x10) == 0;
+    g_settings_move_next(c);
+    if (starting && c->x[0] && !c->exc) overlay_open_from_guest_settings();
+}
+
+static void register_guest_settings_hook(void) {
+    /* v1.0.1 coroutine entry. The guest invokes MoveNext through the dispatch table. */
+    const uint32_t rva = 0x215a600;
+    if (rva >= g_mod[0].text_size) return;
+    const uint64_t addr = g_mod[0].base + rva;
+    g_settings_move_next = rt_lookup(addr);
+    if (g_settings_move_next) rt_reg(addr, settings_move_next);
+}
+#endif
 
 /* ---- the three functions rtld hands to nn::init::Start (see runtime-handover.md) ---- */
 static void rtld_flag(Ctx *c) { (void)c; }
@@ -248,7 +270,12 @@ int main(int argc, char **argv) {
     if (g_reg_nchunks == 0) rt_log("no game library is linked (g_reg_nchunks = 0): every guest address will miss and need the interpreter");
     const char *nolift = getenv("SMRPG_NO_LIFTED");   /* differential test: run everything in the IR interpreter */
     if (nolift && *nolift == '1') rt_log("SMRPG_NO_LIFTED=1: lifted functions are not registered, the interpreter runs all guest code");
-    else for (uint32_t i = 0; i < g_reg_nchunks; i++) g_reg_chunks[i]();
+    else {
+        for (uint32_t i = 0; i < g_reg_nchunks; i++) g_reg_chunks[i]();
+#ifdef SMRPG_OVERLAY
+        if (g_reg_nchunks) register_guest_settings_hook();
+#endif
+    }
     rt_log("registered %u generated chunks", g_reg_nchunks);
 
     if (getenv("SMRPG_PROF")) CreateThread(NULL, 0, prof_main, (LPVOID)(uintptr_t)(DWORD)atoi(getenv("SMRPG_PROF")), 0, NULL);

@@ -565,13 +565,25 @@ static void svc_get_system_tick(Ctx *c) { c->x[0] = rt_cntvct(); }
 static void svc_sync_preempt(Ctx *c) { (void)c; }
 
 /* ------------------------------------------------------------------ address arbiter (doc 4.2) */
-typedef struct { int used, kind; uint64_t addr, key; uint32_t tag; int64_t seq; int woken; } Waiter;   /* kind: 0 lock, 1 condvar, 2 address */
+typedef struct {
+    int used, kind;   /* kind: 0 lock, 1 condvar, 2 address */
+    uint64_t addr, key;
+    uint32_t tag;
+    int64_t seq;
+    int woken;
+    CONDITION_VARIABLE cv;
+} Waiter;
 static Waiter g_w[1024];
 static int64_t g_wseq;
 
 static Waiter *w_add(int kind, uint64_t addr, uint64_t key, uint32_t tag) {
-    for (int i = 0; i < 1024; i++)
-        if (!g_w[i].used) { g_w[i] = (Waiter){1, kind, addr, key, tag, ++g_wseq, 0}; return &g_w[i]; }
+    for (int i = 0; i < 1024; i++) {
+        if (g_w[i].used) continue;
+        Waiter *w = &g_w[i];
+        *w = (Waiter){.used = 1, .kind = kind, .addr = addr, .key = key, .tag = tag, .seq = ++g_wseq};
+        InitializeConditionVariable(&w->cv);
+        return w;
+    }
     return 0;
 }
 static Waiter *w_first(int kind, uint64_t addr, uint64_t key, int *count) {
@@ -590,14 +602,19 @@ static Waiter *w_first(int kind, uint64_t addr, uint64_t key, int *count) {
 static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, __ATOMIC_ACQUIRE); }
 static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a, v, __ATOMIC_RELEASE); }
 
+/* Only the selected waiter can make progress. Waking unrelated waiters on g_kcv made them contend for g_k on every handoff. */
+static void w_wake(Waiter *w) {
+    w->woken = 1;
+    WakeConditionVariable(&w->cv);
+}
+
 /* kernel-side unlock of the Horizon mutex word at addr (g_k held) */
 static void mutex_unlock_locked(uint64_t addr) {
     int n;
     Waiter *w = w_first(0, addr, 0, &n);
     if (w) {
         st32(addr, w->tag | (n > 1 ? WAIT_MASK : 0));
-        w->woken = 1;
-        WakeAllConditionVariable(&g_kcv);
+        w_wake(w);
     } else {
         st32(addr, 0);
     }
@@ -605,7 +622,7 @@ static void mutex_unlock_locked(uint64_t addr) {
 
 /* wait until a lock waiter entry is granted (g_k held) */
 static void lock_wait_locked(Waiter *w) {
-    while (!w->woken) SleepConditionVariableCS(&g_kcv, &g_k, INFINITE);
+    while (!w->woken) SleepConditionVariableCS(&w->cv, &g_k, INFINITE);
     w->used = 0;
 }
 
@@ -653,7 +670,7 @@ static void svc_wait_pwk(Ctx *c) {
             if (el >= deadline) { timed_out = 1; break; }
             wait = (DWORD)(deadline - el);
         }
-        SleepConditionVariableCS(&g_kcv, &g_k, wait);
+        SleepConditionVariableCS(&w->cv, &g_k, wait);
     }
     w->used = 0;
     if (timed_out) { int left; w_first(1, 0, key, &left); if (!left) st32(key, 0); }
@@ -686,10 +703,9 @@ static void svc_signal_pwk(Ctx *c) {
     for (int k = 0; count <= 0 || k < count; k++) {
         Waiter *w = w_first(1, 0, key, 0);
         if (!w) break;
-        w->woken = 1;
+        w_wake(w);
     }
     { int left; w_first(1, 0, key, &left); if (!left) st32(key, 0); }   /* no waiters left: clear the user mode flag */
-    WakeAllConditionVariable(&g_kcv);
     LeaveCriticalSection(&g_k);
     c->x[0] = 0;
 }
@@ -720,7 +736,7 @@ static void svc_wait_for_address(Ctx *c) {
             if (el >= deadline) { timed_out = 1; break; }
             wait = (DWORD)(deadline - el);
         }
-        SleepConditionVariableCS(&g_kcv, &g_k, wait);
+        SleepConditionVariableCS(&w->cv, &g_k, wait);
     }
     w->used = 0;
     LeaveCriticalSection(&g_k);
@@ -747,9 +763,8 @@ static void svc_signal_to_address(Ctx *c) {
     for (int k = 0; count <= 0 || k < count; k++) {
         Waiter *w = w_first(2, addr, 0, 0);
         if (!w) break;
-        w->woken = 1;
+        w_wake(w);
     }
-    WakeAllConditionVariable(&g_kcv);
     LeaveCriticalSection(&g_k);
     c->x[0] = 0;
 }

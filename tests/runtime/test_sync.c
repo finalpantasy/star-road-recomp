@@ -279,10 +279,11 @@ static void *prod(void *p) {
     uint32_t tag = (uint32_t)InterlockedIncrement(&q->next_tag);
     for (;;) {
         mtx_lock(c, &q->mtx, tag);
-        if (q->produced >= q->total) { mtx_unlock(c, &q->mtx, tag); break; }
-        while (q->count == 64) {
+        while (q->count == 64 && q->produced < q->total) {
             sv(c, 0x1C, (uint64_t)&q->mtx, (uint64_t)&q->cv_not_full, tag, (uint64_t)-1);   /* WaitProcessWideKeyAtomic, unlocks and relocks */
         }
+        /* A different producer can finish the queue while this one waits for a slot. */
+        if (q->produced >= q->total) { mtx_unlock(c, &q->mtx, tag); break; }
         int v = (int)(++q->produced);
         q->q[q->tail] = v; q->tail = (q->tail + 1) & 63; q->count++;
         q->sum_in += (uint64_t)v;
@@ -306,7 +307,10 @@ static void *cons(void *p) {
             sv(c, 0x1C, (uint64_t)&q->mtx, (uint64_t)&q->cv_not_empty, tag, (uint64_t)-1);
         }
         int v = q->q[q->head]; q->head = (q->head + 1) & 63; q->count--;
-        q->sum_out += (uint64_t)v; q->consumed++;
+        q->sum_out += (uint64_t)v;
+        /* Consumers hold the guest mutex. The host watchdog also reads this counter. */
+        long consumed = __atomic_load_n(&q->consumed, __ATOMIC_RELAXED);
+        __atomic_store_n(&q->consumed, consumed + 1, __ATOMIC_RELAXED);
         sv(c, 0x1D, (uint64_t)&q->cv_not_full, 1, 0, 0);
         mtx_unlock(c, &q->mtx, tag);
     }
@@ -318,22 +322,62 @@ static void run_queue(int nprod, int ncons, long total) {
     int n = 0;
     for (int i = 0; i < ncons; i++) thr_start(&t[n++], cons, q);
     for (int i = 0; i < nprod; i++) thr_start(&t[n++], prod, q);
-    int stuck = 0;
-    ULONGLONG t0 = GetTickCount64();
-    for (int i = 0; i < n; i++) {
-        ULONGLONG el = GetTickCount64() - t0;
-        DWORD left = el >= 60000 ? 0 : (DWORD)(60000 - el);
-        if (WaitForSingleObject(t[i].h, left) != WAIT_OBJECT_0) { stuck = 1; break; }
-    }
     char nm[64];
     snprintf(nm, sizeof nm, "condvar mutex queue %dp %dc", nprod, ncons);
-    if (stuck) { report(nm, "failed", "threads still running after 60 s (lost wakeup or deadlock): produced %ld consumed %ld", q->produced, q->consumed); free(q); return; }
+    HANDLE threads[32];
+    for (int i = 0; i < n; i++) threads[i] = t[i].h;
+    ULONGLONG last_progress = GetTickCount64();
+    long previous = 0;
+    for (;;) {
+        DWORD result = WaitForMultipleObjects(n, threads, TRUE, 1000);
+        if (result == WAIT_OBJECT_0) break;
+        long consumed = __atomic_load_n(&q->consumed, __ATOMIC_RELAXED);
+        if (consumed != previous) {
+            previous = consumed;
+            last_progress = GetTickCount64();
+        }
+        if (result != WAIT_TIMEOUT || GetTickCount64() - last_progress >= 60000) {
+            report(nm, "failed", "join result %#lx, consumed %ld of %ld without progress", result, consumed, total);
+            /* A worker can still access the queue and the thread arguments on this stack. */
+            ExitProcess(EXIT_FAILURE);
+        }
+    }
+    for (int i = 0; i < n; i++) CloseHandle(t[i].h);
     uint64_t want = (uint64_t)total * (total + 1) / 2;
     if (q->produced == total && q->consumed == total && q->sum_in == want && q->sum_out == want)
         report(nm, "passed", "%ld items, every item consumed exactly once, checksum %llu", total, (unsigned long long)want);
     else report(nm, "failed", "produced %ld consumed %ld sum_in %llu sum_out %llu want %llu", q->produced, q->consumed,
                 (unsigned long long)q->sum_in, (unsigned long long)q->sum_out, (unsigned long long)want);
     free(q);
+}
+
+static void test_producer_limit_after_wait(void) {
+    Q q = {.count = 64, .produced = 64, .total = 65, .nprod = 1, .next_tag = 0x400};
+    Thr t;
+    thr_start(&t, prod, &q);
+    ULONGLONG start = GetTickCount64();
+    while (!ld_acq(&q.cv_not_full)) {
+        if (GetTickCount64() - start >= 10000) {
+            report("producer limit after condvar wait", "failed", "producer did not wait for a slot");
+            ExitProcess(EXIT_FAILURE);
+        }
+        Sleep(1);
+    }
+
+    Ctx *c = new_ctx();
+    mtx_lock(c, &q.mtx, 0x500);
+    /* Two slots are drained and a second producer fills one with the final item before the waiter can reacquire. */
+    q.count--;
+    q.produced++;
+    sv(c, 0x1D, (uint64_t)&q.cv_not_full, 1, 0, 0);
+    mtx_unlock(c, &q.mtx, 0x500);
+    if (WaitForSingleObject(t.h, 10000) != WAIT_OBJECT_0) {
+        report("producer limit after condvar wait", "failed", "producer did not finish after being signaled");
+        ExitProcess(EXIT_FAILURE);
+    }
+    CloseHandle(t.h);
+    report("producer limit after condvar wait", q.produced == q.total ? "passed" : "failed",
+           "expected %ld items, produced %ld", q.total, q.produced);
 }
 
 /* a plain mutex only: many threads increment a plain counter under the arbitrated lock */
@@ -455,6 +499,7 @@ int main(void) {
     run_queue(1, 1, 200000);
     run_queue(4, 4, 200000);
     run_queue(2, 6, 200000);
+    test_producer_limit_after_wait();
     test_timeout();
     test_signal_reacquire();
     test_addr();

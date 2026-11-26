@@ -18,6 +18,7 @@ void overlay_init(void);                              /* main thread, first thin
 void overlay_shutdown(void);
 int overlay_is_open(void);
 void overlay_toggle(const char *why);                 /* F1, the combo or the scripted token; why goes to the log */
+void overlay_open_from_guest_settings(void);          /* guest thread, once when the Settings coroutine starts */
 void overlay_filter_pads(PadState pads[PAD_MAX_PLAYERS], uint32_t *connected_mask);   /* main thread, every 5 ms pad publish */
 void overlay_event(const void *sdl_event);            /* const SDL_Event *: the mouse reaches the menu while it is open */
 void overlay_main_tick(void *sdl_window);             /* main thread: applies requests from the menu that SDL wants on the main thread (window mode, keyboard map) */

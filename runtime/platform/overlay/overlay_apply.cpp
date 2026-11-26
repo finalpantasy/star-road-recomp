@@ -109,6 +109,10 @@ void SaveIfDue(bool force) {
   g_saved_rev = g_opts.revision;                  // a failed write is not retried every frame
 }
 
+static void Open(const char* why) {
+  if (!g_open.exchange(1)) plat_log("overlay: opened (%s)", why);
+}
+
 void Close(const char* why) {
   if (g_open.exchange(0)) plat_log("overlay: closed (%s)", why);
   std::lock_guard<std::recursive_mutex> lk(g_optmx);
@@ -178,9 +182,10 @@ int overlay_is_open(void) { return g_open.load(); }
 
 void overlay_toggle(const char* why) {
   if (g_open.load()) { ovl::Close(why ? why : "toggle"); return; }
-  g_open = 1;
-  plat_log("overlay: opened (%s)", why ? why : "toggle");
+  ovl::Open(why ? why : "toggle");
 }
+
+void overlay_open_from_guest_settings(void) { ovl::Open("game Settings"); }
 
 void overlay_filter_pads(PadState pads[PAD_MAX_PLAYERS], uint32_t* mask) {
   (void)mask;
