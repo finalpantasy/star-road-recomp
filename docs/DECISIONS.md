@@ -33,3 +33,9 @@ Mark unresolved choices OPEN. Defaults are provisional unless explicitly approve
 - Decision: general third-party libraries (FFmpeg first; also SDL, Vulkan loader and the like) may stay in the runtime permanently. They are listed under "Third-party libraries" in `docs/REUSE_LEDGER.md` with their license, need no replacement card, and their binaries are not committed (loaded from A: in development, shipped beside the exe with license files at release).
 - What stays out: code taken from other recomp and emulator projects (ElKiro's SMRPG recomp, LASRecomp, the Snap recomp harness, Ryubing and similar). Under D-009 it lives only in gitignored `reuse/` and on A:, is never committed or pushed, and is replaced by our own code before release.
 - Release note: ship an LGPL-only FFmpeg build so its terms do not reach our own code.
+
+## D-013: Rust decomp leaves default on
+- Date: 2026-11-26. Decided by: the owner ("yes" to accepting task-29).
+- Decision: `SMRPG_DECOMP` defaults to `on`; the three Rust integer leaves replace their lifted bodies. `off` and `ab` stay available.
+- Why: 10,125 randomized comparisons per function and live A/B calls (Min, Max, is_in) all showed 0 differences.
+- Revisit if: a leaf is found to differ from the original in a new scene; run `ab` first.

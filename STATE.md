@@ -4,7 +4,7 @@ Fresh Windows build: task 35 verified that the current worktree loads `d03out` a
 Status: Controllable gameplay verified on the 1b23dda build. The hidden, muted `codex_t26_02` run captured Mario moving in Bowser's Keep and produced an autosave. Baseline check and receipt verification passed (run `1795626986474729600-46de807b`, six suites).
 Active work: task-25 verified the Hard table and the first battle. Task-16 AC6 passed with a controller-only replay. Task-27 audio and the shared heavy-slot lock are verified.
 Graphics: task-12 fixed the colored battle-transition background by converting packed HDR to sRGB during the screen copy. Two opening encounters showed an intact background beneath the stripes on PC. The hidden replay logged 1,624,029 draws with zero skips through present 6480. Same-version console parity remains open.
-Dependencies: Task-24 AC4 passed with two private replay fixtures. Its real-save field-by-field round trip is still pending. D-003 selects Rust for the decomp. The runtime stays C and C++.
+Dependencies: Task-24 AC4 passed with two private replay fixtures. Its real-save round trip passed on game-written saves (253d5bc). D-003 selects Rust for the decomp; task-29 is Accepted and `SMRPG_DECOMP` defaults to `on` (off and ab selectable). The runtime stays C and C++.
 Owner gates: judge FSR and the overlay in a visible play session. Hard difficulty balance and audible output require separate play checks.
 Work board: local task cards are current. The Claude lead mirrors Codex updates from the lead mailbox.
 Resume/run commands: `python tools/game_check.py run --root .`

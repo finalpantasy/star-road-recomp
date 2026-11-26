@@ -1,7 +1,7 @@
 ---
 id: task-29
 title: Swap three lifted integer functions for Rust
-status: Review
+status: Accepted
 ---
 
 ## Observed behavior
@@ -20,10 +20,10 @@ D-003 and D-007. Owns the Rust workspace, runtime swap glue, game build integrat
 
 | Check | Result |
 |---|---|
-| Game executable links the pinned Rust library | Pending |
-| 10,000 randomized comparisons per function | Pending |
-| Hidden muted run compares real guest calls with zero differences | Pending |
-| Locked project check passes | Pending |
+| Game executable links the pinned Rust library | PASS (build_game.py links smrpg_decomp) |
+| 10,000 randomized comparisons per function | PASS (10,125 per function, 0 differences) |
+| Hidden muted run compares real guest calls with zero differences | PASS (task29_is_in1: Min 140,449, Max 1,445, is_in 5 calls, 0 differences) |
+| Locked project check passes | PASS |
 
 ## Reproduction
 
@@ -40,3 +40,6 @@ Lead built and ran what the sandboxed worker could not. Build links smrpg_decomp
 
 ### 2026-11-26 Claude lead
 Live coverage for CommonRoutine.is_in closed. Hidden, muted run `task29_is_in1` (200 s, SMRPG_DECOMP=ab, selftest on, copy of the opening autosave, input of the task-24 route): selftest 10,125 comparisons per function with 0 differences; live Math.Min 140,449 calls, Math.Max 1,445 calls, is_in 5 calls, 0 differences for all three. Default stays off until the owner accepts.
+
+### 2026-11-26 Owner acceptance
+The owner accepted task-29 (reply "yes", relayed by the coordinator). `SMRPG_DECOMP` now defaults to `on` in `runtime/decomp/swap.c`; `off` and `ab` stay selectable. Rebuilt; `game_check run` PASS (1795713428354454800-a6373f7f); hidden muted 90 s run with the default logged `decomp mode=on registered=3`, 29,723 presents, 0 unknown IPC, interpreter misses none. check_log.py applies to `ab` logs only (task29_is_in1 passed it).

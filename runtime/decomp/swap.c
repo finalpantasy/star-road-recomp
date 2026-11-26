@@ -94,11 +94,12 @@ static void selftest(Leaf *leaf, GuestFn entry) {
 
 void decomp_start(void) {
     const char *value = getenv("SMRPG_DECOMP");
-    if (!value || !strcmp(value, "off")) return;
+    if (!value || !*value) value = "on";   /* default on (owner accepted task-29); off and ab stay selectable */
+    if (!strcmp(value, "off")) return;
     if (!strcmp(value, "ab")) mode = AB;
     else if (!strcmp(value, "on")) mode = ON;
     else {
-        rt_log("unknown SMRPG_DECOMP value; using off");
+        rt_log("unknown SMRPG_DECOMP value; using on");
         return;
     }
     const char *test = getenv("SMRPG_DECOMP_SELFTEST");

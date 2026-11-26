@@ -10,7 +10,7 @@ The Windows game build links the `smrpg_decomp` static library from the `decomp`
 
 `runtime/decomp/leaves.def` pairs each address with its lifted chunk and Rust symbol. CMake rebuilds those two chunks in its private build directory. It renames each original definition and keeps direct calls, tail calls and guest table entries pointing to the public wrapper. Startup checks the registered entry for every enabled swap.
 
-`SMRPG_DECOMP=off` is the default and runs the lifted body. Use `on` to run Rust. In `ab` mode the wrapper runs Rust on a copy of the register context, runs lifted C on the live context and compares every byte. Each mismatch log identifies the guest address and the first differing byte. These leaves have register-only effects. A leaf that writes guest memory needs an isolated copy of the affected memory before it can use this comparison.
+`SMRPG_DECOMP=on` is the default (owner accepted task-29, 2026-11-26) and runs the Rust leaves. Use `off` to run the lifted body. In `ab` mode the wrapper runs Rust on a copy of the register context, runs lifted C on the live context and compares every byte. Each mismatch log identifies the guest address and the first differing byte. These leaves have register-only effects. A leaf that writes guest memory needs an isolated copy of the affected memory before it can use this comparison.
 
 ## Reproduce the comparison
 
