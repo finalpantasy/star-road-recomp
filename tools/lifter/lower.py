@@ -150,6 +150,7 @@ def lower(d):
 # ---- extension lowerers (FP and Advanced SIMD): modules lower_simd_a.py and lower_simd_b.py, each exposing
 # decode_lower(word, pc) -> (opname, fields) or None. Ops live in ops_simd_a.py / ops_simd_b.py.
 import importlib  # noqa: E402
+import lower_crypto  # noqa: E402
 
 EXT_NAMES = [x for x in os.environ.get("SMRPG_EXT", "simd_a,simd_b").split(",") if x]
 EXTS = []
@@ -174,6 +175,9 @@ def decode_any(w, pc):
         reason = "base decoded %s without lowering" % d["op"]
     except Unsupported as e:
         reason = str(e)
+    r = lower_crypto.decode_lower(w, pc)
+    if r:
+        return r
     for m in EXTS:
         r = m.decode_lower(w, pc)
         if r:

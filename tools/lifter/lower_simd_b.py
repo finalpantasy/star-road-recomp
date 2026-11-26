@@ -21,12 +21,37 @@ def decode_lower(word, pc):
 def _decode(w):
     if w >> 31:
         return None
+    if _b(w, 30, 30):
+        scalar = _scalar_sat(w)
+        if scalar:
+            return scalar
     top = _b(w, 28, 24)
     if top in (0x0E, 0x0F):
         return _simd(w, top)
     # structure loads and stores: 0 Q 0011 0xx ... (bits 29:24 = 001100 / 001101 / 001110? see _ldst)
     if _b(w, 29, 24) in (0b001100, 0b001101):
         return _ldst_struct(w)
+    return None
+
+
+def _scalar_sat(w):
+    rd, rn, rm = _b(w, 4, 0), _b(w, 9, 5), _b(w, 20, 16)
+    unsigned = _b(w, 29, 29)
+    size = _b(w, 23, 22)
+    # SQADD/UQADD and SQSHL/UQSHL (register).
+    mask = w & 0xDF20FC00
+    if mask in (0x5E200C00, 0x5E204C00):
+        return "ns_sat", dict(rd=rd, rn=rn, rm=rm, size=size, uns=unsigned, shift=int(mask == 0x5E204C00))
+    # SQXTN/UQXTN, the zero-shift case of non-rounding saturating narrowing.
+    if w & 0xDF3FFC00 == 0x5E214800 and size != 3:
+        return "ns_shn", dict(rd=rd, rn=rn, size=size, sh=0, kind=4 + 2 * unsigned)
+    # SQSHRN/SQRSHRN and their unsigned forms.
+    if w & 0xDF80F400 == 0x5F009400:
+        immh = _b(w, 22, 19)
+        size = immh.bit_length() - 1
+        if 0 <= size < 3:
+            sh = (16 << size) - _b(w, 22, 16)
+            return "ns_shn", dict(rd=rd, rn=rn, size=size, sh=sh, kind=4 + _b(w, 11, 11) + 2 * unsigned)
     return None
 
 

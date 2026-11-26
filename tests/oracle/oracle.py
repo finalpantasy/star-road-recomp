@@ -31,6 +31,18 @@ CASEIN_HDR = struct.Struct("<32sII")
 CLANG = "clang"
 FPSR_CMP = 0x0800009F   # QC and the IOC/DZC/OFC/UFC/IXC/IDC cumulative bits
 
+# Synthetic instruction encodings exercise cases that the text sampler rarely
+# sees, including every CRC width and both element widths of PMULL and PMULL2.
+CRYPTO_WORDS = (
+    0x4E284820, 0x4E285820, 0x4E286820, 0x4E287820,
+    0x5E280820, 0x5E281820, 0x5E282820,
+    *(0x5E020020 | (kind << 12) for kind in range(7)),
+    0x0E22E020, 0x4E22E020, 0x0EE2E020, 0x4EE2E020,
+    *(0x1AC24020 | (polynomial << 12) | (size << 10) | ((size == 3) << 31)
+      for polynomial in range(2) for size in range(4)),
+)
+SCALAR_SAT_WORDS = (0x5EA00C20, 0x5EA04C20, 0x5EA14820, 0x5F119C20, 0x5F3F9C20)
+
 
 def load_text_words():
     p = os.path.join(IMG, "main.text.bin")
@@ -66,6 +78,13 @@ def gather_words(per_op, only, seed):
         s = by_op.setdefault(nm, set())
         if len(s) < per_op:
             s.add(w)
+    synthetic = CRYPTO_WORDS + (SCALAR_SAT_WORDS if "simd_b" in gen.EXT_NAMES else ())
+    for w in synthetic:
+        nm, _ = lower_word(w)
+        if nm is None or nm not in ops.OPS:
+            raise ValueError("failed to decode synthetic instruction %08x" % w)
+        if not only or nm in only:
+            by_op.setdefault(nm, set()).add(w)
     # register-field mutations
     out = {}
     for nm, s in by_op.items():

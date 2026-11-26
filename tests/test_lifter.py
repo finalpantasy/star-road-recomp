@@ -39,6 +39,11 @@ def main():
     def record(name, status, detail=""):
         tests.append({"name": name, "status": status, "detail": detail[-400:]})
 
+    for script, name in (("test_lifter_crypto.py", "emitted crypto and CRC vectors"),
+                         ("test_lifter_jump_tables.py", "bounded jump-table recovery")):
+        rc, out = run([sys.executable, "-I", str(ROOT / "tests" / script)], 60)
+        record(name, "passed" if rc == 0 else "failed", out)
+
     for _attempt in range(2):   # the runtime reserves a large address range; another heavy process can make it fail once
         rc, out = run([sys.executable, "-I", str(ROOT / "tests" / "test_runtime_boot.py")], 300)
         if rc == 0:

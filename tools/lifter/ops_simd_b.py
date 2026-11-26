@@ -6,6 +6,29 @@ repeat the first register, declared RWv/Rv so the lifter's dirty-register datafl
 """
 from ops import op
 
+
+def register_scalar_sat():
+    """Append scalar ops after legacy IR IDs, including the control records."""
+    op("ns_sat", "rd:Wv rn:Rv rm:Rv size uns shift", """
+    vb_u _n = {RV(rn)}, _m = {RV(rm)}, _result = {{0, 0}};
+    int _bits = 8 << size;
+    s128 _a = vb_getx(&_n, size, 0, uns), _b = vb_getx(&_m, size, 0, uns);
+    s128 _value = shift ? vb_shl_lane(c, _a, (s8)_b, _bits, 0, 1, uns) :
+                          (uns ? vb_satU(c, _a + _b, _bits) : vb_satS(c, _a + _b, _bits));
+    vb_put(&_result, size, 0, (u64)_value & vb_mask(_bits));
+    WV(rd, _result.v);
+    """)
+    op("ns_shn", "rd:Wv rn:Rv size sh kind", """
+    vb_u _src = {RV(rn)}, _result = {{0, 0}};
+    s128 _value = vb_getx(&_src, size + 1, 0, kind >= 6);
+    if (kind & 1) _value = (_value + ((s128)1 << (sh - 1))) >> sh;
+    else _value >>= sh;
+    int _bits = 8 << size;
+    _value = kind >= 6 ? vb_satU(c, _value, _bits) : vb_satS(c, _value, _bits);
+    vb_put(&_result, size, 0, (u64)_value & vb_mask(_bits));
+    WV(rd, _result.v);
+    """)
+
 # ---------------------------------------------------------------- moves, logic, immediates
 op("nv_mov", "q rd:Wv rn:Rv", "WV(rd, vb_q(q, RV(rn)));")
 op("nv_logic", "q opc rd:RWv rn:Rv rm:Rv", "WV(rd, vb_logic(q, opc, RV(rn), RV(rm), RV(rd)));")

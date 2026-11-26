@@ -100,7 +100,110 @@ def decode_range(words, base, start, end):
 
 
 # ------------------------------------------------------------------ jump tables
-def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
+def jump_table_targets(rd_mem, table, count, size, signed, d64, base, opt, shift):
+    if not 0 < count <= 4096:
+        return None
+    targets = []
+    for i in range(count):
+        raw = rd_mem(table + i * size, size)
+        if raw is None:
+            return None
+        value = dec.sext(raw, size * 8) if signed else raw
+        if not d64:
+            value &= 0xFFFFFFFF
+        width = 8 << (opt & 3)
+        value &= dec._ones(width)
+        if opt & 4:
+            value = dec.sext(value, width)
+        targets.append((base + (value << shift)) & MASK_ALL)
+    return targets
+
+
+# The separate address calculation in ADD (extended register); LDR (immediate)
+# can hide the index from the combined register-offset load matcher below.
+def match_split_jump_table(insns, idx, rd_mem, text_range, entries, valid_target):
+    lo = max(0, idx - 40)
+    br_addr, _, br = insns[idx]
+    boundaries = set(entries)
+    boundaries.update(f["target"] for _, nm, f in insns if nm in ("b", "bcond", "cbz", "tbz"))
+    if br_addr in boundaries:
+        return None
+    regs = {}
+    maxima = {}
+    cmp = None
+
+    def reg(n):
+        return regs.get(n, ("input", n))
+
+    for k in range(lo, idx):
+        a, nm, f = insns[k]
+        if a in boundaries:
+            regs.clear()
+            maxima.clear()
+            cmp = None
+        if nm == "bcond" and cmp is not None and f["cond"] in (2, 8):
+            obj, sf, imm = cmp
+            if not a < f["target"] <= br_addr:
+                maximum = imm - (f["cond"] == 2)
+                if maximum >= 0:
+                    maxima[obj, sf] = min(maxima.get((obj, sf), maximum), maximum)
+                    cmp = None
+                    continue
+        cmp = None
+        if nm is None or nm in lw.CONTROL:
+            regs.clear()
+            maxima.clear()
+            continue
+        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["rn"] != 31:
+            cmp = reg(f["rn"]), f["sf"], f["imm"]
+            continue
+
+        result = ("write", k)
+        dest = f.get("rd", f.get("rt", 31))
+        if nm == "movi":
+            result = ("const", f["imm"])
+        elif nm == "log_reg" and f["opc"] == 1 and f["rn"] == 31 and not f["neg"] and not f["amt"]:
+            src = reg(f["rm"])
+            if f["sf"] and f["rm"] != 31:
+                result = src
+            elif f["rm"] != 31 and (src, 0) in maxima:
+                maxima[result, 1] = maxima[src, 0]
+        elif nm == "log_imm" and f["opc"] == 0:
+            maxima[result, 1] = f["imm"]
+        elif nm == "addsub_imm" and f["sf"] and not f["sub"] and reg(f["rn"])[0] == "const":
+            result = ("const", (reg(f["rn"])[1] + f["imm"]) & MASK_ALL)
+        elif nm in ("addsub_ext", "addsub_reg") and f["sf"] and not f["sub"] and f["rm"] != 31:
+            base, offset = reg(f["rn"]), reg(f["rm"])
+            if base[0] == "const" and (nm == "addsub_ext" or f["shift"] == 0):
+                opt = f["option"] if nm == "addsub_ext" else 3
+                if offset[0] == "table" and opt in (2, 3, 6, 7):
+                    result = ("target", base[1], offset, opt, f["amt"])
+                elif opt in (2, 3, 6, 7):
+                    maximum = maxima.get((offset, 1))
+                    if opt in (2, 6):
+                        maximum = maxima.get((offset, 0), maximum)
+                    if maximum is not None and 0 <= maximum < 4096:
+                        result = ("indexed", base[1], maximum + 1, f["amt"])
+        elif nm == "ld" and reg(f["rn"])[0] == "indexed":
+            _, base, count, shift = reg(f["rn"])
+            if 1 << shift == f["sz"]:
+                result = ("table", (base + f["imm"]) & MASK_ALL, count, f["sz"], f["sgn"], f["d64"])
+        _, written = op_regs(nm, f)
+        for n in range(31):
+            if written & bit_x(n):
+                regs[n] = result if n == dest else ("write", k, n)
+
+    target = reg(br["rn"])
+    if target[0] != "target":
+        return None
+    _, base, (_, table, count, size, signed, d64), opt, shift = target
+    targets = jump_table_targets(rd_mem, table, count, size, signed, d64, base, opt, shift)
+    if not targets or any(t & 3 or not text_range[0] <= t < text_range[1] or not valid_target(t) for t in targets):
+        return None
+    return 0, 0, targets  # The emitter switches on the final target register.
+
+
+def match_jump_table(insns, idx, base_addr, rd_mem, func_range, text_end=None):
     """Resolve `br xN` at insns[idx] using a small symbolic walk over the preceding straight-line code.
     Returns (index_reg, index_ext_opt, [target addresses]) or None."""
     sym = {}
@@ -124,10 +227,10 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
             sym[f["rd"]] = sym.get(f["rm"])      # mov xd, xm keeps the symbolic value (table base parked in a callee-saved reg across a call)
         elif nm in ("addsub_reg", "addsub_ext") and not f["sub"]:
             sa, sb = sym.get(f["rn"]), sym.get(f["rm"])
-            sh = f["amt"] if nm == "addsub_reg" else f["amt"]
+            sh = f["amt"]
             if sa and sa[0] == "c" and sb and sb[0] == "tab":
                 sym[f["rd"]] = ("sum", sa[1], sb, sh, nm, f)
-            elif sa and sa[0] == "tab" and sb and sb[0] == "c":
+            elif sa and sa[0] == "tab" and sb and sb[0] == "c" and nm == "addsub_reg" and not sh:
                 sym[f["rd"]] = ("sum", sb[1], sa, sh, nm, f)
             else:
                 sym[f["rd"]] = None
@@ -145,6 +248,8 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
         return None
     _, base, tab, sh, nmadd, fadd = s
     _, taddr, sz, sgn, opt, amt, idxreg, fld = tab
+    if not fadd["sf"] or (nmadd == "addsub_reg" and fadd["shift"]) or (1 << amt) != sz:
+        return None
     # table bound: look back for  cmp xI, #N ; b.hi/b.hs
     # the index often reaches the table load through a copy (mov w8, w1 after cmp w1, #N): every register it was copied from
     # holds the same value, so a compare on any alias bounds the table
@@ -303,19 +408,15 @@ def match_jump_table(insns, idx, base_addr, rd_mem, func_range):
                 break
     if bound is None:
         return None
-    targets = []
-    for i in range(bound):
-        ea = taddr + i * sz
-        raw = rd_mem(ea, sz)
-        if raw is None:
-            return None
-        if sgn:
-            raw = raw - (1 << (8 * sz)) if raw >> (8 * sz - 1) else raw
-        targets.append((base + (raw << sh)) & dec._ones(64))
+    add_opt = fadd["option"] if nmadd == "addsub_ext" else 3
+    targets = jump_table_targets(rd_mem, taddr, bound, sz, sgn, fld["d64"], base, add_opt, sh)
+    if not targets:
+        return None
     # The inventory often splits a switch from its case blocks (each block has its own FDE), so targets outside func_range are
     # expected. They are accepted when aligned and near the br (byte, halfword and word offset tables stay within the window);
     # the emitter turns them into tail calls to the function that owns the case block.
-    if any(t & 3 or t < base_addr or abs(t - br_addr) > 0x40000 for t in targets):
+    if any(t & 3 or t < base_addr or (text_end is not None and t >= text_end) or
+           abs(t - br_addr) > 0x40000 for t in targets):
         return None
     return idxreg, opt, targets
 
@@ -378,6 +479,18 @@ class Lifter:
                     if s[0]:
                         sites[a] = s
         site_pads = {a: s[1] for a, s in sites.items() if s[0] == 1 and start <= s[1] < end}
+        jump_entries = {entry, *site_pads.values()}
+        text_range = m["base"], m["base"] + len(m["words"]) * 4
+
+        def valid_target(t):
+            if t in pos:
+                return insns[pos[t]][1] is not None
+            try:
+                lw.decode_any(m["words"][(t - m["base"]) // 4], t)
+            except dec.Unsupported:
+                return False
+            return True
+
         pad_roots = set()
         self._sites = sites
         has_pad = any(s[0] == 1 for s in sites.values())
@@ -418,7 +531,9 @@ class Lifter:
                             work.append(t)
                         leaders.add(nxt)
                     elif nm == "br":
-                        r = match_jump_table(insns, i, m["base"], m["rd_mem"], (start, end))
+                        r = match_jump_table(insns, i, m["base"], m["rd_mem"], (start, end), text_range[1])
+                        if r is None:
+                            r = match_split_jump_table(insns, i, m["rd_mem"], text_range, jump_entries, valid_target)
                         if r:
                             jt[a] = r
                             for t in r[2]:
