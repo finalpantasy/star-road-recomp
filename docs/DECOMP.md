@@ -1,6 +1,6 @@
 # Rust function swaps
 
-The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports eighteen leaves through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4). Each takes guest x0 to x2 as u64 and returns the new x0. The crate has no dependencies.
+The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports twenty-three leaves through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4, task-43 batch 5). Each takes guest x0 to x2 as u64 and returns the new x0. The crate has no dependencies.
 
 | Guest address | IL2CPP method |
 |---|---|
@@ -22,16 +22,29 @@ The Windows game build links the `smrpg_decomp` static library from the `decomp`
 | 0x71011ef830 | global slot 0x7103ded330 (reads memory, unnamed) |
 | 0x71005b8b00 | global slot 0x7103d823f8 (reads memory, unnamed) |
 | 0x710200fd30 | System.String.IsNullOrEmpty (reads the length at +0x10) |
+| 0x71002cdf10 | Unity native, zero 12 bytes at x0 (writes memory, unnamed) |
+| 0x7101451240 | CRI native, store x0 twice at x2 and w1 at x2+0x10 (writes memory, unnamed) |
+| 0x7101347ed8 | Unity native setter, w1 to x0+4 (writes memory, unnamed) |
+| 0x7101e357b0 | Battle.BattleCharacterAnimator.set_idle_id(int, int) (writes x0+0x54 and +0x58) |
+| 0x7101a0aa40 | Flag.off() (clears the byte at x0+0x10) |
 
 `runtime/decomp/leaves.def` pairs each address with its lifted chunk and Rust symbol. CMake rebuilds those two chunks in its private build directory. It renames each original definition and keeps direct calls, tail calls and guest table entries pointing to the public wrapper. Startup checks the registered entry for every enabled swap.
 
-`SMRPG_DECOMP=on` is the default (owner accepted task-29, 2026-11-26) and runs the Rust leaves. Use `off` to run the lifted body. In `ab` mode the wrapper runs Rust on a copy of the register context, runs lifted C on the live context and compares every byte. Each mismatch log identifies the guest address and the first differing byte. These leaves have register-only effects. A leaf that writes guest memory needs an isolated copy of the affected memory before it can use this comparison.
+`SMRPG_DECOMP=on` is the default (owner accepted task-29, 2026-11-26) and runs the Rust leaves. Use `off` to run the lifted body. In `ab` mode the wrapper runs Rust on a copy of the register context, runs lifted C on the live context and compares every byte. Each mismatch log identifies the guest address and the first differing byte. Leaves that store use the shadow comparison described under "Leaves that write guest memory".
 
 ## Leaves that read guest memory
 
 Guest memory is identity mapped: a guest address is a host address (`runtime/ir_ops.h`, `MLD` and `ir_ld`, relaxed atomic loads). Rust reads through the same relaxed atomic loads (`guest_ld64` and `guest_ld32` in `decomp/smrpg_decomp/src/lib.rs`), so there is no separate mapping. Only load-only leaves qualify (no stores, calls, atomics, exclusive loads, floating point or lazy static init), because then both sides leave memory unchanged and the byte comparison stays valid. A concurrent writer between the Rust read and the lifted read could show up as a false difference; none did in the 200 s run.
 
 The selftest needs no game data for the pointer leaves: `reads_x0_pointer` in `runtime/decomp/swap.c` points x0 at a private 64-word fake region (a mix of zero, small and full-width words) or at null. The global slot leaves read the real mapped slot, which both bodies see identically. `cargo test --release --locked --offline` in `decomp/` also checks the two pointer leaves against a fake region.
+
+## Leaves that write guest memory
+
+A store leaf is declared with `SLEAF(chunk, address, symbol, base_reg, offset, bytes)` in `runtime/decomp/leaves.def`: the footprint is `bytes` bytes (at most 32) at `x[base_reg] + offset`, taken from the decoded instructions. The Rust symbol takes a fourth argument, `delta`, added to every store address (`guest_st64`, `guest_st32` and `guest_st8` in `decomp/smrpg_decomp/src/lib.rs`, relaxed atomic stores like `ir_st`). The game passes 0 (`run_rust` in `swap.c`).
+
+In `ab` mode `compare_store` in `runtime/decomp/swap.c` copies the footprint into a private shadow buffer with the same low 4 address bits, runs Rust on a register copy with `delta` set so its stores land in the shadow, then runs lifted C on live memory, so live memory ends exactly as the lifted body leaves it. It then compares all registers and the footprint bytes (live against shadow). A leaf with a footprint gap leaves the gap bytes equal on both sides. Residual race: another thread writing the footprint between the copy and the final compare would show a false difference (never a game corruption, because Rust never touches live memory). None appeared.
+
+The selftest points the base register into a private 64-word fake region (never game memory) and requires the footprint to change in at least one call, so a pair that both skip the store cannot pass. Store leaves may not call, load from the footprint, use atomics, floating point or a write barrier, or write any register other than x0; the scan keeps only leaves of stores whose base and value registers are x0, x1, x2 or xzr. `cargo test` checks the written bytes with a fake region.
 
 ## Reproduce the comparison
 

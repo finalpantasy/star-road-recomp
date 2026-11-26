@@ -3,10 +3,15 @@
 #include <stdatomic.h>
 
 typedef uint64_t (*IntLeaf)(uint64_t, uint64_t, uint64_t);
+/* Store leaves take a fourth argument added to every store address (0 in normal use; see compare()). */
+typedef uint64_t (*StoreLeaf)(uint64_t, uint64_t, uint64_t, uint64_t);
+#define MAX_FOOTPRINT 32
 typedef struct {
     uint64_t address;
     GuestFn entry, lifted;
     IntLeaf rust;
+    StoreLeaf rust_store;           /* set instead of rust for a leaf that writes guest memory */
+    unsigned base_reg, offset, bytes; /* store footprint: bytes at x[base_reg] + offset */
     atomic_ullong calls, differences;
 } Leaf;
 
@@ -14,29 +19,70 @@ typedef struct {
     void f_##addr(Ctx *); \
     extern void f_##addr##_lifted(Ctx *); \
     extern uint64_t rust(uint64_t, uint64_t, uint64_t);
+#define SLEAF(chunk, addr, rust, base, off, len) \
+    void f_##addr(Ctx *); \
+    extern void f_##addr##_lifted(Ctx *); \
+    extern uint64_t rust(uint64_t, uint64_t, uint64_t, uint64_t);
 #include "leaves.def"
 #undef LEAF
+#undef SLEAF
 
 enum {
 #define LEAF(chunk, addr, rust) index_##addr,
+#define SLEAF(chunk, addr, rust, base, off, len) index_##addr,
 #include "leaves.def"
 #undef LEAF
+#undef SLEAF
     leaf_count
 };
 
 static Leaf leaves[leaf_count] = {
-#define LEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0},
+#define LEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0, 0, 0, 0, 0},
+#define SLEAF(chunk, addr, rust, base, off, len) \
+    {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, rust, base, off, len, 0, 0},
 #include "leaves.def"
 #undef LEAF
+#undef SLEAF
 };
 
 static enum { OFF, ON, AB } mode;
 
 static void run_rust(const Leaf *leaf, Ctx *c) {
-    c->x[0] = leaf->rust(c->x[0], c->x[1], c->x[2]);
+    c->x[0] = leaf->rust_store ? leaf->rust_store(c->x[0], c->x[1], c->x[2], 0)
+                               : leaf->rust(c->x[0], c->x[1], c->x[2]);
+}
+
+/* Store leaves, ab mode. Rust never touches live memory: its stores are redirected (delta argument) into a
+ * private shadow buffer that starts as a copy of the footprint, with the same low 4 address bits so atomic
+ * store alignment matches. Lifted C then runs on live memory exactly as without the swap. Afterwards the
+ * registers and the footprint bytes (live vs shadow) must match. Residual race: a different thread writing
+ * the footprint between the snapshot and the final compare gives a false difference (the leaves are setters
+ * on one object at a time; none seen). It cannot corrupt the game, since live memory only sees lifted code. */
+static void compare_store(Leaf *leaf, Ctx *c) {
+    _Alignas(16) unsigned char shadow_storage[MAX_FOOTPRINT + 16];
+    const uint64_t footprint = c->x[leaf->base_reg] + leaf->offset;
+    unsigned char *shadow = shadow_storage + (footprint & 15);
+    memcpy(shadow, (const void *)(uintptr_t)footprint, leaf->bytes);
+    Ctx trial;
+    memcpy(&trial, c, sizeof trial);
+    trial.x[0] = leaf->rust_store(trial.x[0], trial.x[1], trial.x[2],
+                                  (uint64_t)(uintptr_t)shadow - footprint);
+    leaf->lifted(c);
+    int regs_differ = memcmp(&trial, c, sizeof trial) != 0;
+    int memory_differs = memcmp(shadow, (const void *)(uintptr_t)footprint, leaf->bytes) != 0;
+    if (regs_differ || memory_differs) {
+        atomic_fetch_add(&leaf->differences, 1);
+        rt_log("decomp mismatch addr=%#llx regs=%d memory=%d", (unsigned long long)leaf->address, regs_differ,
+               memory_differs);
+    }
+    atomic_fetch_add(&leaf->calls, 1);
 }
 
 static void compare(Leaf *leaf, Ctx *c) {
+    if (leaf->rust_store) {
+        compare_store(leaf, c);
+        return;
+    }
     Ctx trial;
     memcpy(&trial, c, sizeof trial);
     run_rust(leaf, &trial);
@@ -59,8 +105,10 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
 }
 
 #define LEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#define SLEAF(chunk, addr, rust, base, off, len) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #include "leaves.def"
 #undef LEAF
+#undef SLEAF
 
 static uint64_t random_word(uint64_t *state) {
     *state ^= *state << 13;
@@ -90,6 +138,7 @@ static void fill_fake_region(uint64_t *words, unsigned count, uint64_t *state) {
 static void selftest(Leaf *leaf, GuestFn entry) {
     uint64_t seed = leaf->address;
     uint64_t fake[64];
+    unsigned long long stores_seen = 0;   /* runs where the footprint changed, so a no-op pair cannot pass */
     const int pointer_leaf = reads_x0_pointer(leaf->address);
     /* 64-bit boundaries plus the byte, short and 20-bit limits that clamp-style leaves care about. */
     const uint64_t edges[] = {0, 1, 2, 0x1f, 0x20, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff, 0x10000,
@@ -112,8 +161,21 @@ static void selftest(Leaf *leaf, GuestFn entry) {
             uint64_t pick = random_word(&seed);
             c.x[0] = (pick & 7) == 0 ? 0 : (uint64_t)(uintptr_t)&fake[(pick >> 8) % (RT_ARRAY_LEN(fake) - 3)];
         }
+        if (leaf->rust_store) {
+            /* store leaves write only into the private fake region, never game memory; the base register
+             * is an 8-byte aligned slot with the whole footprint inside the region */
+            fill_fake_region(fake, RT_ARRAY_LEN(fake), &seed);
+            c.x[leaf->base_reg] = (uint64_t)(uintptr_t)&fake[(random_word(&seed) >> 8) % 40];
+            unsigned char before[MAX_FOOTPRINT];
+            const unsigned char *at = (const unsigned char *)(uintptr_t)(c.x[leaf->base_reg] + leaf->offset);
+            memcpy(before, at, leaf->bytes);
+            entry(&c);
+            stores_seen += memcmp(before, at, leaf->bytes) != 0;
+            continue;
+        }
         entry(&c);
     }
+    if (leaf->rust_store && !stores_seen) rt_exit(10, "decomp selftest: store leaf never wrote");
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);
     rt_log("decomp selftest addr=%#llx random=10000 edge=%u calls=%llu differences=%llu",

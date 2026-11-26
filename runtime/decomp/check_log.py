@@ -6,7 +6,7 @@ import sys
 
 def check(log):
     manifest = Path(__file__).with_name("leaves.def").read_text()
-    addresses = re.findall(r"LEAF\(\w+, ([0-9a-f]+),", manifest)
+    addresses = re.findall(r"S?LEAF\(\w+, ([0-9a-f]+),", manifest)
     if not addresses or "decomp mismatch" in log:
         raise ValueError("empty manifest or a recorded mismatch")
     if not re.search(r"EXIT code=(?:0\b|4 \(watchdog timeout\))", log):

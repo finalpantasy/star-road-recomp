@@ -6,7 +6,7 @@ from pathlib import Path
 
 def wrap(chunk, source, registry):
     for row in registry.splitlines():
-        owner, address = re.fullmatch(r"LEAF\((main_[0-9]+), ([0-9a-f]+), \w+\)", row).groups()
+        owner, address = re.fullmatch(r"S?LEAF\((main_[0-9]+), ([0-9a-f]+), \w+(?:, \d+)*\)", row).groups()
         if owner != chunk:
             continue
         symbol = "f_" + address
