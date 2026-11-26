@@ -76,3 +76,119 @@ pub extern "C" fn smrpg_fixmul_16(a: u64, b: u64, _: u64) -> u64 {
     let p = p.wrapping_add(p >> 63).wrapping_add(0x8000);
     (p >> 16) as u64
 }
+
+// ---- Leaves that read guest memory (task-42) ----
+// Guest memory is identity mapped: a guest address is a host address (runtime/ir_ops.h, MLD/ir_ld, which
+// use relaxed atomic loads). The leaves below read through the same relaxed atomic loads and never store.
+
+/// Relaxed 64-bit guest load, the same access as ir_ld(8, ...).
+///
+/// # Safety
+/// `addr` must be a mapped, 8-byte aligned guest address.
+#[inline(always)]
+unsafe fn guest_ld64(addr: u64) -> u64 {
+    unsafe {
+        core::sync::atomic::AtomicU64::from_ptr(addr as *mut u64)
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Relaxed 32-bit guest load, the same access as ir_ld(4, ...).
+///
+/// # Safety
+/// `addr` must be a mapped, 4-byte aligned guest address.
+#[inline(always)]
+unsafe fn guest_ld32(addr: u64) -> u32 {
+    unsafe {
+        core::sync::atomic::AtomicU32::from_ptr(addr as *mut u32)
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Unity native null-safe getter: object == 0 ? 0 : *(u64 *)(object + 0x10).
+#[inline(always)]
+unsafe fn null_safe_ld64_0x10(object: u64) -> u64 {
+    if object == 0 {
+        object
+    } else {
+        unsafe { guest_ld64(object.wrapping_add(0x10)) }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_ld64_nullsafe_0x10(object: u64, _: u64, _: u64) -> u64 {
+    unsafe { null_safe_ld64_0x10(object) }
+}
+
+/// Static slot getter: *(u64 *)(0x7103ded000 + 0x330) (a global pointer in the data segment).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_static_7103ded330(_: u64, _: u64, _: u64) -> u64 {
+    unsafe { guest_ld64(0x7103ded000 + 0x330) }
+}
+
+/// The same global slot plus 0x18 (address of a field inside the object it points to).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_static_7103ded330_add_0x18(_: u64, _: u64, _: u64) -> u64 {
+    unsafe { guest_ld64(0x7103ded000 + 0x330).wrapping_add(0x18) }
+}
+
+/// Static slot getter: *(u64 *)(0x7103d82000 + 0x3f8).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_static_7103d823f8(_: u64, _: u64, _: u64) -> u64 {
+    unsafe { guest_ld64(0x7103d82000 + 0x3f8) }
+}
+
+/// System.String.IsNullOrEmpty: string == 0 || *(u32 *)(string + 0x10) == 0 (the length field).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_string_is_null_or_empty(string: u64, _: u64, _: u64) -> u64 {
+    u64::from(string == 0 || unsafe { guest_ld32(string.wrapping_add(0x10)) } == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fake guest memory: 64 words, addressed by their host address (identity mapping).
+    fn region(seed: u64) -> [u64; 64] {
+        let mut s = seed | 1;
+        let mut words = [0u64; 64];
+        for w in &mut words {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *w = match s % 4 {
+                0 => 0,
+                1 => s >> 60,
+                _ => s,
+            };
+        }
+        words
+    }
+
+    #[test]
+    fn nullsafe_load_matches_reference() {
+        for seed in 1..200 {
+            let words = region(seed);
+            let base = words.as_ptr() as u64;
+            assert_eq!(unsafe { smrpg_ld64_nullsafe_0x10(0, 5, 6) }, 0);
+            for k in 0..60u64 {
+                let got = unsafe { smrpg_ld64_nullsafe_0x10(base + 8 * k, 0, 0) };
+                assert_eq!(got, words[(k + 2) as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn string_is_null_or_empty_matches_reference() {
+        for seed in 1..200 {
+            let words = region(seed);
+            let base = words.as_ptr() as u64;
+            assert_eq!(unsafe { smrpg_string_is_null_or_empty(0, 0, 0) }, 1);
+            for k in 0..60u64 {
+                let length = words[(k + 2) as usize] as u32;
+                let got = unsafe { smrpg_string_is_null_or_empty(base + 8 * k, 0, 0) };
+                assert_eq!(got, u64::from(length == 0));
+            }
+        }
+    }
+}

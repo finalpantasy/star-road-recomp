@@ -69,8 +69,28 @@ static uint64_t random_word(uint64_t *state) {
     return *state;
 }
 
+/* Leaves whose x0 is a guest pointer that they dereference. The selftest points x0 into a private fake
+ * region (or at null) so it needs no game data. Leaves that read a fixed global slot (task-42) read the
+ * real mapped slot, which both the Rust and lifted bodies see identically. */
+static int reads_x0_pointer(uint64_t address) {
+    return address == 0x71005b3a20ULL || address == 0x710200fd30ULL;
+}
+
+static void fill_fake_region(uint64_t *words, unsigned count, uint64_t *state) {
+    for (unsigned i = 0; i < count; ++i) {
+        uint64_t r = random_word(state);
+        switch (r & 3) {   /* zero lengths, small values and full-width values all matter */
+        case 0: words[i] = 0; break;
+        case 1: words[i] = (r >> 60) | ((r & 4) ? 0x100000000ULL : 0); break;
+        default: words[i] = r; break;
+        }
+    }
+}
+
 static void selftest(Leaf *leaf, GuestFn entry) {
     uint64_t seed = leaf->address;
+    uint64_t fake[64];
+    const int pointer_leaf = reads_x0_pointer(leaf->address);
     /* 64-bit boundaries plus the byte, short and 20-bit limits that clamp-style leaves care about. */
     const uint64_t edges[] = {0, 1, 2, 0x1f, 0x20, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff, 0x10000,
                               0x7fffffffULL, 0x80000000ULL, 0xffffffffULL, 0x100000000ULL,
@@ -85,6 +105,12 @@ static void selftest(Leaf *leaf, GuestFn entry) {
         if (i < edge_cases) {
             unsigned k = i;
             for (unsigned j = 0; j < 3; ++j, k /= nedge) c.x[j] = edges[k % nedge];
+        }
+        if (pointer_leaf) {
+            fill_fake_region(fake, RT_ARRAY_LEN(fake), &seed);
+            /* null one time in eight, otherwise an 8-byte aligned slot with room for the +0x10 field */
+            uint64_t pick = random_word(&seed);
+            c.x[0] = (pick & 7) == 0 ? 0 : (uint64_t)(uintptr_t)&fake[(pick >> 8) % (RT_ARRAY_LEN(fake) - 3)];
         }
         entry(&c);
     }
