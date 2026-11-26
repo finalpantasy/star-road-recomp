@@ -1,3 +1,8 @@
 LEAF(main_0371, 710213e820, smrpg_min_i32)
 LEAF(main_0371, 710213e670, smrpg_max_i32)
 LEAF(main_0288, 71018ba2c0, smrpg_in_range_i32)
+LEAF(main_0086, 71005aca60, smrpg_array_elem_addr)
+LEAF(main_0317, 7101b905b0, smrpg_hash_combine)
+LEAF(main_0335, 7101d70190, smrpg_ptr_eq)
+LEAF(main_0335, 7101d715a0, smrpg_ptr_ne)
+LEAF(main_0340, 7101df0f10, smrpg_ptr_eq)

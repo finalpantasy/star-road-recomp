@@ -2,7 +2,7 @@
 #include "swap.h"
 #include <stdatomic.h>
 
-typedef int32_t (*IntLeaf)(int32_t, int32_t, int32_t);
+typedef uint64_t (*IntLeaf)(uint64_t, uint64_t, uint64_t);
 typedef struct {
     uint64_t address;
     GuestFn entry, lifted;
@@ -13,7 +13,7 @@ typedef struct {
 #define LEAF(chunk, addr, rust) \
     void f_##addr(Ctx *); \
     extern void f_##addr##_lifted(Ctx *); \
-    extern int32_t rust(int32_t, int32_t, int32_t);
+    extern uint64_t rust(uint64_t, uint64_t, uint64_t);
 #include "leaves.def"
 #undef LEAF
 
@@ -33,7 +33,7 @@ static Leaf leaves[leaf_count] = {
 static enum { OFF, ON, AB } mode;
 
 static void run_rust(const Leaf *leaf, Ctx *c) {
-    c->x[0] = (uint32_t)leaf->rust((int32_t)c->x[0], (int32_t)c->x[1], (int32_t)c->x[2]);
+    c->x[0] = leaf->rust(c->x[0], c->x[1], c->x[2]);
 }
 
 static void compare(Leaf *leaf, Ctx *c) {
@@ -71,7 +71,11 @@ static uint64_t random_word(uint64_t *state) {
 
 static void selftest(Leaf *leaf, GuestFn entry) {
     uint64_t seed = leaf->address;
-    const uint32_t edges[] = {0, 1, UINT32_MAX, INT32_MAX, 0x80000000u};
+    /* 64-bit boundaries plus the byte, short and 20-bit limits that clamp-style leaves care about. */
+    const uint64_t edges[] = {0, 1, 2, 0x1f, 0x20, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff, 0x10000,
+                              0x7fffffffULL, 0x80000000ULL, 0xffffffffULL, 0x100000000ULL,
+                              UINT64_MAX, UINT64_MAX - 0x7f, UINT64_MAX - 0x80, UINT64_MAX - 0x7fff,
+                              UINT64_MAX - 0x8000, 0xffffffff80000000ULL, INT64_MAX, (uint64_t)INT64_MIN};
     const unsigned nedge = RT_ARRAY_LEN(edges);
     const unsigned edge_cases = nedge * nedge * nedge;
     for (unsigned i = 0; i < 10000 + edge_cases; ++i) {
@@ -80,8 +84,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
         for (unsigned j = 0; j < 32; ++j) c.x[j] = random_word(&seed);
         if (i < edge_cases) {
             unsigned k = i;
-            for (unsigned j = 0; j < 3; ++j, k /= nedge)
-                c.x[j] = (c.x[j] & 0xffffffff00000000ULL) | edges[k % nedge];
+            for (unsigned j = 0; j < 3; ++j, k /= nedge) c.x[j] = edges[k % nedge];
         }
         entry(&c);
     }
