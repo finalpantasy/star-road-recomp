@@ -1,0 +1,6 @@
+[workspace]
+members = ["smrpg_decomp"]
+resolver = "3"
+
+[profile.release]
+panic = "abort"

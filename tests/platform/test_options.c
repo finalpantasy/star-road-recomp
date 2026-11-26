@@ -262,6 +262,57 @@ static void test_file_path(void) {
     CHECK(strstr(p, "options.ini") != NULL);
 }
 
+static int g_applied[OPT_COUNT], g_apply_count;
+static void record_apply(int id, void *context) {
+    (void)context;
+    if (id >= 0 && id < OPT_COUNT) { g_applied[id]++; g_apply_count++; }
+}
+
+static void test_live_reload(const char *dir) {
+    char path[512];
+    snprintf(path, sizeof path, "%s\\live.ini", dir);
+    spit(path, "[performance]\nfps_cap = 60\n[display]\nupscale = fsr1\n[audio]\nvolume = 20\n");
+    Options live, before;
+    opts_defaults(&live);
+    CHECK_EQ(opt_set(&live, OPT_FPS_CAP, 2), 1);   /* current running value is 60 */
+    CHECK_EQ(opt_set(&live, OPT_VOLUME, 75), 1);
+    before = live; before.extra = NULL;
+    int invalid = -1;
+    CHECK_EQ(opts_reload_live(&live, path, &invalid), 3);
+    CHECK_EQ(invalid, 0);
+    CHECK_EQ(opt_get(&live, OPT_FPS_CAP), 2);      /* file value matches current */
+    CHECK_EQ(opt_get(&live, OPT_UPSCALE), 1);
+    CHECK_EQ(opt_get(&live, OPT_VOLUME), 20);
+    memset(g_applied, 0, sizeof g_applied); g_apply_count = 0;
+    opts_apply_diff(&before, &live, record_apply, NULL);
+    CHECK_EQ(g_apply_count, 2);
+    CHECK_EQ(g_applied[OPT_UPSCALE], 1);
+    CHECK_EQ(g_applied[OPT_VOLUME], 1);
+
+    /* An invalid field is ignored without losing the last valid running value. */
+    spit(path, "[performance]\nfps_cap = 999\n[display]\nupscale = bogus\n[audio]\nvolume = 45\n");
+    CHECK_EQ(opts_reload_live(&live, path, &invalid), 1);
+    CHECK_EQ(invalid, 2);
+    CHECK_EQ(opt_get(&live, OPT_FPS_CAP), 2);
+    CHECK_EQ(opt_get(&live, OPT_UPSCALE), 1);
+    CHECK_EQ(opt_get(&live, OPT_VOLUME), 45);
+    opts_free(&live);
+}
+
+static void test_file_debounce(void) {
+    OptFileWatch w;
+    opts_watch_init(&w, 100, 1000);
+    CHECK_EQ(opts_watch_poll(&w, 100, 1100, 250), 0);  /* initial state is not a reload */
+    CHECK_EQ(opts_watch_poll(&w, 101, 1200, 250), 0);  /* first change starts debounce */
+    CHECK_EQ(opts_watch_poll(&w, 101, 1449, 250), 0);
+    CHECK_EQ(opts_watch_poll(&w, 101, 1450, 250), 1);
+    CHECK_EQ(opts_watch_poll(&w, 101, 1800, 250), 0);
+    CHECK_EQ(opts_watch_poll(&w, 102, 1900, 250), 0);
+    CHECK_EQ(opts_watch_poll(&w, 103, 2000, 250), 0);  /* another write resets the timer */
+    CHECK_EQ(opts_watch_poll(&w, 103, 2249, 250), 0);
+    CHECK_EQ(opts_watch_poll(&w, 103, 2250, 250), 1);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "--emit")) {
         char *buf = (char *)calloc(1, 1 << 16);
@@ -280,6 +331,8 @@ int main(int argc, char **argv) {
     test_restart_tracking();
     test_save_roundtrip(argv[1]);
     test_file_path();
+    test_live_reload(argv[1]);
+    test_file_debounce();
     printf("options: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

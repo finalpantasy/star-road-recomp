@@ -290,7 +290,7 @@ void DrawMenu(const ImVec2& disp, const Options& o) {
     if (it.opt >= 0) {
       const OptDesc* d = opt_desc(it.opt);
       dl->AddText(font, 24 * ui, ImVec2(r0.x + 34 * ui, ly), white, d->label);
-      if (d->apply != OPT_LIVE) dl->AddText(font, 14 * ui, ImVec2(r0.x + 34 * ui + TextW(24 * ui, d->label) + 10 * ui, ly + 8 * ui), dim, d->apply == OPT_RESTART ? "on restart" : "on load");
+      if (d->apply != OPT_LIVE) dl->AddText(font, 14 * ui, ImVec2(r0.x + 34 * ui + TextW(24 * ui, d->label) + 10 * ui, ly + 8 * ui), dim, d->apply == OPT_RESTART ? "applies on restart" : "applies on next load");
       char val[OPT_PATH_MAX];
       opt_text(&o, it.opt, val, sizeof val);
       const bool restart = opt_needs_restart(&o, it.opt);

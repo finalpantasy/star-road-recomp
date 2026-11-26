@@ -3,6 +3,7 @@
 #include "rt_internal.h"
 #include "eh/eh.h"
 #include "gc/gc.h"
+#include "decomp/swap.h"
 
 uint32_t *g_fn[RT_NMOD];
 int g_trace;
@@ -373,6 +374,9 @@ void rt_summary(void) {
 }
 
 void rt_exit(int code, const char *why) {
+#ifdef SMRPG_DECOMP_BUILT
+    decomp_summary();
+#endif
     rt_log("EXIT code=%d (%s)", code, why ? why : "");
     { extern void prof_dump(void) __attribute__((weak)); if (prof_dump) prof_dump(); }   /* main.c's sampling profiler; absent in the unit-test builds */
     if (code == 4) dump_addrs();   /* watchdog: lets a passing run be compared with a crashing one */

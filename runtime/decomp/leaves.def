@@ -1,0 +1,3 @@
+LEAF(main_0371, 710213e820, smrpg_min_i32)
+LEAF(main_0371, 710213e670, smrpg_max_i32)
+LEAF(main_0288, 71018ba2c0, smrpg_in_range_i32)

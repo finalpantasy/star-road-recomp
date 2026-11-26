@@ -25,6 +25,7 @@ bool g_loaded = false;
 char g_path[MAX_PATH];
 unsigned g_saved_rev = 0;
 ULONGLONG g_changed_at = 0;
+OptFileWatch g_file_watch{};
 
 std::atomic<int> g_open{0};
 std::atomic<int> g_fps_hz{0};
@@ -59,7 +60,7 @@ void ApplyOne(int id, const Options& o, bool startup) {
     case OPT_SHARPNESS: if (!EnvSet("SMRPG_UPSCALE_SHARPNESS")) upscale::SetSharpness(kSharp[v]); break;
     case OPT_FPS_CAP: g_fps_hz = kFps[v]; break;
     case OPT_UNLOCK_POSTGAME: break;                                   // read by the game (overlay_unlock_postgame) when a save loads or a new game starts
-    case OPT_AUDIO: break;                                             // restart: plat_init reads it
+    case OPT_AUDIO: break;                                             // restart: a null audout sink has no stream to promote to a device
     case OPT_VOLUME: plat_audio_set_volume(v); break;
     case OPT_INPUT_MAP: {
       if (startup) break;                                              // load_keymap reads it at startup
@@ -79,6 +80,15 @@ void LogValues(const char* when) {
     n += (size_t)snprintf(line + n, sizeof line - n, " %s=%s", opt_desc(i)->key, t);
   }
   plat_log("overlay: options (%s):%s", when, line);
+}
+
+void ApplyReloaded(int id, void*) {
+  ApplyOne(id, g_opts, false);
+  char t[OPT_PATH_MAX];
+  opt_text(&g_opts, id, t, sizeof t);
+  const OptApply apply = opt_desc(id)->apply;
+  const char* timing = apply == OPT_RESTART ? " (applies on restart)" : (apply == OPT_ON_LOAD ? " (next save load or new game)" : "");
+  plat_log("overlay: applied options.ini change %s.%s = %s%s", opt_desc(id)->section, opt_desc(id)->key, t, timing);
 }
 
 }  // namespace
@@ -168,6 +178,7 @@ void overlay_init(void) {
   else plat_log("overlay: %d options read from %s", n, g_path);
   g_loaded = true;
   g_saved_rev = g_opts.revision;
+  opts_watch_init(&g_file_watch, opts_file_stamp(g_path), GetTickCount64());
   for (int i = 0; i < OPT_COUNT; i++) ApplyOne(i, g_opts, true);
   LogValues("startup");
 }
@@ -258,8 +269,23 @@ void overlay_event(const void* e) {
 }
 
 void overlay_main_tick(void* win) {
+  const ULONGLONG now = GetTickCount64();
+  const uint64_t stamp = opts_file_stamp(g_path);
+  if (opts_watch_poll(&g_file_watch, stamp, now, 250)) {
+    std::lock_guard<std::recursive_mutex> lk(g_optmx);
+    Options before = g_opts;
+    before.extra = nullptr;
+    int invalid = 0;
+    const int loaded = opts_reload_live(&g_opts, g_path, &invalid);
+    if (loaded < 0) plat_log("overlay: options.ini changed but could not be read: %s", g_path);
+    else {
+      opts_apply_diff(&before, &g_opts, ApplyReloaded, nullptr);
+      g_saved_rev = g_opts.revision;
+      plat_log("overlay: options.ini reload complete (%d valid values, %d invalid values)", loaded, invalid);
+    }
+  }
   int w = g_req_window.exchange(-1);
-  if (w >= 0 && win && plat_window_visible()) SDL_SetWindowFullscreen((SDL_Window*)win, w == 1);
+  if (w >= 0 && win) SDL_SetWindowFullscreen((SDL_Window*)win, w == 1);
   char path[OPT_PATH_MAX];
   bool pending = false;
   {

@@ -4,6 +4,7 @@
  * guest the way rtld does: nn::init::Start(thread handle, rtld end, flag fn, run-init fn, run-fini fn).
  * Stops with a clear log line once the first nn service request is logged. Our own code. */
 #include "rt_internal.h"
+#include "decomp/swap.h"
 #include "platform/overlay/overlay.h"
 #include "platform/plat.h"
 int svc_thread_registry(RtThread **out, int max);   /* svc.c */
@@ -272,6 +273,9 @@ int main(int argc, char **argv) {
     if (nolift && *nolift == '1') rt_log("SMRPG_NO_LIFTED=1: lifted functions are not registered, the interpreter runs all guest code");
     else {
         for (uint32_t i = 0; i < g_reg_nchunks; i++) g_reg_chunks[i]();
+#ifdef SMRPG_DECOMP_BUILT
+        decomp_start();
+#endif
 #ifdef SMRPG_OVERLAY
         if (g_reg_nchunks) register_guest_settings_hook();
 #endif

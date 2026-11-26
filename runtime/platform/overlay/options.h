@@ -57,10 +57,20 @@ typedef struct Options {
     unsigned revision;                     /* bumps on every change */
 } Options;
 
+typedef struct OptFileWatch {
+    uint64_t observed_stamp;
+    uint64_t applied_stamp;
+    uint64_t changed_at_ms;
+    int pending;
+} OptFileWatch;
+
+typedef void (*OptApplyFn)(int id, void *context);
+
 const OptDesc *opt_desc(int id);
 void opts_defaults(Options *o);                              /* also marks the defaults as "applied" */
 void opts_free(Options *o);
 int opts_load(Options *o, const char *path);                  /* values read (>= 0), -1 if the file cannot be opened; bad lines are skipped; marks "applied" */
+int opts_reload_live(Options *o, const char *path, int *invalid_count); /* merge valid keys into o; invalid values keep their old value */
 int opts_save(const Options *o, const char *path);            /* 0 ok; writes a temp file beside it and renames, so a crash never leaves half a file */
 int opt_get(const Options *o, int id);
 const char *opt_get_path(const Options *o, int id);
@@ -77,6 +87,10 @@ void opt_text(const Options *o, int id, char *buf, size_t n);
 size_t opts_default_ini(char *buf, size_t n);
 /* where the options file lives: SMRPG_OPTIONS, else options.ini beside the exe */
 void opts_file_path(char *buf, size_t n);
+uint64_t opts_file_stamp(const char *path);
+void opts_watch_init(OptFileWatch *watch, uint64_t stamp, uint64_t now_ms);
+int opts_watch_poll(OptFileWatch *watch, uint64_t stamp, uint64_t now_ms, uint64_t debounce_ms);
+void opts_apply_diff(const Options *before, const Options *after, OptApplyFn apply, void *context);
 
 #ifdef __cplusplus
 }

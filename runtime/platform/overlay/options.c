@@ -2,6 +2,7 @@
 #include "options.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +35,7 @@ static const OptDesc T[OPT_COUNT] = {
         "game adds no limit (the game's own pacing and vsync). A number caps presented frames per second.",
         OPT_ENUM, OPT_LIVE, 0, 0, 6, 1, N_FPS, NN(N_FPS), 0},
     [OPT_AUDIO] = {"audio", "enabled", "Audio", "Audio output",
-        "on opens the real playback device when the game starts. The --audio flag does the same.",
+        "on opens the real playback device when audout starts. A running null sink cannot be promoted to a device, so restart is required.",
         OPT_BOOL, OPT_RESTART, 0, 0, 1, 1, N_OFFON, NN(N_OFFON), 0},
     [OPT_VOLUME] = {"audio", "volume", "Audio", "Volume",
         "master volume of the audio output, 0 to 100.",
@@ -46,19 +47,19 @@ static const OptDesc T[OPT_COUNT] = {
         "off is the game as shipped. on unlocks the post-game boss rematches without playing through. Applies on save load or new game.",
         OPT_BOOL, OPT_ON_LOAD, 0, 0, 1, 1, N_OFFON, NN(N_OFFON), 0},
     [OPT_DIFFICULTY_PLUS] = {"gameplay", "difficulty_plus", "Gameplay", "Difficulty Plus",
-        "off is faithful. hard raises monster stats from the data table. Applies after restarting the game.",
+        "off is faithful. hard raises monster stats from the data table. The runtime caches the transformed monster.tbl once per run, so restart is required.",
         OPT_ENUM, OPT_RESTART, 0, 0, 1, 1, N_DIFFICULTY_PLUS, NN(N_DIFFICULTY_PLUS), 0},
     [OPT_DIFFICULTY_PLUS_HP_PERCENT] = {"gameplay", "difficulty_plus_hp_percent", "Gameplay", "Enemy HP scale (%)",
-        "hard mode HP multiplier, from 100% to 400%. Default 150%. Applies after restarting the game.",
+        "hard mode HP multiplier, from 100% to 400%. Default 150%. monster.tbl is cached once per run, so restart is required.",
         OPT_INT, OPT_RESTART, 150, 100, 400, 5, NULL, 0, 0},
     [OPT_DIFFICULTY_PLUS_DAMAGE_PERCENT] = {"gameplay", "difficulty_plus_damage_percent", "Gameplay", "Enemy stat scale (%)",
-        "hard mode attack, defense, magic attack and magic defense multiplier. Default 125%. Applies after restarting the game.",
+        "hard mode attack, defense, magic attack and magic defense multiplier. Default 125%. monster.tbl is cached once per run, so restart is required.",
         OPT_INT, OPT_RESTART, 125, 100, 400, 5, NULL, 0, 0},
     [OPT_DIFFICULTY_PLUS_BOSS_HP_PERCENT] = {"gameplay", "difficulty_plus_boss_hp_percent", "Gameplay", "Boss HP scale (%)",
-        "HP multiplier for monster IDs listed in difficulty_plus_boss_ids in options.ini. Default 150%. Applies after restarting the game.",
+        "HP multiplier for monster IDs listed in difficulty_plus_boss_ids in options.ini. Default 150%. monster.tbl is cached once per run, so restart is required.",
         OPT_INT, OPT_RESTART, 150, 100, 400, 5, NULL, 0, 0},
     [OPT_DIFFICULTY_PLUS_BOSS_DAMAGE_PERCENT] = {"gameplay", "difficulty_plus_boss_damage_percent", "Gameplay", "Boss stat scale (%)",
-        "Attack, defense, magic attack and magic defense multiplier for IDs in difficulty_plus_boss_ids. Default 125%. Applies after restarting the game.",
+        "Attack, defense, magic attack and magic defense multiplier for IDs in difficulty_plus_boss_ids. Default 125%. monster.tbl is cached once per run, so restart is required.",
         OPT_INT, OPT_RESTART, 125, 100, 400, 5, NULL, 0, 0},
 };
 
@@ -237,11 +238,116 @@ int opts_load(Options *o, const char *path) {
     return n;
 }
 
+/* Disk reloads are stricter than the original startup parser: a malformed field cannot
+ * silently clamp a running setting to a different value. Valid fields still merge. */
+int opts_reload_live(Options *o, const char *path, int *invalid_count) {
+    if (invalid_count) *invalid_count = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    Options parsed;
+    opts_defaults(&parsed);
+    int valid[OPT_COUNT] = {0}, n = 0, bad = 0;
+    char line[OPT_FILE_LINE_MAX], section[64] = "";
+    while (fgets(line, sizeof line, f)) {
+        if (!strchr(line, '\n') && strlen(line) == sizeof line - 1) {
+            int ch;
+            while ((ch = fgetc(f)) != '\n' && ch != EOF) {}
+            bad++;
+            continue;
+        }
+        char *s = trim(line);
+        if (!*s || *s == ';' || *s == '#') continue;
+        if (*s == '[') {
+            char *e = strchr(s, ']');
+            if (e) { *e = 0; snprintf(section, sizeof section, "%s", trim(s + 1)); }
+            continue;
+        }
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = trim(s), *val = trim(eq + 1);
+        int id = find_opt(section, key);
+        if (id < 0) { add_extra(&parsed, section, key, val); continue; }
+        if (T[id].type != OPT_PATH) {
+            char *c = strstr(val, " ;");
+            if (c) { *c = 0; val = trim(val); }
+        }
+        int ok = 1, value = 0;
+        const OptDesc *d = &T[id];
+        if (d->type == OPT_PATH) ok = strlen(val) < OPT_PATH_MAX;
+        else if (d->type == OPT_BOOL) ok = parse_bool(val, &value) == 0;
+        else if (d->type == OPT_ENUM) {
+            ok = 0;
+            for (int i = 0; i < d->n_names; i++) if (!_stricmp(val, d->names[i])) { value = i; ok = 1; break; }
+        } else {
+            char *end = NULL;
+            errno = 0;
+            long x = strtol(val, &end, 10);
+            ok = !errno && end != val && *end == 0 && x >= d->min && x <= d->max;
+            if (ok) value = (int)x;
+        }
+        if (!ok) { bad++; continue; }
+        if (d->type == OPT_PATH) snprintf(parsed.path[id], OPT_PATH_MAX, "%s", val);
+        else parsed.v[id] = value;
+        valid[id] = 1;
+        n++;
+    }
+    fclose(f);
+    for (int i = 0; i < OPT_COUNT; i++) if (valid[i]) {
+        if (T[i].type == OPT_PATH) opt_set_path(o, i, parsed.path[i]);
+        else opt_set(o, i, parsed.v[i]);
+    }
+    free(o->extra);
+    o->extra = parsed.extra;
+    parsed.extra = NULL;
+    opts_free(&parsed);
+    if (invalid_count) *invalid_count = bad;
+    return n;
+}
+
+uint64_t opts_file_stamp(const char *path) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return 0;
+    ULARGE_INTEGER t, size;
+    t.HighPart = d.ftLastWriteTime.dwHighDateTime;
+    t.LowPart = d.ftLastWriteTime.dwLowDateTime;
+    size.HighPart = d.nFileSizeHigh;
+    size.LowPart = d.nFileSizeLow;
+    return t.QuadPart ^ (size.QuadPart * 0x9E3779B185EBCA87ull);
+}
+
+void opts_watch_init(OptFileWatch *w, uint64_t stamp, uint64_t now_ms) {
+    memset(w, 0, sizeof *w);
+    w->observed_stamp = w->applied_stamp = stamp;
+    w->changed_at_ms = now_ms;
+}
+
+int opts_watch_poll(OptFileWatch *w, uint64_t stamp, uint64_t now_ms, uint64_t debounce_ms) {
+    if (stamp != w->observed_stamp) {
+        w->observed_stamp = stamp;
+        w->changed_at_ms = now_ms;
+        w->pending = 1;
+    }
+    if (!w->pending || now_ms - w->changed_at_ms < debounce_ms) return 0;
+    w->pending = 0;
+    if (stamp == w->applied_stamp) return 0;
+    w->applied_stamp = stamp;
+    return 1;
+}
+
+void opts_apply_diff(const Options *before, const Options *after, OptApplyFn apply, void *context) {
+    if (!before || !after || !apply) return;
+    for (int i = 0; i < OPT_COUNT; i++) {
+        int changed = T[i].type == OPT_PATH ? strcmp(before->path[i], after->path[i]) != 0 : before->v[i] != after->v[i];
+        if (changed) apply(i, context);
+    }
+}
+
 /* the text of the file for these values (buf may be NULL: only the length) */
 static size_t render(const Options *o, char *buf, size_t cap, int with_extra) {
     size_t len = 0;
 #define PUT(...) do { int w_ = snprintf(buf ? buf + len : NULL, buf ? (cap > len ? cap - len : 0) : 0, __VA_ARGS__); if (w_ > 0) len += (size_t)w_; } while (0)
-    PUT("; Star Road Recomp options. The in-game overlay writes this file (F1, or L + R + MINUS on a controller); you can edit it while the game is closed.\n");
+    PUT("; Star Road Recomp options. The in-game overlay writes this file (F1, or L + R + MINUS on a controller); you can also edit it while the game runs (most options apply live, the rest say so).\n");
     PUT("; Copy config/options.default.ini to options.ini beside smrpg.exe, or point SMRPG_OPTIONS at a file. A missing key keeps its default.\n");
     const char *last = "";
     for (int i = 0; i < OPT_COUNT; i++) {
