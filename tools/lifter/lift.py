@@ -240,92 +240,118 @@ def _bound32(s, m32):
     return min(cands) if cands else None
 
 
-def match_compact_jump_table(insns, idx, rd_mem, func_range, entries, valid_target):
-    lo = max(0, idx - 64)
-    br_addr, _, br = insns[idx]
-    boundaries = set(entries)
-    boundaries.update(f["target"] for _, nm, f in insns if nm in ("b", "bcond", "cbz", "tbz"))
-    if br_addr in boundaries:
-        return None
+class _CS:
+    """Abstract state of the compact-switch matcher: register expressions, index bounds and a pending compare."""
+    __slots__ = ("regs", "m32", "m64", "cmp")
+
+    def __init__(self, regs=None, m32=None, m64=None, cmp=None):
+        self.regs = {} if regs is None else regs
+        self.m32 = {} if m32 is None else m32
+        self.m64 = {} if m64 is None else m64
+        self.cmp = cmp
+
+    def copy(self):
+        return _CS(dict(self.regs), dict(self.m32), dict(self.m64), self.cmp)
+
+    def reg(self, n):
+        return self.regs.get(n, ("o", n))
+
+    def __eq__(self, other):
+        return (self.regs == other.regs and self.m32 == other.m32 and self.m64 == other.m64
+                and self.cmp == other.cmp)
+
+
+def _cs_depth(e):
+    return 1 + max((_cs_depth(x) for x in e if isinstance(x, tuple)), default=0)
+
+
+def _cs_join(x, y, where):
+    """Merge two states at a join point: a value both paths agree on survives, anything else becomes unknown."""
     regs = {}
-    m32 = {}
-    m64 = {}
-    cmp = None
+    for n in set(x.regs) | set(y.regs):
+        vx, vy = x.reg(n), y.reg(n)
+        regs[n] = vx if vx == vy else ("j", where, n)
+    m32 = {k: max(v, y.m32[k]) for k, v in x.m32.items() if k in y.m32}
+    m64 = {k: max(v, y.m64[k]) for k, v in x.m64.items() if k in y.m64}
+    return _CS(regs, m32, m64, x.cmp if x.cmp == y.cmp else None)
 
-    def reg(n):
-        return regs.get(n, ("o", n))
 
-    for k in range(lo, idx):
-        a, nm, f = insns[k]
-        if a in boundaries:
-            regs.clear()
-            m32.clear()
-            m64.clear()
-            cmp = None
-        if nm == "bcond" and cmp is not None and f["cond"] in (2, 8) and not a < f["target"] <= br_addr:
-            key, sf, imm = cmp
-            maximum = imm - (f["cond"] == 2)
-            if maximum >= 0:
-                tab = m64 if sf else m32
-                kk = key if sf else _lo32(key)
-                tab[kk] = min(tab.get(kk, maximum), maximum)
-            cmp = None
-            continue
-        prev_cmp, cmp = cmp, None
-        if nm is None or nm in lw.CONTROL:
-            regs.clear()
-            m32.clear()
-            m64.clear()
-            continue
-        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["rn"] != 31:
-            cmp = reg(f["rn"]), f["sf"], f["imm"]
-            continue
-        if (nm == "ccmp_imm" and f["sub"] and f["rn"] != 31 and f["cond"] == 1 and f["nzcv"] & 6 == 2):
-            # cond false: flags C=1 Z=0, so b.hi / b.hs is taken; cond true: a plain compare against imm
-            cmp = reg(f["rn"]), f["sf"], f["imm"]
-            continue
+def _cs_apply(st, a, nm, f):
+    """Run one instruction on `st` in place. Returns the compare that was pending when it ran (a conditional
+    branch uses it on its fall-through edge, see _cs_refine)."""
+    prev, st.cmp = st.cmp, None
+    if nm in ("b", "bcond", "cbz", "tbz"):
+        return prev
+    if nm is None or nm in lw.CONTROL:
+        st.regs.clear()
+        st.m32.clear()
+        st.m64.clear()
+        return prev
+    reg, m32, m64 = st.reg, st.m32, st.m64
+    if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["rn"] != 31:
+        st.cmp = reg(f["rn"]), f["sf"], f["imm"]
+        return prev
+    if (nm == "ccmp_imm" and f["sub"] and f["rn"] != 31 and f["cond"] == 1 and f["nzcv"] & 6 == 2):
+        # cond false: flags C=1 Z=0, so b.hi / b.hs is taken; cond true: a plain compare against imm
+        st.cmp = reg(f["rn"]), f["sf"], f["imm"]
+        return prev
+    result = ("w", a)
+    dest = f.get("rd", f.get("rt", 31))
+    if nm == "movi":
+        result = ("c", f["imm"])
+    elif nm == "log_reg" and f["opc"] == 1 and f["rn"] == 31 and not f["neg"] and not f["amt"] and f["rm"] != 31:
+        src = reg(f["rm"])
+        result = src if f["sf"] else ("z", _lo32(src))
+    elif nm == "log_imm" and f["opc"] == 0 and f["rn"] != 31:
+        mask = f["imm"] & (MASK_ALL if f["sf"] else 0xFFFFFFFF)
+        if mask <= 0xFFFFFFFF:
+            result = ("z", ("and", _lo32(reg(f["rn"])), mask))
+    elif nm == "addsub_imm" and f["sf"] and not f["sub"] and reg(f["rn"])[0] == "c":
+        result = ("c", (reg(f["rn"])[1] + f["imm"]) & MASK_ALL)
+    elif nm == "bfm" and f["opc"] == 2 and f["imms"] >= f["immr"] and f["rn"] != 31:
+        width = f["imms"] - f["immr"] + 1
+        if width < 32:
+            src = reg(f["rn"])
+            s32 = _lo32(src) if (not f["sf"] or src[0] != "z") else src[1]
+            if f["sf"] and src[0] != "z":
+                # a 64-bit field extract of an unknown value: only the field bits are known, keep it opaque
+                s32 = None
+            if s32 is not None:
+                result = ("z", ("ubx", s32, f["immr"], (1 << width) - 1))
+    elif nm == "ld_x" and not f["sgn"] and f["sz"] in (1, 2) and f["opt"] in (2, 3) and f["rm"] != 31 and f["rn"] != 31:
+        tbase, tix = reg(f["rn"]), reg(f["rm"])
+        if tbase[0] == "c" and f["amt"] in (0, 1):
+            ix = tix if f["opt"] == 3 else ("z", _lo32(tix))
+            maximum = _bound(ix, m32, m64)
+            if maximum is not None and 0 <= maximum < 4096:
+                result = ("tab", tbase[1], maximum + 1, f["sz"], 1 << f["amt"])
+    elif nm in ("addsub_ext", "addsub_reg") and f["sf"] and not f["sub"] and f["rm"] != 31 and f["rn"] != 31:
+        basev, off = reg(f["rn"]), reg(f["rm"])
+        if basev[0] == "c" and off[0] == "tab" and (nm == "addsub_ext" and f["option"] in (2, 3) or
+                                                   nm == "addsub_reg" and f["shift"] == 0):
+            result = ("target", basev[1], off, f["amt"])
+    if _cs_depth(result) > 6:
+        result = ("w", a)
+    _, written = op_regs(nm, f)
+    for n in range(31):
+        if written & bit_x(n):
+            st.regs[n] = result if n == dest else ("w", a, n)
+    return prev
 
-        result = ("w", k)
-        dest = f.get("rd", f.get("rt", 31))
-        if nm == "movi":
-            result = ("c", f["imm"])
-        elif nm == "log_reg" and f["opc"] == 1 and f["rn"] == 31 and not f["neg"] and not f["amt"] and f["rm"] != 31:
-            src = reg(f["rm"])
-            result = src if f["sf"] else ("z", _lo32(src))
-        elif nm == "log_imm" and f["opc"] == 0 and f["rn"] != 31:
-            mask = f["imm"] & (MASK_ALL if f["sf"] else 0xFFFFFFFF)
-            if mask <= 0xFFFFFFFF:
-                result = ("z", ("and", _lo32(reg(f["rn"])), mask))
-        elif nm == "addsub_imm" and f["sf"] and not f["sub"] and reg(f["rn"])[0] == "c":
-            result = ("c", (reg(f["rn"])[1] + f["imm"]) & MASK_ALL)
-        elif nm == "bfm" and f["opc"] == 2 and f["imms"] >= f["immr"] and f["rn"] != 31:
-            width = f["imms"] - f["immr"] + 1
-            if width < 32:
-                src = reg(f["rn"])
-                s32 = _lo32(src) if (not f["sf"] or src[0] != "z") else src[1]
-                if f["sf"] and src[0] != "z":
-                    # a 64-bit field extract of an unknown value: only the field bits are known, keep it opaque
-                    s32 = None
-                if s32 is not None:
-                    result = ("z", ("ubx", s32, f["immr"], (1 << width) - 1))
-        elif nm == "ld_x" and not f["sgn"] and f["sz"] in (1, 2) and f["opt"] in (2, 3) and f["rm"] != 31 and f["rn"] != 31:
-            tbase, tix = reg(f["rn"]), reg(f["rm"])
-            if tbase[0] == "c" and f["amt"] in (0, 1):
-                ix = tix if f["opt"] == 3 else ("z", _lo32(tix))
-                maximum = _bound(ix, m32, m64)
-                if maximum is not None and 0 <= maximum < 4096:
-                    result = ("tab", tbase[1], maximum + 1, f["sz"], 1 << f["amt"])
-        elif nm in ("addsub_ext", "addsub_reg") and f["sf"] and not f["sub"] and f["rm"] != 31 and f["rn"] != 31:
-            basev, off = reg(f["rn"]), reg(f["rm"])
-            if basev[0] == "c" and off[0] == "tab" and (nm == "addsub_ext" and f["option"] in (2, 3) or
-                                                       nm == "addsub_reg" and f["shift"] == 0):
-                result = ("target", basev[1], off, f["amt"])
-        _, written = op_regs(nm, f)
-        for n in range(31):
-            if written & bit_x(n):
-                regs[n] = result if n == dest else ("w", k, n)
 
-    target = reg(br["rn"])
+def _cs_refine(st, f, prev):
+    """State on the fall-through edge of a b.hi / b.hs that follows `prev`: the compared value is within bounds."""
+    if prev is not None and f["cond"] in (2, 8):
+        key, sf, imm = prev
+        maximum = imm - (f["cond"] == 2)
+        if maximum >= 0:
+            tab = st.m64 if sf else st.m32
+            kk = key if sf else _lo32(key)
+            tab[kk] = min(tab.get(kk, maximum), maximum)
+
+
+def _compact_finish(st, br, rd_mem, func_range, valid_target):
+    target = st.reg(br["rn"])
     if target[0] != "target":
         return None
     _, base, (_, table, count, size, scale), shift = target
@@ -341,6 +367,132 @@ def match_compact_jump_table(insns, idx, rd_mem, func_range, entries, valid_targ
     if any(t & 3 or not lo_f <= t < hi_f or not valid_target(t) for t in targets):
         return None
     return 0, 0, targets
+
+
+def _compact_trace(trace, br_addr, br, rd_mem, func_range, valid_target):
+    """Resolve one compact switch from a single straight execution path `trace` (list of (addr, name, fields)
+    ending right before the br). Registers are unknown at the start of the trace."""
+    st = _CS()
+    for k, (a, nm, f) in enumerate(trace):
+        nxt = trace[k + 1][0] if k + 1 < len(trace) else br_addr
+        prev = _cs_apply(st, a, nm, f)
+        if nm == "bcond" and nxt == a + 4 and f["target"] != a + 4:
+            _cs_refine(st, f, prev)
+    return _compact_finish(st, br, rd_mem, func_range, valid_target)
+
+
+def _linear_trace(insns, idx, entries):
+    """The straight-line run that must execute right before insns[idx]: starts at the nearest branch target or
+    entry, and after the nearest call or other non-conditional control instruction."""
+    boundaries = set(entries)
+    boundaries.update(f["target"] for _, nm, f in insns if nm in ("b", "bcond", "cbz", "tbz"))
+    lo = max(0, idx - 64)
+    start = lo
+    for k in range(idx - 1, lo - 1, -1):
+        a, nm, f = insns[k]
+        if nm is None or (nm in lw.CONTROL and nm not in ("bcond", "cbz", "tbz")):
+            start = k + 1
+            break
+        if a in boundaries:
+            start = k
+            break
+    return insns[start:idx]
+
+
+def match_compact_jump_table(insns, idx, rd_mem, func_range, entries, valid_target):
+    br_addr, _, br = insns[idx]
+    boundaries = set(entries)
+    boundaries.update(f["target"] for _, nm, f in insns if nm in ("b", "bcond", "cbz", "tbz"))
+    if br_addr in boundaries:
+        return None
+    return _compact_trace(_linear_trace(insns, idx, entries), br_addr, br, rd_mem, func_range, valid_target)
+
+
+DF_MAX_NODES = 600    # ancestor instructions explored per br
+
+
+def cfg_preds(insns, pos):
+    """Intra-function predecessor map: address -> list of predecessor instruction addresses."""
+    preds = {}
+    for a, nm, f in insns:
+        if nm is None or nm in ("ret", "brk", "br"):
+            continue
+        if nm == "b":
+            succ = [f["target"]]
+        elif nm in ("bcond", "cbz", "tbz"):
+            succ = [f["target"], a + 4]
+        else:
+            succ = [a + 4]
+        for t in succ:
+            if t in pos:
+                preds.setdefault(t, []).append(a)
+    return preds
+
+
+def match_compact_dataflow(insns, pos, preds, idx, rd_mem, func_range, entries, valid_target):
+    """Bounded forward dataflow over the instructions that can reach the br (their predecessor closure, at most
+    DF_MAX_NODES). Entry points, jump-table targets and blocks without known predecessors start from "nothing
+    known". Values merge only when every path agrees, and a bound counts only when it holds on every path.
+    Returns (result, visited addresses) or None. The caller must still reject the result when a visited address
+    is also an indirect jump target discovered later."""
+    br_addr, _, br = insns[idx]
+    if br_addr in entries:
+        return None
+    nodes = {br_addr}
+    stack = [br_addr]
+    while stack:
+        a = stack.pop()
+        if a in entries:
+            continue
+        for p in preds.get(a, ()):
+            if p not in nodes:
+                nodes.add(p)
+                if len(nodes) > DF_MAX_NODES:
+                    return None
+                stack.append(p)
+    tops = {a for a in nodes if a in entries or not preds.get(a)}
+    state = {a: _CS() for a in tops}
+    work = list(tops)
+    queued = set(work)
+    budget = 30 * len(nodes) + 200
+    while work:
+        a = work.pop()
+        queued.discard(a)
+        budget -= 1
+        if budget < 0:
+            return None
+        if a == br_addr:
+            continue
+        _, nm, f = insns[pos[a]]
+        st = state[a].copy()
+        prev = _cs_apply(st, a, nm, f)
+        if nm is None or nm in ("ret", "brk", "br"):
+            continue
+        if nm == "b":
+            succ = [(f["target"], True)]
+        elif nm in ("bcond", "cbz", "tbz"):
+            succ = [(f["target"], True), (a + 4, f["target"] == a + 4)]
+        else:
+            succ = [(a + 4, True)]
+        for t, plain in succ:
+            if t not in nodes or t in tops:
+                continue
+            out = st
+            if nm == "bcond" and not plain:
+                out = st.copy()
+                _cs_refine(out, f, prev)
+            new = out.copy() if t not in state else _cs_join(state[t], out, t)
+            if t not in state or new != state[t]:
+                state[t] = new
+                if t not in queued:
+                    queued.add(t)
+                    work.append(t)
+    if br_addr not in state:
+        return None
+    r = _compact_finish(state[br_addr], br, rd_mem, func_range, valid_target)
+    if r is None:
+        return None
+    return r, nodes - tops - {br_addr}
 
 
 def match_jump_table(insns, idx, base_addr, rd_mem, func_range, text_end=None):
@@ -631,84 +783,103 @@ class Lifter:
                 return False
             return True
 
-        pad_roots = set()
         self._sites = sites
         has_pad = any(s[0] == 1 for s in sites.values())
         info["eh_sites"] = len(sites)
         info["eh_pads"] = sum(1 for s in sites.values() if s[0] == 1)
         info["eh_pads_out"] = sum(1 for s in sites.values() if s[0] == 1 and not (start <= s[1] < end))
         info["eh_nosite"] = sum(1 for s in sites.values() if s[0] == 3)
-        # ---- reachability and leaders
-        leaders = {entry}
-        jt = {}
-        bad = None
-        work = [entry]
-        seen = set()
-        reach = set()
+        df_banned = set()
+        preds = None
         while True:
-            while work:
-                a = work.pop()
-                while start <= a < end and a not in seen:
-                    seen.add(a)
-                    i = pos[a]
-                    _, nm, f = insns[i]
-                    if nm is None:
-                        if bad is None:
-                            bad = (a, f)
-                        break
-                    reach.add(a)
-                    nxt = a + 4
-                    if nm == "b":
-                        t = f["target"]
-                        if start <= t < end:
-                            leaders.add(t)
-                            work.append(t)
-                        break
-                    if nm in ("bcond", "cbz", "tbz"):
-                        t = f["target"]
-                        if start <= t < end:
-                            leaders.add(t)
-                            work.append(t)
-                        leaders.add(nxt)
-                    elif nm == "br":
-                        r = match_jump_table(insns, i, m["base"], m["rd_mem"], (start, end), text_range[1])
-                        if r is None:
-                            r = match_split_jump_table(insns, i, m["rd_mem"], text_range, jump_entries, valid_target)
-                        if r is None:
-                            r = match_compact_jump_table(insns, i, m["rd_mem"], (start, end), jump_entries, valid_target)
-                        if r:
-                            jt[a] = r
-                            for t in r[2]:
-                                if start <= t < end:
-                                    leaders.add(t)
-                                    work.append(t)
-                        else:
-                            # indirect jump through a loaded pointer (virtual/import tail call) vs an unresolved switch
-                            org = None
-                            for k in range(i - 1, max(-1, i - 30), -1):
-                                nm2, f2 = insns[k][1], insns[k][2]
-                                if nm2 is None:
-                                    continue
-                                try:
-                                    if op_regs(nm2, f2)[1] & bit_x(f["rn"]):
-                                        org = nm2
-                                        break
-                                except Exception:
-                                    pass
-                            if org in ("addsub_reg", "addsub_ext"):
-                                info["jt_unresolved"] += 1      # a computed switch we could not bound
+            # ---- reachability and leaders
+            leaders = {entry}
+            info["jt_unresolved"] = 0
+            info.pop("br_tail_ptr", None)
+            df_vis = {}
+            pad_roots = set()
+            jt = {}
+            bad = None
+            work = [entry]
+            seen = set()
+            reach = set()
+            while True:
+                while work:
+                    a = work.pop()
+                    while start <= a < end and a not in seen:
+                        seen.add(a)
+                        i = pos[a]
+                        _, nm, f = insns[i]
+                        if nm is None:
+                            if bad is None:
+                                bad = (a, f)
+                            break
+                        reach.add(a)
+                        nxt = a + 4
+                        if nm == "b":
+                            t = f["target"]
+                            if start <= t < end:
+                                leaders.add(t)
+                                work.append(t)
+                            break
+                        if nm in ("bcond", "cbz", "tbz"):
+                            t = f["target"]
+                            if start <= t < end:
+                                leaders.add(t)
+                                work.append(t)
+                            leaders.add(nxt)
+                        elif nm == "br":
+                            r = match_jump_table(insns, i, m["base"], m["rd_mem"], (start, end), text_range[1])
+                            if r is None:
+                                r = match_split_jump_table(insns, i, m["rd_mem"], text_range, jump_entries, valid_target)
+                            if r is None:
+                                r = match_compact_jump_table(insns, i, m["rd_mem"], (start, end), jump_entries, valid_target)
+                            if r is None and a not in df_banned:
+                                if preds is None:
+                                    preds = cfg_preds(insns, pos)
+                                d = match_compact_dataflow(insns, pos, preds, i, m["rd_mem"], (start, end), jump_entries, valid_target)
+                                if d:
+                                    r = d[0]
+                                    df_vis[a] = d[1]
+                            if r:
+                                jt[a] = r
+                                for t in r[2]:
+                                    if start <= t < end:
+                                        leaders.add(t)
+                                        work.append(t)
                             else:
-                                info["br_tail_ptr"] = info.get("br_tail_ptr", 0) + 1
-                        break
-                    elif nm in ("ret", "brk"):
-                        break
-                    a = nxt
-            new = sorted({p for a, p in site_pads.items() if a in reach and p not in pad_roots})
-            if not new:
+                                # indirect jump through a loaded pointer (virtual/import tail call) vs an unresolved switch
+                                org = None
+                                for k in range(i - 1, max(-1, i - 30), -1):
+                                    nm2, f2 = insns[k][1], insns[k][2]
+                                    if nm2 is None:
+                                        continue
+                                    try:
+                                        if op_regs(nm2, f2)[1] & bit_x(f["rn"]):
+                                            org = nm2
+                                            break
+                                    except Exception:
+                                        pass
+                                if org in ("addsub_reg", "addsub_ext"):
+                                    info["jt_unresolved"] += 1      # a computed switch we could not bound
+                                else:
+                                    info["br_tail_ptr"] = info.get("br_tail_ptr", 0) + 1
+                            break
+                        elif nm in ("ret", "brk"):
+                            break
+                        a = nxt
+                new = sorted({p for a, p in site_pads.items() if a in reach and p not in pad_roots})
+                if not new:
+                    break
+                pad_roots.update(new)
+                leaders.update(new)
+                work.extend(new)
+            # a path through an address that another table can jump to is incomplete: drop that table and redo
+            targets_all = {t for r in jt.values() for t in r[2]}
+            bad_df = {a for a, vis in df_vis.items() if a in jt and vis & targets_all}
+            if not bad_df:
                 break
-            pad_roots.update(new)
-            leaders.update(new)
-            work.extend(new)
+            df_banned |= bad_df
         if bad:
             info["bad"] = "%x: %s" % bad
             raise Unlifted(info["bad"])

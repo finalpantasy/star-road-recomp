@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "lifter"))
-from lift import decode_range, match_compact_jump_table, match_split_jump_table
+from lift import cfg_preds, decode_range, match_compact_dataflow, match_compact_jump_table, match_split_jump_table
 
 BASE = 0x100000
 TABLE = BASE + 0x100
@@ -143,6 +143,123 @@ class CompactJumpTableTests(unittest.TestCase):
         self.assertIsNone(self.match(w, data={CTAB: 0, CTAB + 1: 1, CTAB + 2: 2, CTAB + 3: 40}))  # outside the function
         self.assertIsNone(self.match(w, data={CTAB: 0, CTAB + 1: 1, CTAB + 2: 2}))  # unreadable entry
         self.assertIsNone(self.match(w, forbidden=(BASE + 4 * (len(w) - 5),)))  # not an instruction
+
+
+def b_(pc, target):
+    return 0x14000000 | (((target - pc) >> 2) & 0x3FFFFFF)
+
+
+def cbz_x(rt, pc, target):
+    return 0xB4000000 | (((target - pc) >> 2) & 0x7FFFF) << 5 | rt
+
+
+ADD_W1_1 = 0x11000421  # add w1, w1, #1
+MOV_X10_X3 = 0xAA0303EA  # mov x10, x3
+CTAB2 = BASE + 0x180
+
+
+class CompactDataflowTests(unittest.TestCase):
+    """The table base and the bound guard sit in earlier basic blocks than the switch."""
+
+    def build(self, pre, tail_adr=True):
+        """pre: words before the dispatch block. Dispatch: adr x11; ldrb; add; br; 4 targets; exit ret.
+        Returns (words, dispatch index)."""
+        n = len(pre)
+        disp = [adr(11, BASE + 4 * n, BASE + 4 * (n + 4)), LDRB | 9 << 16 | 10 << 5 | 12,
+                ADD_LSL2 | 12 << 16 | 11 << 5 | 11, BR_X11]
+        return pre + disp + [RET] * 5, n
+
+    def run_df(self, words, entries=(BASE,), data=None, forbidden=()):
+        end = BASE + len(words) * 4
+        insns = decode_range(words, BASE, BASE, end)
+        pos = {a: i for i, (a, _, _) in enumerate(insns)}
+        idx = next(i for i, x in enumerate(insns) if x[1] == "br")
+        data = {CTAB + i: v for i, v in enumerate((0, 1, 2, 3))} if data is None else data
+        rd = lambda addr, size: data.get(addr)
+        valid = lambda addr: addr not in forbidden
+        lin = match_compact_jump_table(insns, idx, rd, (BASE, end), entries, valid)
+        df = match_compact_dataflow(insns, pos, cfg_preds(insns, pos), idx, rd, (BASE, end), entries, valid)
+        return lin, (df[0] if df else None)
+
+    def expect(self, words):
+        base = BASE + 4 * (len(words) - 5)
+        return (0, 0, [base + 4 * i for i in range(4)])
+
+    def exit_of(self, n_pre):
+        return BASE + 4 * (n_pre + 4 + 4)  # the final ret
+
+    def test_base_and_guard_in_earlier_block(self):
+        # 0 adr x10; 1 cmp; 2 b.hi exit; 3 mov w9,w1; 4 b 5 (new block); dispatch
+        pre = [adr(10, BASE, CTAB), cmp_w(1, 3), 0, MOV_W9_W1, b_(BASE + 16, BASE + 20)]
+        w, n = self.build(pre)
+        pre[2] = bhi(BASE + 8, self.exit_of(n))
+        w, n = self.build(pre)
+        lin, df = self.run_df(w)
+        self.assertIsNone(lin)
+        self.assertEqual(df, self.expect(w))
+
+    def test_diamond_where_both_paths_agree(self):
+        # 0 adr; 1 cmp; 2 b.hi exit; 3 mov; 4 cbz x2 -> 7; 5 nop; 6 b 8; 7 nop; 8 dispatch
+        pre = [adr(10, BASE, CTAB), cmp_w(1, 3), 0, MOV_W9_W1, cbz_x(2, BASE + 16, BASE + 28), NOP,
+               b_(BASE + 24, BASE + 32), NOP]
+        n = len(pre)
+        pre[2] = bhi(BASE + 8, self.exit_of(n))
+        w, n = self.build(pre)
+        lin, df = self.run_df(w)
+        self.assertIsNone(lin)
+        self.assertEqual(df, self.expect(w))
+
+    def test_rejects_two_reaching_bases(self):
+        # cbz x2 picks adr x10 = CTAB or CTAB2; both tables hold different entries
+        pre = [cmp_w(1, 3), 0, MOV_W9_W1, cbz_x(2, BASE + 12, BASE + 24), adr(10, BASE + 16, CTAB),
+               b_(BASE + 20, BASE + 28), adr(10, BASE + 24, CTAB2), NOP]
+        n = len(pre)
+        pre[1] = bhi(BASE + 4, self.exit_of(n))
+        w, n = self.build(pre)
+        data = {CTAB + i: v for i, v in enumerate((0, 1, 2, 3))}
+        data.update({CTAB2 + i: v for i, v in enumerate((3, 2, 1, 0))})
+        lin, df = self.run_df(w, data=data)
+        self.assertIsNone(df)
+
+    def test_rejects_guard_bypassed_on_one_path(self):
+        # 0 adr; 1 mov; 2 cbz x2 -> 5 (skips the guard); 3 cmp; 4 b.hi exit; 5 dispatch
+        pre = [adr(10, BASE, CTAB), MOV_W9_W1, cbz_x(2, BASE + 8, BASE + 20), cmp_w(1, 3), 0]
+        n = len(pre)
+        pre[4] = bhi(BASE + 16, self.exit_of(n))
+        w, n = self.build(pre)
+        lin, df = self.run_df(w)
+        self.assertIsNone(df)
+
+    def test_rejects_register_redefined_after_guard(self):
+        # guard on w1, then w1 is rewritten before it is copied to the index register
+        pre = [adr(10, BASE, CTAB), cmp_w(1, 3), 0, ADD_W1_1, MOV_W9_W1, b_(BASE + 16, BASE + 20)]
+        n = len(pre)
+        pre[2] = bhi(BASE + 8, self.exit_of(n))
+        w, n = self.build(pre)
+        self.assertIsNone(self.run_df(w)[1])
+
+    def test_rejects_table_base_redefined(self):
+        pre = [adr(10, BASE, CTAB), cmp_w(1, 3), 0, MOV_W9_W1, MOV_X10_X3, b_(BASE + 20, BASE + 24)]
+        n = len(pre)
+        pre[2] = bhi(BASE + 8, self.exit_of(n))
+        w, n = self.build(pre)
+        self.assertIsNone(self.run_df(w)[1])
+
+    def test_rejects_unknown_entry_into_the_middle(self):
+        # the second block can be entered from outside (landing pad or table target): no guard on that path
+        pre = [adr(10, BASE, CTAB), cmp_w(1, 3), 0, MOV_W9_W1, b_(BASE + 16, BASE + 20)]
+        n = len(pre)
+        pre[2] = bhi(BASE + 8, self.exit_of(n))
+        w, n = self.build(pre)
+        self.assertIsNone(self.run_df(w, entries=(BASE, BASE + 12))[1])
+
+    def test_rejects_guard_taken_edge_only(self):
+        # b.hi falls into the dispatch via its taken edge: the guard says nothing about the in-range case
+        pre = [adr(10, BASE, CTAB), cmp_w(1, 3), 0, MOV_W9_W1]
+        n = len(pre)
+        pre[2] = bhi(BASE + 8, BASE + 4 * (n))
+        w, n = self.build(pre)
+        self.assertIsNone(self.run_df(w)[1])
 
 
 if __name__ == "__main__":
