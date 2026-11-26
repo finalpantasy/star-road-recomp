@@ -7,8 +7,11 @@
 //   A  constants c[0].x + c[1].x + c[4095].w (file bytes 0..3 and 16..19, zero padding for the rest): 0.25 + 0.125 + 0.0 = 0.375
 layout(set = 1, binding = 0, std140) uniform Support { vec4 w[100]; } sup;
 layout(set = 1, binding = 1, std140) uniform Consts { vec4 c[4096]; } k;
+layout(location = 0) in vec2 vUv;
+layout(location = 8) flat in vec4 unwritten;
 layout(location = 0) out vec4 o;
 void main() {
   float b = sup.w[12].x * 0.5 + sup.w[84].x * 0.25 + sup.w[0].x + sup.w[1].x + sup.w[5].y;
-  o = vec4(sup.w[10].x / 64.0, sup.w[9].x * 32.0, b, k.c[0].x + k.c[1].x + k.c[4095].w);
+  // The paired vertex shader writes vUv but leaves location 8 unwritten.
+  o = vec4((sup.w[10].x / 64.0) * step(0.25, vUv.x), sup.w[9].x * 32.0, b, k.c[0].x + k.c[1].x + k.c[4095].w) + unwritten;
 }

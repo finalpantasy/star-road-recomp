@@ -141,12 +141,11 @@ Rules the consumer can rely on:
   varyings with `location` only. Integer vertex formats are not expected from Unity on this game; the
   runtime must check the bound vertex formats and log any integer format as a mismatch.
 - **Varyings**: generic output `i` (`a[0x80 + 16*i]`) is `location = i` in every stage, so stages
-  link by location. A fragment input the previous stage does not write is undefined in Vulkan
-  (on Maxwell it reads 0). The consumer compares the vertex `outputs` with the fragment `inputs`
-  when it builds a pipeline and logs any unwritten location; v1 does not patch it. Measured in the
-  task-12 reader: 61 of 26,766 (vs, fs) pairs read a location the vertex stage never writes. To match
-  Maxwell, give such a pipeline a vertex output of zero at that location or bind a variant whose
-  fragment input reads 0; until then the value is undefined.
+  link by location. Maxwell supplies zero for a missing fragment input. At pipeline creation the
+  Vulkan runtime checks the immediately preceding graphics stage's SPIR-V interface and creates a
+  fragment variant with zero-initialized private values for absent locations. It caches the
+  variant by stage pair, so the same fragment shader can still receive a varying from a producer
+  that writes it. The on-disk shader cache is read-only.
 - **Geometry stage**: a geometry program reads per-vertex inputs through the `ISBERD` vertex handle;
   the translator models one input primitive per invocation (invocation info low byte 0, as on the
   hardware for a non-instanced draw), so the handle is the vertex index. Inputs are arrays sized to

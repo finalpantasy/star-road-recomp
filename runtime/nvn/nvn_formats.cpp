@@ -129,6 +129,21 @@ uint32_t NvnFormatBytes(uint32_t nvnFormat) {
   return 0;
 }
 
+bool IsIntegerFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16_SINT:
+    case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Vertex attribute formats: the integer to float conversions (UI2F, I2F) are scaled formats.
 VkFormat VertexFormatFromNvn(uint32_t f, bool* isInt) {
   if (isInt) *isInt = false;
@@ -145,16 +160,7 @@ VkFormat VertexFormatFromNvn(uint32_t f, bool* isInt) {
       f == NVN_FORMAT_RGB32_I2F || f == NVN_FORMAT_RGBA32_UI2F || f == NVN_FORMAT_RGBA32_I2F)
     return VK_FORMAT_UNDEFINED;   // no Vulkan equivalent: the pipeline logs and skips the attribute
   VkFormat vk = VkFormatFromNvn(f, nullptr, nullptr, nullptr);
-  if (isInt && vk != VK_FORMAT_UNDEFINED) {
-    switch (vk) {
-      case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R32_UINT:
-      case VK_FORMAT_R32_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
-      case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT:
-      case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
-      case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: *isInt = true; break;
-      default: break;
-    }
-  }
+  if (isInt) *isInt = IsIntegerFormat(vk);
   return vk;
 }
 

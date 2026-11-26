@@ -105,10 +105,12 @@ struct Vk {
   VkPhysicalDevice4444FormatsFeaturesEXT f4444{};
   VkPhysicalDeviceIndexTypeUint8FeaturesEXT idx8{};
   VkPhysicalDeviceCustomBorderColorFeaturesEXT customBorder{};
+  VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR vertexDivisor{};
   VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
   bool hasHostImport = false, hasDepthClipControl = false, hasSwapchain = false, has4444 = false, hasIdx8 = false,
        hasCustomBorder = false, hasDebugUtils = false, hasMinMax = false;
   VkDeviceSize hostAlign = 4096;
+  uint32_t maxVertexDivisor = 1;
   VkDeviceSize granularity = 1;
   VkSemaphore timeline = VK_NULL_HANDLE;   // GPU completion counter (monotonic)
   std::recursive_mutex lock;               // the one NVN lock (object creation, queue work)

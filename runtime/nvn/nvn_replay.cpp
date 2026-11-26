@@ -5,6 +5,7 @@
 // manifest (docs/SHADER_CACHE.md). Every image lives in GENERAL layout; hazards use global barriers at render pass boundaries
 // and at NVN Barrier calls.
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <mutex>
 
@@ -73,6 +74,8 @@ struct DescPools {
 static VkPipelineCache g_pcache = VK_NULL_HANDLE;
 static std::unordered_map<std::string, VkPipeline> g_pipes;
 static std::unordered_map<std::string, VkPipelineLayout> g_layouts;
+struct LinkedFragment { VkShaderModule module; bool usesOriginal; };
+static std::unordered_map<std::string, LinkedFragment> g_linkedFragments;
 static VkDescriptorSetLayout g_emptySet = VK_NULL_HANDLE;
 static VkBuffer g_nullVb = VK_NULL_HANDLE; static Buf g_nullVbBuf;
 struct Dummy { VkImage img = VK_NULL_HANDLE; MemAlloc mem; VkImageView view = VK_NULL_HANDLE; };
@@ -86,8 +89,13 @@ void ReplayShutdown() {
   if (!g_vk.inited) return;
   auto& F = g_vk.f;
   F.vkDeviceWaitIdle(g_vk.dev);
+  DestroyMaskedClearPipelines();
   for (auto& kv : g_pipes) if (kv.second) F.vkDestroyPipeline(g_vk.dev, kv.second, nullptr);
   g_pipes.clear();
+  for (const auto& entry : g_linkedFragments) {
+    if (entry.second.module) F.vkDestroyShaderModule(g_vk.dev, entry.second.module, nullptr);
+  }
+  g_linkedFragments.clear();
   for (auto& kv : g_layouts) if (kv.second) F.vkDestroyPipelineLayout(g_vk.dev, kv.second, nullptr);
   g_layouts.clear();
   if (g_emptySet) F.vkDestroyDescriptorSetLayout(g_vk.dev, g_emptySet, nullptr);
@@ -169,13 +177,47 @@ static bool EnsureStage(StageProgram* sp) {
 
 bool ShaderStageReady(StageProgram* sp) { return EnsureStage(sp); }
 
-static VkPipelineLayout GetLayout(ProgramImpl* p) {
+using ShaderStages = std::array<StageProgram*, 6>;
+static constexpr int kGraphicsStageCount = NVN_SHADER_STAGE_COMPUTE;
+
+template <class T> static void Put(std::string& k, const T& v) { k.append((const char*)&v, sizeof v); }
+
+static VkShaderModule LinkFragment(const ShaderStages& stages) {
+  StageProgram* fragment = stages[NVN_SHADER_STAGE_FRAGMENT];
+  if (!fragment) return VK_NULL_HANDLE;
+  StageProgram* producer = stages[NVN_SHADER_STAGE_GEOMETRY];
+  if (!producer) producer = stages[NVN_SHADER_STAGE_TESS_EVALUATION];
+  if (!producer) producer = stages[NVN_SHADER_STAGE_VERTEX];
+
+  std::string key = producer->key + ":" + fragment->key;
+  auto cached = g_linkedFragments.find(key);
+  if (cached != g_linkedFragments.end()) {
+    return cached->second.usesOriginal ? fragment->module : cached->second.module;
+  }
+
+  std::vector<uint32_t> code;
+  LinkedFragment linked{VK_NULL_HANDLE, false};
+  if (ShaderLinkFragment(*producer, *fragment, code)) {
+    if (code.empty()) linked.usesOriginal = true;
+    else {
+      VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      info.codeSize = code.size() * sizeof(uint32_t);
+      info.pCode = code.data();
+      if (g_vk.f.vkCreateShaderModule(g_vk.dev, &info, nullptr, &linked.module) != VK_SUCCESS) linked.module = VK_NULL_HANDLE;
+    }
+  }
+  if (!linked.module && !linked.usesOriginal) Err("cannot link fragment shader %.12s to producer %.12s", fragment->key.c_str(), producer->key.c_str());
+  g_linkedFragments.emplace(std::move(key), linked);
+  return linked.usesOriginal ? fragment->module : linked.module;
+}
+
+static VkPipelineLayout GetLayout(const ShaderStages& stages) {
   uint32_t nsets = 0;
   VkDescriptorSetLayout sets[6];
   for (auto& s : sets) s = g_emptySet;
   std::string key;
   for (int s = 0; s < 6; s++) {
-    StageProgram* sp = p->byStage[s];
+    StageProgram* sp = stages[s];
     if (!sp) continue;
     uint32_t idx = SetOfStage(s);
     sets[idx] = sp->setLayout; nsets = std::max(nsets, idx + 1);
@@ -202,7 +244,9 @@ struct RS {
   PolygonStateG poly{NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
   DepthStencilG ds{}; MultisampleG ms{};
   VertexAttribG attr[16]; bool attrSet[16] = {}; VertexStreamG stream[16];
-  ProgramImpl* prog = nullptr; uint32_t progStages = 0;
+  ProgramImpl* stageOwners[6] = {};
+  uint32_t vertexBindMask = 0;
+  const char* missingProgramReason = "no bind recorded on this queue";
   struct Range { uint64_t addr = 0, size = 0; };
   Range vb[16], ub[6][16], sb[6][16];
   uint32_t c2[6][0x400] = {};                    // c[2] handle words per stage
@@ -396,7 +440,6 @@ static void InitDummies(RS& s) {
 }
 
 // ---- pipeline building ---------------------------------------------------------------------------------------------
-template <class T> static void Put(std::string& k, const T& v) { k.append((const char*)&v, sizeof v); }
 
 static VkBlendFactor BF(uint32_t f) {
   switch (f) {
@@ -455,20 +498,20 @@ static VkFormat RtFormat(const RtBind& r) {
   return t->vkFormat;
 }
 
-static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
+static VkPipeline BuildGraphics(RS& s, uint32_t prim, const ShaderStages& shaders) {
   g_crumb.where = "BuildGraphics";
   auto& F = g_vk.f;
-  ProgramImpl* p = s.prog;
   VkPrimitiveTopology topo;
   if (!Topology(prim, &topo)) { LogOnce("badprim", "draw primitive %u has no Vulkan topology (draw skipped)", prim); return VK_NULL_HANDLE; }
-  StageProgram* vs = p->byStage[NVN_SHADER_STAGE_VERTEX];
+  StageProgram* vs = shaders[NVN_SHADER_STAGE_VERTEX];
   VkFormat cfmt[8]; for (uint32_t i = 0; i < s.nColor; i++) cfmt[i] = s.color[i].tex ? RtFormat(s.color[i]) : VK_FORMAT_UNDEFINED;
   VkFormat dfmt = s.depth.tex ? RtFormat(s.depth) : VK_FORMAT_UNDEFINED;
   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   { TextureG* any = s.nColor && s.color[0].tex ? s.color[0].tex : s.depth.tex; if (any) { uint32_t n = std::max(1u, any->samples); samples = (VkSampleCountFlagBits)n; } }
 
   std::string key;
-  Put(key, p->id); Put(key, prim); Put(key, s.nColor); for (uint32_t i = 0; i < s.nColor; i++) Put(key, cfmt[i]); Put(key, dfmt); Put(key, samples);
+  Put(key, 'G'); for (auto* shader : shaders) Put(key, shader);
+  Put(key, prim); Put(key, s.nColor); for (uint32_t i = 0; i < s.nColor; i++) Put(key, cfmt[i]); Put(key, dfmt); Put(key, samples);
   Put(key, s.colorState); Put(key, s.chan); Put(key, s.poly); Put(key, s.ds); Put(key, s.ms.a2c);
   for (uint32_t i = 0; i < s.nColor; i++) Put(key, s.blend[i]);
   Put(key, s.originMode); Put(key, s.depthClamp); Put(key, s.discard); Put(key, s.primRestart); Put(key, s.sampleMask); Put(key, s.patchSize); Put(key, s.depthMode); Put(key, s.depthBoundsOn);
@@ -477,18 +520,21 @@ static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
   auto it = g_pipes.find(key);
   if (it != g_pipes.end()) return it->second;
 
+  VkShaderModule fragment = LinkFragment(shaders);
+  if (shaders[NVN_SHADER_STAGE_FRAGMENT] && !fragment) return VK_NULL_HANDLE;
   std::vector<VkPipelineShaderStageCreateInfo> stages;
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg[5];
-  for (int st = 0; st < 5; st++) {
-    StageProgram* sp = p->byStage[st];
+  for (int st = 0; st < kGraphicsStageCount; st++) {
+    StageProgram* sp = shaders[st];
     if (!sp) continue;
     VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    si.stage = StageBit(st); si.module = sp->module; si.pName = "main";
+    si.stage = StageBit(st); si.module = st == NVN_SHADER_STAGE_FRAGMENT ? fragment : sp->module; si.pName = "main";
     if (WantSubgroup32(sp, si.stage)) { sg[st] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, nullptr, 32}; si.pNext = &sg[st]; }
     stages.push_back(si);
   }
   // vertex input
   std::vector<VkVertexInputBindingDescription> binds; std::vector<VkVertexInputAttributeDescription> attrs;
+  std::vector<VkVertexInputBindingDivisorDescriptionKHR> divisors;
   bool used[17] = {};
   for (auto& in : vs->man.inputs) {
     uint32_t a = in.attr & 15; VkVertexInputAttributeDescription d{};
@@ -508,11 +554,24 @@ static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
     if (!used[b]) continue;
     VkVertexInputBindingDescription d{}; d.binding = b;
     if (b == 16) { d.stride = 0; d.inputRate = VK_VERTEX_INPUT_RATE_VERTEX; }
-    else { d.stride = s.stream[b].stride; d.inputRate = s.stream[b].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
-           if (s.stream[b].divisor > 1) LogOnce("divisor", "vertex stream divisor %u > 1 is not supported (treated as 1)", s.stream[b].divisor); }
+    else {
+      const auto& stream = s.stream[b];
+      d.stride = stream.stride;
+      d.inputRate = stream.divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+      if (stream.divisor > 1) {
+        if (stream.divisor <= g_vk.maxVertexDivisor) divisors.push_back({b, stream.divisor});
+        else LogOnce("divisor", "vertex stream divisor %u exceeds device support of %u (treated as 1)", stream.divisor, g_vk.maxVertexDivisor);
+      }
+    }
     binds.push_back(d);
   }
   VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineVertexInputDivisorStateCreateInfoKHR vd{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR};
+  if (!divisors.empty()) {
+    vd.vertexBindingDivisorCount = (uint32_t)divisors.size();
+    vd.pVertexBindingDivisors = divisors.data();
+    vi.pNext = &vd;
+  }
   vi.vertexBindingDescriptionCount = (uint32_t)binds.size(); vi.pVertexBindingDescriptions = binds.data();
   vi.vertexAttributeDescriptionCount = (uint32_t)attrs.size(); vi.pVertexAttributeDescriptions = attrs.data();
   VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -563,18 +622,18 @@ static VkPipeline BuildGraphics(RS& s, uint32_t prim) {
   gi.pNext = &ri; gi.stageCount = (uint32_t)stages.size(); gi.pStages = stages.data(); gi.pVertexInputState = &vi; gi.pInputAssemblyState = &ia;
   if (topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) gi.pTessellationState = &ti;
   gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms; gi.pDepthStencilState = &dsi; gi.pColorBlendState = &cb; gi.pDynamicState = &dy;
-  gi.layout = GetLayout(p);
+  gi.layout = GetLayout(shaders);
   VkPipeline out = VK_NULL_HANDLE;
   VkResult r = F.vkCreateGraphicsPipelines(g_vk.dev, g_pcache, 1, &gi, nullptr, &out);
-  if (r != VK_SUCCESS) { Err("vkCreateGraphicsPipelines failed (%d) program %llu", r, (unsigned long long)p->id); out = VK_NULL_HANDLE; g_stats.pipelineFails++; }
+  if (r != VK_SUCCESS) { Err("vkCreateGraphicsPipelines failed (%d), vertex shader %.12s", r, vs->key.c_str()); out = VK_NULL_HANDLE; g_stats.pipelineFails++; }
   g_pipes[key] = out; g_stats.pipelines++;
   return out;
 }
 
-static VkPipeline BuildCompute(RS& s) {
+static VkPipeline BuildCompute(const ShaderStages& shaders) {
   g_crumb.where = "BuildCompute";
-  ProgramImpl* p = s.prog; StageProgram* cs = p->byStage[NVN_SHADER_STAGE_COMPUTE];
-  std::string key; Put(key, p->id); Put(key, 'C');
+  StageProgram* cs = shaders[NVN_SHADER_STAGE_COMPUTE];
+  std::string key; Put(key, 'C'); Put(key, cs);
   auto it = g_pipes.find(key);
   if (it != g_pipes.end()) return it->second;
   VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
@@ -583,7 +642,7 @@ static VkPipeline BuildCompute(RS& s) {
   VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, nullptr, 32};
   ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, WantSubgroup32(cs, VK_SHADER_STAGE_COMPUTE_BIT) ? &sg : nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs->module, "main", &sp};
-  ci.layout = GetLayout(p);
+  ci.layout = GetLayout(shaders);
   VkPipeline out = VK_NULL_HANDLE;
   if (g_vk.f.vkCreateComputePipelines(g_vk.dev, g_pcache, 1, &ci, nullptr, &out) != VK_SUCCESS) out = VK_NULL_HANDLE;
   g_pipes[key] = out; g_stats.pipelines++;
@@ -602,15 +661,14 @@ static void FillSupportBuffer(const RS& s, uint8_t* p, uint32_t size) {
   for (uint32_t i = 0; i < 73 && 192 + 16 * i + 4 <= size; i++) memcpy(p + 192 + 16 * i, &one, 4);
 }
 
-static bool BindDescriptors(RS& s, bool compute) {
+static bool BindDescriptors(RS& s, const ShaderStages& shaders, bool compute) {
   g_crumb.where = "BindDescriptors";
   auto& F = g_vk.f;
-  ProgramImpl* p = s.prog;
   InitDummies(s);
-  VkPipelineLayout pl = GetLayout(p);
+  VkPipelineLayout pl = GetLayout(shaders);
   VkPipelineBindPoint bp = compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS;
   for (int st = 0; st < 6; st++) {
-    StageProgram* sp = p->byStage[st];
+    StageProgram* sp = shaders[st];
     if (!sp) continue;
     const Manifest& m = sp->man;
     VkDescriptorSet set = s.dpools->Alloc(sp->setLayout);
@@ -718,7 +776,7 @@ static bool BeginRendering(RS& s) {
   EndRendering(s);
   if (!s.nColor && !s.depth.tex) { LogOnce("nort", "draw with no render targets bound (skipped)"); return false; }
   VkRenderingAttachmentInfo ca[8]; VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-  uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = 1; bool haveDepth = false, haveStencil = false;
+  uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX; bool haveDepth = false, haveStencil = false;
   for (uint32_t i = 0; i < s.nColor; i++) if (!s.color[i].tex) { LogOnce("rtgone", "draw with a color target that was finalized or is missing (skipped)"); return false; }
   for (uint32_t i = 0; i < s.nColor; i++) {
     TextureG* g = s.color[i].tex; TextureImpl* t = TexOf(g);
@@ -729,7 +787,7 @@ static bool BeginRendering(RS& s) {
     ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     uint32_t lv = (s.color[i].view.flags & 8) ? s.color[i].view.minLevel : 0;
     w = std::min(w, std::max(1u, t->width >> lv)); h = std::min(h, std::max(1u, t->height >> lv));
-    layers = (s.color[i].view.flags & 16) ? std::max<uint32_t>(1, s.color[i].view.numLayers) : 1;
+    layers = std::min(layers, (s.color[i].view.flags & 16) ? std::max<uint32_t>(1, s.color[i].view.numLayers) : 1);
   }
   if (s.depth.tex) {
     TextureG* g = s.depth.tex; TextureImpl* t = TexOf(g);
@@ -739,6 +797,7 @@ static bool BeginRendering(RS& s) {
     da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     uint32_t lv = (s.depth.view.flags & 8) ? s.depth.view.minLevel : 0;
     w = std::min(w, std::max(1u, t->width >> lv)); h = std::min(h, std::max(1u, t->height >> lv));
+    layers = std::min(layers, (s.depth.view.flags & 16) ? std::max<uint32_t>(1, s.depth.view.numLayers) : 1);
     haveDepth = (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0; haveStencil = (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
   }
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -748,6 +807,18 @@ static bool BeginRendering(RS& s) {
   F.vkCmdBeginRendering(s.cb, &ri);
   s.rendering = true; s.rtDirty = false; s.area = {w, h}; s.renderLayers = layers; s.pipeDirty = true;
   return true;
+}
+
+static VkRect2D RenderScissor(const RS& s) {
+  if (!s.scSet) return {{0, 0}, s.area};
+
+  // Intersect the original rectangle with the render area in wide arithmetic.
+  const int64_t x = s.scissor[0], y = s.scissor[1];
+  const int64_t left = std::clamp<int64_t>(x, 0, s.area.width);
+  const int64_t top = std::clamp<int64_t>(y, 0, s.area.height);
+  const int64_t right = std::clamp<int64_t>(x + s.scissor[2], left, s.area.width);
+  const int64_t bottom = std::clamp<int64_t>(y + s.scissor[3], top, s.area.height);
+  return {{(int32_t)left, (int32_t)top}, {(uint32_t)(right - left), (uint32_t)(bottom - top)}};
 }
 
 static void SetDynamic(RS& s) {
@@ -760,11 +831,7 @@ static void SetDynamic(RS& s) {
   else { v.y = (float)(y + vh); v.height = -(float)vh; }                                              // row 0 is the top, NDC +y up
   v.width = (float)vw;
   F.vkCmdSetViewport(s.cb, 0, 1, &v);
-  VkRect2D sc;
-  if (s.scSet) sc = {{s.scissor[0], s.scissor[1]}, {(uint32_t)std::max(0, s.scissor[2]), (uint32_t)std::max(0, s.scissor[3])}};
-  else sc = {{0, 0}, s.area};
-  if (sc.offset.x < 0) { sc.extent.width = (uint32_t)std::max<int64_t>(0, (int64_t)sc.extent.width + sc.offset.x); sc.offset.x = 0; }
-  if (sc.offset.y < 0) { sc.extent.height = (uint32_t)std::max<int64_t>(0, (int64_t)sc.extent.height + sc.offset.y); sc.offset.y = 0; }
+  const VkRect2D sc = RenderScissor(s);
   F.vkCmdSetScissor(s.cb, 0, 1, &sc);
   F.vkCmdSetStencilReference(s.cb, VK_STENCIL_FACE_FRONT_BIT, s.stRef[0]); F.vkCmdSetStencilReference(s.cb, VK_STENCIL_FACE_BACK_BIT, s.stRef[1]);
   F.vkCmdSetStencilCompareMask(s.cb, VK_STENCIL_FACE_FRONT_BIT, s.stMask[0]); F.vkCmdSetStencilCompareMask(s.cb, VK_STENCIL_FACE_BACK_BIT, s.stMask[1]);
@@ -776,11 +843,11 @@ static void SetDynamic(RS& s) {
 
 // Layout transitions, uploads and the dummy images are recorded outside a render pass, so every texture the draw can sample is
 // made ready here, before BeginRendering. BindDescriptors then finds them ready.
-static void PrepareResources(RS& s) {
+static void PrepareResources(RS& s, const ShaderStages& shaders) {
   g_crumb.where = "PrepareResources";
   InitDummies(s);
   for (int st = 0; st < 6; st++) {
-    StageProgram* sp = s.prog->byStage[st];
+    StageProgram* sp = shaders[st];
     if (!sp || !s.texPool) continue;
     for (auto& t : sp->man.texs) {
       uint32_t n = std::max(1u, t.arrayLen);
@@ -813,6 +880,36 @@ template <class At> static uint32_t ExpandPrimitive(uint32_t prim, uint32_t n, A
 }
 static bool NeedsExpand(uint32_t prim) { return prim == NVN_DRAW_PRIMITIVE_QUADS || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP || prim == NVN_DRAW_PRIMITIVE_LINE_LOOP; }
 
+struct IndexFormat { VkIndexType type; uint32_t bytes; };
+static IndexFormat DrawIndexFormat(int type) {
+  switch (type) {
+    case NVN_INDEX_TYPE_UNSIGNED_BYTE: return {VK_INDEX_TYPE_UINT8, 1};
+    case NVN_INDEX_TYPE_UNSIGNED_SHORT: return {VK_INDEX_TYPE_UINT16, 2};
+    case NVN_INDEX_TYPE_UNSIGNED_INT: return {VK_INDEX_TYPE_UINT32, 4};
+    default: return {VK_INDEX_TYPE_MAX_ENUM, 0};
+  }
+}
+
+static bool ResolveIndexBuffer(uint64_t address, IndexFormat format, uint32_t count,
+                               VkBuffer* buffer, uint64_t* offset) {
+  if (!format.bytes || address % format.bytes != 0 ||
+      !ResolveBuffer(address, uint64_t(std::max(count, 1u)) * format.bytes, buffer, offset)) {
+    LogOnce("badidx", "draw has an invalid or unresolved index range");
+    return false;
+  }
+  if (format.type == VK_INDEX_TYPE_UINT8 && !g_vk.hasIdx8) {
+    LogOnce("idx8", "8-bit indices require the Vulkan indexTypeUint8 feature");
+    return false;
+  }
+  return true;
+}
+
+static bool ResolveIndirectBuffer(uint64_t address, size_t size, VkBuffer* buffer, uint64_t* offset) {
+  if (address % sizeof(uint32_t) == 0 && ResolveBuffer(address, size, buffer, offset)) return true;
+  LogOnce("badindirect", "indirect command arguments are misaligned or outside the memory pool");
+  return false;
+}
+
 // Upload an expanded index list to scratch memory and bind it. False when the scratch allocation failed.
 static bool BindExpanded(RS& s, const std::vector<uint32_t>& idx) {
   VkBuffer b; VkDeviceSize o; void* p;
@@ -825,22 +922,38 @@ static bool BindExpanded(RS& s, const std::vector<uint32_t>& idx) {
 static bool PrepareDraw(RS& s, uint32_t prim, bool* skip) {
   g_crumb.where = "PrepareDraw";
   *skip = true;
-  if (!s.prog) { g_stats.noProgNull++; LogOnce("noprog", "draw with no program bound (skipped)"); return false; }
-  if (!s.prog->complete) {
-    g_stats.noProgIncomplete++;
-    std::string why; for (StageProgram* sp : s.prog->stages) { if (sp && !sp->ok) why += " " + sp->key.substr(0, 12) + "(" + sp->reason + ")"; }
-    LogOnce(("noprog" + std::to_string(s.prog->id)).c_str(), "draw with an incomplete program %llu (skipped), stages not usable:%s", (unsigned long long)s.prog->id, why.empty() ? " none listed (no vertex stage?)" : why.c_str());
+  if (!s.stageOwners[NVN_SHADER_STAGE_VERTEX]) {
+    g_stats.noProgNull++;
+    const std::string key = std::string("noprog") + s.missingProgramReason + std::to_string(s.vertexBindMask);
+    LogOnce(key.c_str(), "draw with no vertex program bound (skipped): %s, last vertex bind mask 0x%x", s.missingProgramReason, s.vertexBindMask);
     return false;
   }
-  for (int st = 0; st < 5; st++) if (s.prog->byStage[st] && !EnsureStage(s.prog->byStage[st])) { return false; }
+  ShaderStages shaders{};
+  for (int st = 0; st < kGraphicsStageCount; st++) {
+    ProgramImpl* owner = s.stageOwners[st];
+    if (!owner) continue;
+    StageProgram* shader = owner->byStage[st];
+    if (!owner->complete || (st == NVN_SHADER_STAGE_VERTEX && !shader)) {
+      g_stats.noProgIncomplete++;
+      std::string why;
+      for (StageProgram* sp : owner->stages) {
+        if (sp && !sp->ok) why += " " + sp->key.substr(0, 12) + "(" + sp->reason + ")";
+      }
+      LogOnce(("noprog" + std::to_string(owner->id)).c_str(), "draw with an incomplete program %llu (skipped):%s",
+              (unsigned long long)owner->id, why.empty() ? " required stage data unavailable" : why.c_str());
+      return false;
+    }
+    if (shader && !EnsureStage(shader)) return false;
+    shaders[st] = shader;
+  }
   EnsureGlobals();
-  PrepareResources(s);
+  PrepareResources(s, shaders);
   if (!BeginRendering(s)) return false;
-  VkPipeline pipe = BuildGraphics(s, prim);
+  VkPipeline pipe = BuildGraphics(s, prim, shaders);
   if (!pipe) return false;
   g_vk.f.vkCmdBindPipeline(s.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
   SetDynamic(s);
-  if (!BindDescriptors(s, false)) return false;
+  if (!BindDescriptors(s, shaders, false)) return false;
   // vertex buffers
   uint32_t maxb = 0; bool any = false;
   VkBuffer vbs[17]; VkDeviceSize offs[17];
@@ -858,49 +971,279 @@ static bool PrepareDraw(RS& s, uint32_t prim, bool* skip) {
 // ---- exec ---------------------------------------------------------------------------------------------------------------
 static void Exec(RS& s, const CmdList& l, int depth);
 
-// A clear rectangle must lie inside the render area; the scissor the game sets is often larger (the hardware clips it to the target).
-static void ClampToArea(VkRect2D& r, VkExtent2D area) {
-  r.offset.x = std::min<int32_t>(r.offset.x, (int32_t)area.width); r.offset.y = std::min<int32_t>(r.offset.y, (int32_t)area.height);
-  r.extent.width = std::min<uint32_t>(r.extent.width, area.width - (uint32_t)r.offset.x);
-  r.extent.height = std::min<uint32_t>(r.extent.height, area.height - (uint32_t)r.offset.y);
-}
-
 static TextureView ViewAt(const uint8_t* p) { TextureView v; memcpy(&v, p, sizeof v); return v; }
+
+static bool DrawMaskedClear(RS& s, const RtBind& target, VkRect2D rect, uint32_t mask, ClearKind kind, const Cmd& c) {
+  auto& vk = g_vk.f;
+  TextureImpl* texture = TexOf(target.tex);
+  if (!texture) return false;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = GetMaskedClearPipeline(RtFormat(target), (VkSampleCountFlagBits)texture->samples,
+                                                mask, kind, layout);
+  if (!pipeline) {
+    LogOnce("clrmask", "cannot create a masked clear pipeline");
+    return false;
+  }
+  // Draw into one attachment and one layer at a time so no guest MRT or shader state is changed.
+  TextureView view = target.view;
+  const uint32_t base = (view.flags & 16) ? view.minLayer : 0;
+  view.flags |= 16;
+  view.numLayers = 1;
+  std::vector<VkImageView> views;
+  views.reserve(s.renderLayers);
+  for (uint32_t i = 0; i < s.renderLayers; i++) {
+    view.minLayer = base + i;
+    VkImageView attachment = GetView(texture, target.tex, &view, true);
+    if (!attachment) return false;
+    views.push_back(attachment);
+  }
+  EndRendering(s);
+  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  render.renderArea = rect;
+  render.layerCount = 1;
+  const bool stencil = kind == ClearKind::Stencil;
+  if (stencil) render.pStencilAttachment = &attachment;
+  else {
+    render.colorAttachmentCount = 1;
+    render.pColorAttachments = &attachment;
+  }
+  const VkViewport viewport{(float)rect.offset.x, (float)rect.offset.y, (float)rect.extent.width,
+                           (float)rect.extent.height, 0.0f, 1.0f};
+  for (VkImageView layer : views) {
+    attachment.imageView = layer;
+    vk.vkCmdBeginRendering(s.cb, &render);
+    vk.vkCmdBindPipeline(s.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vk.vkCmdSetViewport(s.cb, 0, 1, &viewport);
+    vk.vkCmdSetScissor(s.cb, 0, 1, &rect);
+    if (stencil) {
+      vk.vkCmdSetStencilReference(s.cb, VK_STENCIL_FACE_FRONT_AND_BACK, (uint32_t)c.i[1] & 0xff);
+      vk.vkCmdSetStencilWriteMask(s.cb, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+    } else vk.vkCmdPushConstants(s.cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, c.st);
+    vk.vkCmdDraw(s.cb, 3, 1, 0, 0);
+    vk.vkCmdEndRendering(s.cb);
+  }
+  GlobalBarrier(s.cb);
+  return true;
+}
 
 static void DoClearColor(RS& s, const Cmd& c) {
   g_crumb.where = "DoClearColor";
+  const uint32_t mask = (uint32_t)c.i[1] & NVN_CLEAR_COLOR_MASK_RGBA;
+  if (!mask) return;
   uint32_t idx = (uint32_t)c.i[0];
   if (idx >= s.nColor || !s.color[idx].tex) { LogOnce("clr", "ClearColor of target %u that is not bound", idx); return; }
   if (!BeginRendering(s)) return;
-  VkClearAttachment ca{}; ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ca.colorAttachment = idx; memcpy(&ca.clearValue.color, c.st, 16);
-  if ((uint32_t)c.i[1] != 0xF) LogOnce("clrmask", "ClearColor with a partial color mask clears all channels");
-  VkClearRect cr{}; cr.rect = {{0, 0}, s.area}; cr.layerCount = s.renderLayers;
-  if (s.scSet) { cr.rect.offset = {std::max(0, s.scissor[0]), std::max(0, s.scissor[1])}; cr.rect.extent = {(uint32_t)std::max(0, s.scissor[2]), (uint32_t)std::max(0, s.scissor[3])}; }
-  ClampToArea(cr.rect, s.area);
+  const VkClearRect cr{RenderScissor(s), 0, s.renderLayers};
   if (!cr.rect.extent.width || !cr.rect.extent.height) return;
-  g_vk.f.vkCmdClearAttachments(s.cb, 1, &ca, 1, &cr); g_stats.clears++;
+  if (mask == NVN_CLEAR_COLOR_MASK_RGBA) {
+    VkClearAttachment ca{}; ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ca.colorAttachment = idx; memcpy(&ca.clearValue.color, c.st, 16);
+    g_vk.f.vkCmdClearAttachments(s.cb, 1, &ca, 1, &cr);
+  } else if (!DrawMaskedClear(s, s.color[idx], cr.rect, mask, (ClearKind)c.i[2], c)) return;
+  g_stats.clears++;
 }
 
 static void DoClearDepth(RS& s, const Cmd& c) {
   g_crumb.where = "DoClearDepth";
-  if (!s.depth.tex) { LogOnce("clrd", "ClearDepthStencil with no depth target bound"); return; }
+  const TextureImpl* texture = TexOf(s.depth.tex);
+  if (!texture) { LogOnce("clrd", "ClearDepthStencil with no depth-stencil target bound"); return; }
+  const uint32_t stencilMask = (texture->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? (uint32_t)c.i[2] & 0xff : 0;
+  VkImageAspectFlags aspects = (c.i[0] && (texture->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0;
+  if (stencilMask == 0xff) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+  if (!aspects && !stencilMask) return;
   if (!BeginRendering(s)) return;
-  VkImageAspectFlags a = 0; TextureImpl* t = TexOf(s.depth.tex);
-  if (c.i[0] && (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) a |= VK_IMAGE_ASPECT_DEPTH_BIT;
-  if (c.i[2] && (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) a |= VK_IMAGE_ASPECT_STENCIL_BIT;
-  if (!a) return;
-  VkClearAttachment ca{}; ca.aspectMask = a; ca.clearValue.depthStencil = {c.f[0], (uint32_t)c.i[1]};
-  VkClearRect cr{}; cr.rect = {{0, 0}, s.area}; cr.layerCount = s.renderLayers;
-  if (s.scSet) { cr.rect.offset = {std::max(0, s.scissor[0]), std::max(0, s.scissor[1])}; cr.rect.extent = {(uint32_t)std::max(0, s.scissor[2]), (uint32_t)std::max(0, s.scissor[3])}; }
-  ClampToArea(cr.rect, s.area);
+  const VkClearRect cr{RenderScissor(s), 0, s.renderLayers};
   if (!cr.rect.extent.width || !cr.rect.extent.height) return;
-  g_vk.f.vkCmdClearAttachments(s.cb, 1, &ca, 1, &cr); g_stats.clears++;
+  if (aspects) {
+    VkClearAttachment ca{}; ca.aspectMask = aspects; ca.clearValue.depthStencil = {c.f[0], (uint32_t)c.i[1] & 0xff};
+    g_vk.f.vkCmdClearAttachments(s.cb, 1, &ca, 1, &cr);
+  }
+  const bool partialStencil = stencilMask && stencilMask != 0xff;
+  if (partialStencil && DrawMaskedClear(s, s.depth, cr.rect, stencilMask, ClearKind::Stencil, c)) {
+    g_stats.clears++;
+  } else if (aspects) g_stats.clears++;
 }
 
-static VkImageSubresourceLayers SubLayers(TextureImpl* t, const TextureView& v, bool hasV) {
-  uint32_t lv = hasV && (v.flags & 8) ? v.minLevel : 0, ly = hasV && (v.flags & 16) ? v.minLayer : 0;
-  uint32_t cnt = hasV && (v.flags & 16) ? std::max<uint32_t>(1, v.numLayers) : 1;
-  return {t->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : t->aspect) : t->aspect, lv, ly, cnt};
+struct ImageCopyRegion {
+  VkImageSubresourceLayers layers;
+  VkOffset3D offset;
+  VkExtent3D extent;
+
+  VkOffset3D End() const {
+    return {offset.x + (int32_t)extent.width, offset.y + (int32_t)extent.height, offset.z + (int32_t)extent.depth};
+  }
+
+  ImageCopyRegion Slice(bool volume, uint32_t index) const {
+    ImageCopyRegion slice = *this;
+    if (volume) {
+      slice.offset.z += (int32_t)index;
+      slice.extent.depth = 1;
+    } else {
+      slice.layers.baseArrayLayer += index;
+      slice.layers.layerCount = 1;
+    }
+    return slice;
+  }
+};
+
+static bool ResolveImageRegion(const TextureImpl& texture, const TextureView& view, const int32_t* region,
+                               ImageCopyRegion& copy) {
+  const uint32_t mip = (view.flags & 8) ? view.minLevel : 0;
+  if (mip >= texture.levels || mip >= 32 || region[0] < 0 || region[1] < 0 ||
+      region[2] < 0 || region[3] <= 0 || region[4] <= 0 || region[5] < 0) return false;
+  const uint32_t width = std::max(1u, texture.width >> mip);
+  const uint32_t height = std::max(1u, texture.height >> mip);
+  const uint32_t count = std::max(1, region[5]);
+  if (uint64_t(region[0]) + region[3] > width || uint64_t(region[1]) + region[4] > height) return false;
+
+  const VkImageAspectFlags aspect = (texture.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : texture.aspect;
+  copy.layers = {aspect, mip, 0, 1};
+  copy.offset = {region[0], region[1], 0};
+  copy.extent = {(uint32_t)region[3], (uint32_t)region[4], 1};
+  if (texture.is3D) {
+    if (uint64_t(region[2]) + count > std::max(1u, texture.depth >> mip)) return false;
+    copy.offset.z = region[2];
+    copy.extent.depth = count;
+  } else {
+    const uint64_t layer = uint64_t((view.flags & 16) ? view.minLayer : 0) + region[2];
+    if (layer + count > texture.layers) return false;
+    copy.layers.baseArrayLayer = (uint32_t)layer;
+    copy.layers.layerCount = count;
+  }
+  return true;
+}
+
+static bool ResolveViewRegion(const TextureImpl& texture, TextureView& view, VkExtent2D& extent, VkFormat& format) {
+  if (texture.is3D || texture.aspect != VK_IMAGE_ASPECT_COLOR_BIT || !texture.renderTarget) return false;
+  const uint32_t mip = (view.flags & 8) ? view.minLevel : 0;
+  const uint32_t base = (view.flags & 16) ? view.minLayer : 0;
+  const uint32_t count = (view.flags & 16) ? view.numLayers : texture.layers;
+  if (mip >= texture.levels || mip >= 32 || base >= texture.layers ||
+      !count || count > texture.layers - base || count > UINT16_MAX) return false;
+  VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+  format = (view.flags & 2) ? VkFormatFromNvn(view.format, nullptr, nullptr, &aspect) : texture.vkFormat;
+  if (format == VK_FORMAT_UNDEFINED || aspect != VK_IMAGE_ASPECT_COLOR_BIT) return false;
+  extent = {std::max(1u, texture.width >> mip), std::max(1u, texture.height >> mip)};
+  view.flags |= 8 | 16;
+  view.minLevel = (uint16_t)mip; view.numLevels = 1;
+  view.minLayer = (uint16_t)base; view.numLayers = (uint16_t)count;
+  return true;
+}
+
+static void DoDownsample(RS& s, const Cmd& c) {
+  auto* src = (TextureG*)c.obj[0];
+  auto* dst = (TextureG*)c.obj[1];
+  TextureImpl* source = TexOf(src);
+  TextureImpl* dest = TexOf(dst);
+  if (!source || !dest) return;
+  TextureView sv{}, dv{};
+  if (!c.blob.empty()) {
+    sv = ViewAt(c.blob.data());
+    dv = ViewAt(c.blob.data() + sizeof(TextureView));
+  }
+  VkExtent2D extent{}, destExtent{};
+  VkFormat format, destFormat;
+  if (source->samples <= 1 || dest->samples != 1 ||
+      !ResolveViewRegion(*source, sv, extent, format) || !ResolveViewRegion(*dest, dv, destExtent, destFormat) ||
+      extent.width != destExtent.width || extent.height != destExtent.height ||
+      sv.numLayers != dv.numLayers || format != destFormat) {
+    LogOnce("badresolve", "Downsample needs matching color views from multisample to single-sample textures");
+    return;
+  }
+  const VkImageView sourceView = GetView(source, src, &sv, true);
+  const VkImageView destView = GetView(dest, dst, &dv, true);
+  if (!sourceView || !destView) return;
+
+  EndRendering(s);
+  ToGeneral(s, source);
+  ToGeneral(s, dest);
+  GlobalBarrier(s.cb);
+  source->lastUse = s.value;
+  dest->gpuWritten = true;
+  dest->uploaded = true;
+  dest->lastUse = s.value;
+
+  // Attachment resolves apply the selected view format, including integer sample-zero behavior.
+  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  attachment.imageView = sourceView;
+  attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  attachment.resolveMode = IsIntegerFormat(format) ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+  attachment.resolveImageView = destView;
+  attachment.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo render{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  render.renderArea = {{0, 0}, extent};
+  render.layerCount = sv.numLayers;
+  render.colorAttachmentCount = 1;
+  render.pColorAttachments = &attachment;
+  g_vk.f.vkCmdBeginRendering(s.cb, &render);
+  g_vk.f.vkCmdEndRendering(s.cb);
+  GlobalBarrier(s.cb);
+}
+
+struct BufferImageLayout {
+  VkBuffer buffer = VK_NULL_HANDLE;
+  uint64_t offset = 0;
+  uint64_t separateSlicePitch = 0;
+  uint32_t rowLength = 0;
+};
+
+static bool ResolveImageBuffer(const TextureImpl& texture, const ImageCopyRegion& region, const Cmd& copy,
+                               BufferImageLayout& layout) {
+  if (texture.samples != 1 || copy.l[1] < 0 || copy.l[2] < 0) return false;
+  uint32_t blockWidth = 1, blockHeight = 1, blockBytes = NvnFormatBytes(texture.nvnFormat);
+  const bool depthStencil = region.layers.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT;
+  if (region.layers.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) {
+    blockBytes = texture.vkFormat == VK_FORMAT_D16_UNORM ? 2 : 4;
+  } else if (region.layers.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT) {
+    blockBytes = 1;
+  } else {
+    sr_tex_format format{};
+    if (sr_tex_format_from_nvn(texture.nvnFormat, &format) == SR_TEX_OK) {
+      const sr_tex_format_info* info = sr_tex_format_info_get(format.fmt);
+      if (info && info->codec != SR_TEX_CODEC_RAW) {
+        // An emulated ASTC image needs a conversion from guest blocks, not a direct buffer copy.
+        if (info->codec == SR_TEX_CODEC_ASTC &&
+            (texture.vkFormat == VK_FORMAT_R8G8B8A8_UNORM || texture.vkFormat == VK_FORMAT_R8G8B8A8_SRGB)) return false;
+        blockWidth = info->block_w; blockHeight = info->block_h; blockBytes = info->bytes_per_block;
+      }
+    }
+  }
+  if (!blockBytes || !blockWidth || !blockHeight) return false;
+  const uint32_t mip = region.layers.mipLevel;
+  const auto end = region.End();
+  if (region.offset.x % blockWidth || region.offset.y % blockHeight ||
+      (region.extent.width % blockWidth && (uint32_t)end.x != std::max(1u, texture.width >> mip)) ||
+      (region.extent.height % blockHeight && (uint32_t)end.y != std::max(1u, texture.height >> mip))) return false;
+
+  const uint64_t rowBytes = ((uint64_t(region.extent.width) + blockWidth - 1) / blockWidth) * blockBytes;
+  const uint64_t rowPitch = copy.l[1] ? (uint64_t)copy.l[1] : rowBytes;
+  if (rowPitch < rowBytes || rowPitch > INT32_MAX || rowPitch % blockBytes) return false;
+  if (rowPitch != rowBytes) {
+    const uint64_t texels = rowPitch / blockBytes * blockWidth;
+    if (texels > UINT32_MAX) return false;
+    layout.rowLength = (uint32_t)texels;
+  }
+  const uint64_t rows = (uint64_t(region.extent.height) + blockHeight - 1) / blockHeight;
+  const uint64_t defaultSlicePitch = rows * rowPitch;
+  const uint64_t sliceBytes = defaultSlicePitch - rowPitch + rowBytes;
+  const uint64_t slices = texture.is3D ? region.extent.depth : region.layers.layerCount;
+  const uint64_t slicePitch = copy.l[2] ? (uint64_t)copy.l[2] : defaultSlicePitch;
+  const uint32_t alignment = depthStencil ? 4u : blockBytes;
+  if (slices > 1) {
+    if (slicePitch < sliceBytes || slices - 1 > (UINT64_MAX - sliceBytes) / slicePitch) return false;
+    if (slicePitch != defaultSlicePitch) {
+      if (slicePitch % alignment) return false;
+      layout.separateSlicePitch = slicePitch;
+    }
+  }
+  const uint64_t length = (slices - 1) * slicePitch + sliceBytes;
+  return ResolveBuffer((uint64_t)copy.l[0], length, &layout.buffer, &layout.offset) &&
+         layout.offset % alignment == 0;
 }
 
 static void DoCopy(RS& s, const Cmd& c) {
@@ -913,41 +1256,111 @@ static void DoCopy(RS& s, const Cmd& c) {
       if (!ResolveBuffer((uint64_t)c.l[0], (uint64_t)c.l[2], &a, &oa) || !ResolveBuffer((uint64_t)c.l[1], (uint64_t)c.l[2], &b, &ob)) { LogOnce("cpb", "CopyBufferToBuffer with unresolved address"); break; }
       VkBufferCopy r{oa, ob, (VkDeviceSize)c.l[2]}; F.vkCmdCopyBuffer(s.cb, a, b, 1, &r); break;
     }
-    case Op::CopyBufToTex: {
+    case Op::CopyBufToTex: case Op::CopyTexToBuf: {
+      const bool upload = c.op == Op::CopyBufToTex;
       TextureG* g = (TextureG*)c.obj[0]; TextureImpl* t = TexOf(g); TextureView v = ViewAt(c.blob.data()); const int32_t* rg = (const int32_t*)(c.blob.data() + 16);
-      VkBuffer b; uint64_t o; if (!t || !ResolveBuffer((uint64_t)c.l[0], 1, &b, &o)) { LogOnce("cpbt", "CopyBufferToTexture with unresolved address"); break; }
-      ToGeneral(s, t); t->gpuWritten = true; t->uploaded = true; t->lastUse = s.value;
-      VkBufferImageCopy r{}; r.bufferOffset = o; r.imageSubresource = SubLayers(t, v, v.flags != 0);
-      r.imageOffset = {rg[0], rg[1], rg[2]}; r.imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], (uint32_t)std::max(1, rg[5])};
-      if (!t->is3D) { r.imageOffset.z = 0; r.imageExtent.depth = 1; r.imageSubresource.baseArrayLayer += (uint32_t)rg[2]; r.imageSubresource.layerCount = std::max(1, rg[5]); }
-      F.vkCmdCopyBufferToImage(s.cb, b, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r); break;
-    }
-    case Op::CopyTexToBuf: {
-      TextureG* g = (TextureG*)c.obj[0]; TextureImpl* t = TexOf(g); TextureView v = ViewAt(c.blob.data()); const int32_t* rg = (const int32_t*)(c.blob.data() + 16);
-      VkBuffer b; uint64_t o; if (!t || !ResolveBuffer((uint64_t)c.l[0], 1, &b, &o)) { LogOnce("cptb", "CopyTextureToBuffer with unresolved address"); break; }
-      ToGeneral(s, t); PrepareSampled(s, g);
-      VkBufferImageCopy r{}; r.bufferOffset = o; r.imageSubresource = SubLayers(t, v, v.flags != 0);
-      r.imageOffset = {rg[0], rg[1], rg[2]}; r.imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], (uint32_t)std::max(1, rg[5])};
-      if (!t->is3D) { r.imageOffset.z = 0; r.imageExtent.depth = 1; r.imageSubresource.baseArrayLayer += (uint32_t)rg[2]; r.imageSubresource.layerCount = std::max(1, rg[5]); }
-      F.vkCmdCopyImageToBuffer(s.cb, t->image, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r); break;
+      if (!t) { LogOnce("cpimg", "buffer-image copy with unresolved texture"); break; }
+      ImageCopyRegion image{};
+      if (!ResolveImageRegion(*t, v, rg, image)) { LogOnce("cpimgregion", "buffer-image copy exceeds the image subresource"); break; }
+      BufferImageLayout layout;
+      if (!ResolveImageBuffer(*t, image, c, layout)) { LogOnce("cpimgbuffer", "buffer-image copy has an invalid range, stride or format"); break; }
+      ToGeneral(s, t);
+      if (upload) { t->gpuWritten = true; t->uploaded = true; t->lastUse = s.value; }
+      else PrepareSampled(s, g);
+      const VkBufferImageCopy packed{layout.offset, layout.rowLength, 0, image.layers, image.offset, image.extent};
+      std::vector<VkBufferImageCopy> split;
+      const VkBufferImageCopy* regions = &packed;
+      uint32_t count = 1;
+      if (layout.separateSlicePitch) {
+        count = t->is3D ? image.extent.depth : image.layers.layerCount;
+        split.reserve(count);
+        for (uint32_t i = 0; i < count; i++) {
+          const ImageCopyRegion slice = image.Slice(t->is3D, i);
+          split.push_back({layout.offset + i * layout.separateSlicePitch, layout.rowLength, 0,
+                           slice.layers, slice.offset, slice.extent});
+        }
+        regions = split.data();
+      }
+      if (upload) F.vkCmdCopyBufferToImage(s.cb, layout.buffer, t->image, VK_IMAGE_LAYOUT_GENERAL, count, regions);
+      else F.vkCmdCopyImageToBuffer(s.cb, t->image, VK_IMAGE_LAYOUT_GENERAL, layout.buffer, count, regions);
+      break;
     }
     case Op::CopyTexToTex: {
       TextureG* sg = (TextureG*)c.obj[0]; TextureG* dg = (TextureG*)c.obj[1]; TextureImpl* st = TexOf(sg); TextureImpl* dt = TexOf(dg);
       TextureView sv = ViewAt(c.blob.data()); const int32_t* sr = (const int32_t*)(c.blob.data() + 16);
       TextureView dv = ViewAt(c.blob.data() + 40); const int32_t* dr = (const int32_t*)(c.blob.data() + 56);
       if (!st || !dt) break;
+      ImageCopyRegion src{}, dst{};
+      if (!ResolveImageRegion(*st, sv, sr, src) || !ResolveImageRegion(*dt, dv, dr, dst)) {
+        LogOnce("cpttregion", "CopyTextureToTexture region exceeds the source or destination subresource");
+        break;
+      }
+      const bool mixedDimensions = st->is3D != dt->is3D;
+      const uint32_t srcSlices = st->is3D ? src.extent.depth : src.layers.layerCount;
+      const uint32_t dstSlices = dt->is3D ? dst.extent.depth : dst.layers.layerCount;
+      const bool flipX = c.i[0] & NVN_COPY_FLAGS_MIRROR_X_BIT;
+      const bool flipY = c.i[0] & NVN_COPY_FLAGS_MIRROR_Y_BIT;
+      const bool flipZ = c.i[0] & NVN_COPY_FLAGS_MIRROR_Z_BIT;
+      const bool linear = c.i[0] & NVN_COPY_FLAGS_LINEAR_FILTER_BIT;
+      const bool sameSize = src.extent.width == dst.extent.width && src.extent.height == dst.extent.height && srcSlices == dstSlices;
+      const auto blockCompressed = [](VkFormat format) {
+        return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+      };
+      // Equal extents still require conversion when the color encodings differ, e.g. packed HDR to sRGB.
+      const bool convertColor = st->vkFormat != dt->vkFormat && src.layers.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+          !IsIntegerFormat(st->vkFormat) && !IsIntegerFormat(dt->vkFormat) &&
+          !blockCompressed(st->vkFormat) && !blockCompressed(dt->vkFormat);
+      const bool copy = sameSize && st->samples == dt->samples && !flipX && !flipY && !convertColor;
+      if ((!copy && (mixedDimensions || st->samples != 1 || dt->samples != 1 ||
+                     src.layers.layerCount != dst.layers.layerCount)) ||
+          src.layers.aspectMask != dst.layers.aspectMask) {
+        LogOnce("cpttshape", "CopyTextureToTexture has incompatible aspects, slices or sample counts");
+        break;
+      }
+      if (!copy && (!(st->optimalFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
+                    !(dt->optimalFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
+                    (linear && !(st->optimalFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)))) {
+        LogOnce("cpttblitformat", "CopyTextureToTexture blit format or filter is unsupported by the device");
+        break;
+      }
       PrepareSampled(s, sg); ToGeneral(s, dt); dt->gpuWritten = true; dt->uploaded = true; dt->lastUse = s.value;
-      bool same = (sr[3] == dr[3] && sr[4] == dr[4]);
-      VkImageSubresourceLayers a = SubLayers(st, sv, sv.flags != 0), b = SubLayers(dt, dv, dv.flags != 0);
-      if (same && st->samples == dt->samples) {
-        VkImageCopy r{}; r.srcSubresource = a; r.dstSubresource = b; r.srcOffset = {sr[0], sr[1], st->is3D ? sr[2] : 0}; r.dstOffset = {dr[0], dr[1], dt->is3D ? dr[2] : 0};
-        r.extent = {(uint32_t)sr[3], (uint32_t)sr[4], (uint32_t)std::max(1, sr[5])}; if (!st->is3D) r.extent.depth = 1;
-        F.vkCmdCopyImage(s.cb, st->image, VK_IMAGE_LAYOUT_GENERAL, dt->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+      if (copy) {
+        if (flipZ && srcSlices > 1) {
+          std::vector<VkImageCopy> regions;
+          regions.reserve(srcSlices);
+          for (uint32_t layer = 0; layer < srcSlices; layer++) {
+            const ImageCopyRegion from = src.Slice(st->is3D, srcSlices - 1 - layer);
+            const ImageCopyRegion to = dst.Slice(dt->is3D, layer);
+            regions.push_back({from.layers, from.offset, to.layers, to.offset, from.extent});
+          }
+          F.vkCmdCopyImage(s.cb, st->image, VK_IMAGE_LAYOUT_GENERAL, dt->image, VK_IMAGE_LAYOUT_GENERAL,
+                           (uint32_t)regions.size(), regions.data());
+        } else {
+          VkImageCopy r{src.layers, src.offset, dst.layers, dst.offset, src.extent};
+          if (mixedDimensions) r.extent.depth = srcSlices;
+          F.vkCmdCopyImage(s.cb, st->image, VK_IMAGE_LAYOUT_GENERAL, dt->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        }
       } else {
-        VkImageBlit r{}; r.srcSubresource = a; r.dstSubresource = b;
-        r.srcOffsets[0] = {sr[0], sr[1], 0}; r.srcOffsets[1] = {sr[0] + sr[3], sr[1] + sr[4], 1};
-        r.dstOffsets[0] = {dr[0], dr[1], 0}; r.dstOffsets[1] = {dr[0] + dr[3], dr[1] + dr[4], 1};
-        F.vkCmdBlitImage(s.cb, st->image, VK_IMAGE_LAYOUT_GENERAL, dt->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r, (c.i[0] & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        auto Region = [&](const ImageCopyRegion& from, const ImageCopyRegion& to) {
+          VkImageBlit r{from.layers, {from.offset, from.End()}, to.layers, {to.offset, to.End()}};
+          if (flipX) std::swap(r.srcOffsets[0].x, r.srcOffsets[1].x);
+          if (flipY) std::swap(r.srcOffsets[0].y, r.srcOffsets[1].y);
+          if (flipZ && st->is3D) std::swap(r.srcOffsets[0].z, r.srcOffsets[1].z);
+          return r;
+        };
+        const VkFilter filter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        if (flipZ && !st->is3D && srcSlices > 1) {
+          std::vector<VkImageBlit> regions;
+          regions.reserve(srcSlices);
+          for (uint32_t layer = 0; layer < srcSlices; layer++) {
+            regions.push_back(Region(src.Slice(false, srcSlices - 1 - layer), dst.Slice(false, layer)));
+          }
+          F.vkCmdBlitImage(s.cb, st->image, VK_IMAGE_LAYOUT_GENERAL, dt->image, VK_IMAGE_LAYOUT_GENERAL,
+                           (uint32_t)regions.size(), regions.data(), filter);
+        } else {
+          const VkImageBlit r = Region(src, dst);
+          F.vkCmdBlitImage(s.cb, st->image, VK_IMAGE_LAYOUT_GENERAL, dt->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r, filter);
+        }
       }
       break;
     }
@@ -971,7 +1384,16 @@ static void Exec(RS& s, const CmdList& l, int depth) {
       case Op::BindVertexAttrib: if (c.i[1]) for (auto& b : s.attrSet) b = false;
         if (c.i[0] >= 0 && c.i[0] < 16) { memcpy(&s.attr[c.i[0]], c.st, sizeof(VertexAttribG)); s.attrSet[c.i[0]] = true; } break;
       case Op::BindVertexStream: if (c.i[0] >= 0 && c.i[0] < 16) memcpy(&s.stream[c.i[0]], c.st, sizeof(VertexStreamG)); break;
-      case Op::BindProgram: s.prog = IsLive((void*)c.p[0]) ? (ProgramImpl*)c.p[0] : nullptr; s.progStages = (uint32_t)c.i[0]; break;
+      case Op::BindProgram: {
+        auto* program = IsLive((void*)c.p[0]) ? (ProgramImpl*)c.p[0] : nullptr;
+        const uint32_t mask = (uint32_t)c.i[0];
+        for (int st = 0; st < 6; st++) if (mask & (1u << st)) s.stageOwners[st] = program;
+        if (mask & NVN_SHADER_STAGE_VERTEX_BIT) {
+          s.vertexBindMask = mask;
+          if (!program) s.missingProgramReason = c.i[1] ? "bound program is unavailable" : "explicit null bind";
+        }
+        break;
+      }
       case Op::BindVertexBuffer: if (c.i[0] >= 0 && c.i[0] < 16) s.vb[c.i[0]] = {(uint64_t)c.l[0], (uint64_t)c.l[1]}; break;
       case Op::BindVertexBuffers: for (int k = 0; k < c.i[1]; k++) if (c.i[0] + k < 16) memcpy(&s.vb[c.i[0] + k], c.blob.data() + 16 * k, 16); break;
       case Op::BindUniform: if (c.i[0] >= 0 && c.i[0] < 6 && c.i[1] >= 0 && c.i[1] < 16) s.ub[c.i[0]][c.i[1]] = {(uint64_t)c.l[0], (uint64_t)c.l[1]}; break;
@@ -1020,56 +1442,72 @@ static void Exec(RS& s, const CmdList& l, int depth) {
         F.vkCmdDraw(s.cb, (uint32_t)c.i[2], c.op == Op::Draw ? 1u : (uint32_t)c.i[4], (uint32_t)c.i[1], c.op == Op::Draw ? 0u : (uint32_t)c.i[3]); g_stats.draws++; break;
       }
       case Op::DrawElements: case Op::DrawElementsInstanced: {
+        const IndexFormat format = DrawIndexFormat(c.i[1]);
+        if (!format.bytes || c.i[2] < 0) { g_stats.skippedDraws++; break; }
         bool skip; if (!PrepareDraw(s, (uint32_t)c.i[0], &skip)) { g_stats.skippedDraws++; break; }
         VkBuffer ib; uint64_t io;
         if (NeedsExpand((uint32_t)c.i[0])) {
-          uint32_t isz = c.i[1] == NVN_INDEX_TYPE_UNSIGNED_INT ? 4u : c.i[1] == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2u : 1u, n = (uint32_t)c.i[2];
+          const uint32_t isz = format.bytes, n = (uint32_t)c.i[2];
           const uint8_t* src = HostPtr((uint64_t)c.l[0], (uint64_t)n * isz);
           if (!src) { LogOnce("badidx2", "DrawElements of QUADS/QUAD_STRIP/LINE_LOOP needs its index data in a memory pool (skipped)"); g_stats.skippedDraws++; break; }
-          auto at = [&](uint32_t k) -> uint32_t { return isz == 4 ? ((const uint32_t*)src)[k] : isz == 2 ? ((const uint16_t*)src)[k] : src[k]; };
+          auto at = [&](uint32_t k) -> uint32_t {
+            uint32_t index = 0;
+            memcpy(&index, src + uint64_t(k) * isz, isz);
+            return index;
+          };
           std::vector<uint32_t> idx;
           if (!ExpandPrimitive((uint32_t)c.i[0], n, at, &idx) || !BindExpanded(s, idx)) { g_stats.skippedDraws++; break; }
           F.vkCmdDrawIndexed(s.cb, (uint32_t)idx.size(), c.op == Op::DrawElements ? 1u : (uint32_t)c.i[5], 0, c.i[3], c.op == Op::DrawElements ? 0u : (uint32_t)c.i[4]); g_stats.draws++; break;
         }
-        if (!ResolveBuffer((uint64_t)c.l[0], 1, &ib, &io)) { LogOnce("badidx", "DrawElements index address unresolved (skipped)"); g_stats.skippedDraws++; break; }
-        VkIndexType it = c.i[1] == NVN_INDEX_TYPE_UNSIGNED_INT ? VK_INDEX_TYPE_UINT32 : c.i[1] == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT8;
-        if (it == VK_INDEX_TYPE_UINT8 && !g_vk.hasIdx8) { LogOnce("idx8", "8-bit indices need VK_EXT_index_type_uint8"); g_stats.skippedDraws++; break; }
-        F.vkCmdBindIndexBuffer(s.cb, ib, io, it);
+        if (!ResolveIndexBuffer((uint64_t)c.l[0], format, (uint32_t)c.i[2], &ib, &io)) { g_stats.skippedDraws++; break; }
+        F.vkCmdBindIndexBuffer(s.cb, ib, io, format.type);
         F.vkCmdDrawIndexed(s.cb, (uint32_t)c.i[2], c.op == Op::DrawElements ? 1u : (uint32_t)c.i[5], 0, c.i[3], c.op == Op::DrawElements ? 0u : (uint32_t)c.i[4]); g_stats.draws++; break;
       }
       case Op::DrawIndirect: case Op::DrawElementsIndirect: {
-        bool skip; if (!PrepareDraw(s, (uint32_t)c.i[0], &skip)) { g_stats.skippedDraws++; break; }
-        VkBuffer ib, db; uint64_t io, dof;
-        if (!ResolveBuffer((uint64_t)c.l[1], 16, &db, &dof)) { g_stats.skippedDraws++; break; }
-        if (c.op == Op::DrawElementsIndirect) {
-          if (!ResolveBuffer((uint64_t)c.l[0], 1, &ib, &io)) { g_stats.skippedDraws++; break; }
-          F.vkCmdBindIndexBuffer(s.cb, ib, io, c.i[1] == NVN_INDEX_TYPE_UNSIGNED_INT ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
-          F.vkCmdDrawIndexedIndirect(s.cb, db, dof, 1, 20);
-        } else F.vkCmdDrawIndirect(s.cb, db, (uint64_t)dof, 1, 16);
+        const uint32_t prim = (uint32_t)c.i[0];
+        if (NeedsExpand(prim)) {
+          LogOnce("indirecttopology", "indirect draw needs GPU primitive expansion (skipped)");
+          g_stats.skippedDraws++; break;
+        }
+        const bool indexed = c.op == Op::DrawElementsIndirect;
+        const size_t argSize = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+        VkBuffer ib = VK_NULL_HANDLE, db; uint64_t io = 0, dof;
+        const IndexFormat format = DrawIndexFormat(c.i[1]);
+        if (!ResolveIndirectBuffer((uint64_t)c.l[1], argSize, &db, &dof) ||
+            (indexed && !ResolveIndexBuffer((uint64_t)c.l[0], format, 1, &ib, &io))) {
+          g_stats.skippedDraws++; break;
+        }
+        bool skip; if (!PrepareDraw(s, prim, &skip)) { g_stats.skippedDraws++; break; }
+        if (indexed) {
+          F.vkCmdBindIndexBuffer(s.cb, ib, io, format.type);
+          F.vkCmdDrawIndexedIndirect(s.cb, db, dof, 1, (uint32_t)argSize);
+        } else F.vkCmdDrawIndirect(s.cb, db, dof, 1, (uint32_t)argSize);
         g_stats.draws++; break;
       }
       case Op::Dispatch: case Op::DispatchIndirect: {
         EndRendering(s);
-        if (!s.prog || !s.prog->complete || !s.prog->byStage[NVN_SHADER_STAGE_COMPUTE]) { LogOnce("nocs", "dispatch without a compute program"); break; }
-        if (!EnsureStage(s.prog->byStage[NVN_SHADER_STAGE_COMPUTE])) break;
-        EnsureGlobals(); VkPipeline pipe = BuildCompute(s); if (!pipe) break;
+        VkBuffer indirect = VK_NULL_HANDLE;
+        uint64_t offset = 0;
+        if (c.op == Op::DispatchIndirect &&
+            !ResolveIndirectBuffer((uint64_t)c.l[0], sizeof(VkDispatchIndirectCommand), &indirect, &offset)) break;
+        ProgramImpl* owner = s.stageOwners[NVN_SHADER_STAGE_COMPUTE];
+        StageProgram* shader = owner && owner->complete ? owner->byStage[NVN_SHADER_STAGE_COMPUTE] : nullptr;
+        if (!shader) { LogOnce("nocs", "dispatch without a compute program"); break; }
+        if (!EnsureStage(shader)) break;
+        ShaderStages shaders{};
+        shaders[NVN_SHADER_STAGE_COMPUTE] = shader;
+        EnsureGlobals(); VkPipeline pipe = BuildCompute(shaders); if (!pipe) break;
         GlobalBarrier(s.cb);
         F.vkCmdBindPipeline(s.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        if (!BindDescriptors(s, true)) break;
+        if (!BindDescriptors(s, shaders, true)) break;
         if (c.op == Op::Dispatch) F.vkCmdDispatch(s.cb, (uint32_t)c.i[0], (uint32_t)c.i[1], (uint32_t)c.i[2]);
-        else { VkBuffer b; uint64_t o; if (ResolveBuffer((uint64_t)c.l[0], 12, &b, &o)) F.vkCmdDispatchIndirect(s.cb, b, o); }
+        else F.vkCmdDispatchIndirect(s.cb, indirect, offset);
         GlobalBarrier(s.cb); g_stats.dispatches++; break;
       }
       case Op::ClearColor: DoClearColor(s, c); break;
       case Op::ClearDepthStencil: DoClearDepth(s, c); break;
       case Op::CopyBufToBuf: case Op::CopyBufToTex: case Op::CopyTexToBuf: case Op::CopyTexToTex: DoCopy(s, c); break;
-      case Op::Downsample: {
-        TextureG* sg = (TextureG*)c.obj[0]; TextureG* dg = (TextureG*)c.obj[1]; TextureImpl* ds = TexOf(sg); TextureImpl* dd = TexOf(dg); if (!ds || !dd) break;
-        EndRendering(s); ToGeneral(s, ds); ToGeneral(s, dd); dd->gpuWritten = true; GlobalBarrier(s.cb);
-        VkImageResolve r{}; r.srcSubresource = {ds->aspect, 0, 0, 1}; r.dstSubresource = {dd->aspect, 0, 0, 1};
-        r.extent = {ds->width, ds->height, 1};
-        F.vkCmdResolveImage(s.cb, ds->image, VK_IMAGE_LAYOUT_GENERAL, dd->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r); GlobalBarrier(s.cb); break;
-      }
+      case Op::Downsample: DoDownsample(s, c); break;
       case Op::Barrier: EndRendering(s); GlobalBarrier(s.cb); break;
       case Op::FenceSync: { Sync* y = (Sync*)c.p[0]; if (y) { y->value = s.value; y->signaled = false; y->eventId = 1; } break; }
       case Op::UpdateUniform: {
@@ -1103,7 +1541,8 @@ void QueueScrub(const void* o) {
     RS* h = q->hw; if (!h) continue;
     if ((void*)h->texPool == o) h->texPool = nullptr;
     if ((void*)h->sampPool == o) h->sampPool = nullptr;
-    if ((void*)h->prog == o) h->prog = nullptr;
+    if ((void*)h->stageOwners[NVN_SHADER_STAGE_VERTEX] == o) h->missingProgramReason = "bound program was finalized";
+    for (auto& owner : h->stageOwners) if ((void*)owner == o) owner = nullptr;
     for (uint32_t i = 0; i < 8; i++) if (h->color[i].tex && (void*)h->color[i].tex->impl == o) { h->color[i].tex = nullptr; h->rtDirty = true; }
     if (h->depth.tex && (void*)h->depth.tex->impl == o) { h->depth.tex = nullptr; h->rtDirty = true; }
   }

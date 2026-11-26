@@ -13,9 +13,12 @@
 | `--input-config PATH` | Keyboard map ini (also `SMRPG_INPUT_CONFIG`). Without it: `input.ini`, then `input.default.ini`, beside the exe, then the built-in map. |
 | `SMRPG_INPUT=frame:BUTTON[:length],...` | Scripted pad input for tests. The keyboard and gamepads are then ignored. |
 | `SMRPG_INPUT_FILE=path` | Same entries, one per line or comma separated. |
+| `SMRPG_INPUT_LIVE_FILE=path` | Opt-in live scripted input for tests. A valid file replaces the active schedule while the process runs. |
 | `SDL_AUDIO_DRIVER=dummy`, `SDL_AUDIODRIVER=dummy` | Set by `tools/rtprep/run_game.py` and by the platform tests for every background run (owner rule: all background runs are muted). |
 
 Scripted input: `frame` counts presented frames (NVN `QueuePresentTexture`), `length` defaults to 10 frames. Buttons: `A B X Y L R ZL ZR PLUS MINUS LSTICK RSTICK LEFT UP RIGHT DOWN`. Left stick: `STICK_UP STICK_DOWN STICK_LEFT STICK_RIGHT` or `STICK_<degrees>` (0 right, 90 up); right stick `RSTICK_...`. Overlapping entries OR their buttons and sum their sticks. Example: `SMRPG_INPUT="100:A:30,200:STICK_UP:40,260:PLUS:5"`.
+
+For a live replay, use `SMRPG_INPUT_FILE` to load the checkpoint and give `SMRPG_INPUT_LIVE_FILE` a separate path. Leave the live file absent until the first update. Write each update to a temporary file in the same directory, then atomically replace the live file. The runtime checks it every 100 ms. `0:B:12` presses B immediately on acceptance. Later offsets count from that same present. Replacing the file with an empty file releases all scripted inputs. If parsing fails, the active schedule continues. Keyboard and gamepad input are disabled while this mode is enabled.
 
 ## Default keyboard map
 

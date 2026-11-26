@@ -19,9 +19,26 @@ endif()
 
 add_library(smrpg_nvn STATIC
   nvn_vk.cpp nvn_objects.cpp nvn_formats.cpp nvn_shaders.cpp nvn_replay.cpp nvn_proc.cpp
-  nvn_api_device.cpp nvn_api_mem.cpp nvn_api_cmd.cpp)
+  nvn_api_device.cpp nvn_api_mem.cpp nvn_api_cmd.cpp nvn_clear.cpp)
 # task-23: present-time upscale pass (FSR 1) and the weak overlay hook, runtime/gfx/upscale/, compiled into this library so QueuePresent links without a cycle
 include(${CMAKE_CURRENT_SOURCE_DIR}/../gfx/upscale/upscale.cmake)
+if(NOT SMRPG_GLSLC)
+  message(FATAL_ERROR "glslc from the Vulkan SDK is required to build the NVN clear shaders")
+endif()
+set(_clear_gen ${CMAKE_CURRENT_BINARY_DIR}/clear_gen)
+file(MAKE_DIRECTORY ${_clear_gen})
+add_custom_command(OUTPUT ${_clear_gen}/clear_vert.inc
+  COMMAND ${SMRPG_GLSLC} --target-env=vulkan1.3 -O -mfmt=c ${CMAKE_CURRENT_SOURCE_DIR}/clear.vert -o ${_clear_gen}/clear_vert.inc
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/clear.vert VERBATIM)
+set(_clear_shaders ${_clear_gen}/clear_vert.inc)
+foreach(_type IN ITEMS vec4 ivec4 uvec4)
+  add_custom_command(OUTPUT ${_clear_gen}/clear_${_type}.inc
+    COMMAND ${SMRPG_GLSLC} --target-env=vulkan1.3 -O -mfmt=c -DVALUE_TYPE=${_type} ${CMAKE_CURRENT_SOURCE_DIR}/clear.frag -o ${_clear_gen}/clear_${_type}.inc
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/clear.frag VERBATIM)
+  list(APPEND _clear_shaders ${_clear_gen}/clear_${_type}.inc)
+endforeach()
+target_sources(smrpg_nvn PRIVATE ${_clear_shaders})
+target_include_directories(smrpg_nvn PRIVATE ${_clear_gen})
 target_include_directories(smrpg_nvn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${NVN_VULKAN_SDK}/Include)
 target_include_directories(smrpg_nvn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_compile_definitions(smrpg_nvn PUBLIC _WIN32_WINNT=0x0A00)

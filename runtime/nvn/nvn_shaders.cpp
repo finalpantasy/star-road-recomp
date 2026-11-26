@@ -2,11 +2,125 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <initializer_list>
+#include <map>
+#include <set>
 #include <sstream>
+#include <spirv/unified1/spirv.h>
 
 #include "nvn_internal.h"
 
 namespace nvn {
+
+// NVN's translated generic varyings each occupy one location. A missing producer value is zero.
+// Keep the fragment's original loads by moving the missing inputs to initialized private storage.
+bool ShaderLinkFragment(const StageProgram& producer, const StageProgram& fragment, std::vector<uint32_t>& variant) {
+  variant.clear();
+  auto Instructions = [](const std::vector<uint32_t>& code, auto&& visit) {
+    if (code.size() < 5 || code[0] != SpvMagicNumber) return false;
+    for (size_t i = 5; i < code.size();) {
+      const uint32_t* words = code.data() + i;
+      const uint32_t count = words[0] >> 16;
+      if (!count || count > code.size() - i) return false;
+      visit(words, count, SpvOp(words[0] & 0xffff));
+      i += count;
+    }
+    return true;
+  };
+  auto Interface = [&](const StageProgram& shader, SpvStorageClass storage, auto& vars) {
+    std::map<uint32_t, uint32_t> locations;
+    if (!Instructions(shader.spv, [&](const uint32_t* w, uint32_t n, SpvOp op) {
+      if (op == SpvOpDecorate && n == 4 && w[2] == SpvDecorationLocation) locations[w[1]] = w[3];
+    })) return false;
+    return Instructions(shader.spv, [&](const uint32_t* w, uint32_t n, SpvOp op) {
+      if (op != SpvOpVariable || n < 4 || w[3] != storage) return;
+      auto it = locations.find(w[2]);
+      if (it != locations.end()) vars.emplace(w[2], it->second);
+    });
+  };
+
+  std::map<uint32_t, uint32_t> inputs, outputs;
+  if (!Interface(producer, SpvStorageClassOutput, outputs) || !Interface(fragment, SpvStorageClassInput, inputs)) return false;
+  std::set<uint32_t> written;
+  for (const auto& out : outputs) written.insert(out.second);
+  std::set<uint32_t> privateVars;
+  for (const auto& in : inputs) if (!written.count(in.second)) privateVars.insert(in.first);
+  if (privateVars.empty()) return true;
+
+  const auto& code = fragment.spv;
+  std::map<uint32_t, uint32_t> pointees, privateTypes, zeros;
+  std::set<uint32_t> privatePointers = privateVars;
+  std::vector<uint32_t> declarations, variables, body;
+  variant.assign(code.begin(), code.begin() + 5);
+  uint32_t nextId = code[3];
+  bool inFunctions = false, supported = true;
+  auto Emit = [](std::vector<uint32_t>& out, SpvOp op, std::initializer_list<uint32_t> operands) {
+    out.push_back((uint32_t(operands.size() + 1) << 16) | op);
+    out.insert(out.end(), operands);
+  };
+  auto PrivateType = [&](uint32_t oldType) {
+    auto it = pointees.find(oldType);
+    if (it == pointees.end()) { supported = false; return 0u; }
+    auto& type = privateTypes[it->second];
+    if (!type) {
+      type = nextId++;
+      Emit(declarations, SpvOpTypePointer, {type, SpvStorageClassPrivate, it->second});
+    }
+    return type;
+  };
+  Instructions(code, [&](const uint32_t* w, uint32_t n, SpvOp op) {
+    if (op == SpvOpFunction) inFunctions = true;
+    if (op == SpvOpTypePointer && n == 4 && w[2] == SpvStorageClassInput) pointees[w[1]] = w[3];
+    if (op == SpvOpVariable && n == 4 && privateVars.count(w[2])) {
+      const uint32_t ptr = PrivateType(w[1]);
+      if (!ptr) return;
+      const uint32_t valueType = pointees.at(w[1]);
+      auto& zero = zeros[valueType];
+      if (!zero) {
+        zero = nextId++;
+        Emit(declarations, SpvOpConstantNull, {valueType, zero});
+      }
+      Emit(variables, SpvOpVariable, {ptr, w[2], SpvStorageClassPrivate, zero});
+      return;
+    }
+    if (op == SpvOpDecorate && n >= 3 && privateVars.count(w[1])) {
+      switch (w[2]) {
+        case SpvDecorationLocation: case SpvDecorationComponent: case SpvDecorationFlat:
+        case SpvDecorationNoPerspective: case SpvDecorationCentroid: case SpvDecorationSample:
+        case SpvDecorationInvariant:
+          return;
+      }
+    }
+    auto& out = inFunctions ? body : variant;
+    if (op == SpvOpEntryPoint && n >= 4 && code[1] < 0x00010400) {
+      // Before SPIR-V 1.4 only Input and Output variables can be present in the entry-point interface.
+      uint32_t first = 3;
+      while (first < n) {
+        uint32_t packed = w[first++];
+        if (!(packed & 0xff) || !(packed & 0xff00) || !(packed & 0xff0000) || !(packed & 0xff000000)) break;
+      }
+      const size_t header = out.size();
+      out.insert(out.end(), w, w + first);
+      for (uint32_t i = first; i < n; i++) if (!privateVars.count(w[i])) out.push_back(w[i]);
+      out[header] = (uint32_t(out.size() - header) << 16) | op;
+      return;
+    }
+    if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain || op == SpvOpCopyObject) &&
+        n >= 4 && privatePointers.count(w[3])) {
+      privatePointers.insert(w[2]);
+      out.insert(out.end(), {w[0], PrivateType(w[1]), w[2]});
+      out.insert(out.end(), w + 3, w + n);
+      return;
+    }
+    out.insert(out.end(), w, w + n);
+  });
+  if (!supported || !inFunctions) { variant.clear(); return false; }
+  variant[3] = nextId;
+  variant.insert(variant.end(), declarations.begin(), declarations.end());
+  variant.insert(variant.end(), variables.begin(), variables.end());
+  variant.insert(variant.end(), body.begin(), body.end());
+  return true;
+}
 
 // ---- SHA-256 ------------------------------------------------------------------------------------------------
 namespace {

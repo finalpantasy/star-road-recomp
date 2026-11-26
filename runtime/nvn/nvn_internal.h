@@ -143,6 +143,7 @@ struct TextureImpl {
   VkImage image = VK_NULL_HANDLE;
   MemAlloc mem;
   VkFormat vkFormat = VK_FORMAT_UNDEFINED;
+  VkFormatFeatureFlags optimalFeatures = 0;
   VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
   uint32_t layers = 1, levels = 1, width = 1, height = 1, depth = 1, samples = 1;
   bool isCube = false, is3D = false;
@@ -224,6 +225,8 @@ bool ShaderCacheCheckDevice(StageProgram* sp);
 // Program constants (c[1]) of a stage as a 64 KiB zero padded uniform range. False when the file is missing (the caller binds zeros).
 bool ShaderCacheConstants(StageProgram* sp, VkBuffer* buf, VkDeviceSize* off);
 bool ShaderStageReady(StageProgram* sp);                                  // device check, VkShaderModule and descriptor set layout (tests, warm up)
+// Build a fragment variant for unproduced user varyings. An empty result means the original interface can be used.
+bool ShaderLinkFragment(const StageProgram& producer, const StageProgram& fragment, std::vector<uint32_t>& variant);
 void ShaderCacheDrop(const std::string& key);                             // forget a loaded stage and its Vulkan objects (sweeps; no program may use it)
 void ShaderCacheLoadTimes(double* readSec, double* parseSec);               // total time spent reading cache files and parsing manifests (diagnostics)
 size_t ShaderCacheIndexSize();                                         // entries in index.jsonl
@@ -288,6 +291,7 @@ uint64_t NextVaBase(uint64_t size);
 VkFormat VkFormatFromNvn(uint32_t nvnFormat, int* srFmt, int* srgb, VkImageAspectFlags* aspect);
 VkFormat VertexFormatFromNvn(uint32_t nvnFormat, bool* isInt);
 uint32_t NvnFormatBytes(uint32_t nvnFormat);
+bool IsIntegerFormat(VkFormat format);
 VkComponentSwizzle SwizzleFromNvn(uint32_t s, VkComponentSwizzle identity);
 bool IsDepthFormat(VkFormat f);
 

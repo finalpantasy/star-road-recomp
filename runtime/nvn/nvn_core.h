@@ -6,6 +6,11 @@
 
 namespace nvn {
 
+enum class ClearKind { Float, Signed, Unsigned, Stencil };
+VkPipeline GetMaskedClearPipeline(VkFormat format, VkSampleCountFlagBits samples, VkColorComponentFlags mask,
+                                  ClearKind kind, VkPipelineLayout& layout);
+void DestroyMaskedClearPipelines();
+
 struct CbImpl {
   Device* dev = nullptr;
   std::shared_ptr<CmdList> cur;
@@ -13,6 +18,8 @@ struct CbImpl {
   std::vector<uint64_t> produced;          // list ids made by this command buffer (released at the next BeginRecording)
   void* memCb = nullptr; void* memCbData = nullptr;
   uint32_t sepSamplerBase = 0;
+  int64_t copyRowStride = 0;
+  int64_t copyImageStride = 0;
 };
 
 struct WindowImpl {

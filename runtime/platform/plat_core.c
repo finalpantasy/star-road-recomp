@@ -9,6 +9,8 @@
 #include "plat.h"
 
 #define PUBLISH_MS 5                               /* the Switch samples pads at 200 Hz */
+#define LIVE_INPUT_POLL_MS 100
+#define LIVE_INPUT_MAX_BYTES 65535u
 
 static struct {
     SDL_Window *win;
@@ -17,6 +19,10 @@ static struct {
     PadInput in;
     PadScript script;
     int scripted;
+    const char *live_input_file;
+    BY_HANDLE_FILE_INFORMATION live_input_stamp;
+    int live_input_seen;
+    uint32_t script_base_frame;
     volatile LONG frame;                           /* presented frames: the clock of scripted input */
     uint64_t published;
 } P;
@@ -97,6 +103,48 @@ static int load_script(void) {
     return 1;
 }
 
+static void reload_live_input(uint32_t frame) {
+    HANDLE file = CreateFileA(P.live_input_file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(file, &info) ||
+        (P.live_input_seen && info.dwVolumeSerialNumber == P.live_input_stamp.dwVolumeSerialNumber &&
+         info.nFileIndexHigh == P.live_input_stamp.nFileIndexHigh && info.nFileIndexLow == P.live_input_stamp.nFileIndexLow &&
+         info.nFileSizeHigh == P.live_input_stamp.nFileSizeHigh && info.nFileSizeLow == P.live_input_stamp.nFileSizeLow &&
+         CompareFileTime(&info.ftLastWriteTime, &P.live_input_stamp.ftLastWriteTime) == 0)) {
+        CloseHandle(file);
+        return;
+    }
+
+    char text[LIVE_INPUT_MAX_BYTES + 1];
+    DWORD n = 0;
+    const int within_limit = !info.nFileSizeHigh && info.nFileSizeLow <= LIVE_INPUT_MAX_BYTES;
+    const int read_ok = within_limit && ReadFile(file, text, info.nFileSizeLow, &n, NULL) && n == info.nFileSizeLow;
+    CloseHandle(file);
+    if (within_limit && !read_ok) return;
+    P.live_input_stamp = info;
+    P.live_input_seen = 1;
+    if (!read_ok || memchr(text, 0, n)) {
+        plat_log("platform: live input rejected: expected up to %u bytes of text", LIVE_INPUT_MAX_BYTES);
+        return;
+    }
+
+    for (DWORD i = 0; i < n; i++) if (text[i] == '\n' || text[i] == '\r') text[i] = ',';
+    text[n] = '\0';
+    PadScript script;
+    char err[160] = "out of memory";
+    if (pad_script_parse(&script, text, err, sizeof err)) {
+        plat_log("platform: live input rejected: %s", err);
+        return;
+    }
+    pad_script_free(&P.script);
+    P.script = script;
+    P.script_base_frame = frame;
+    plat_log("platform: live input accepted: %d entries at frame %u", P.script.n, P.script_base_frame);
+}
+
 /* the 5 ms pad tick needs a 1 ms timer: Windows 11 ignores the request for a process with only hidden windows unless the process says it
  * wants timer resolution honoured */
 static void fine_timer(void) {
@@ -113,6 +161,13 @@ int plat_init(const PlatOptions *o) {
     pad_input_init(&P.in);
     load_keymap(overlay_input_map(), 1);
     P.scripted = load_script();
+    P.live_input_file = getenv("SMRPG_INPUT_LIVE_FILE");
+    if (P.live_input_file && *P.live_input_file) {
+        P.scripted = 1;
+        plat_log("platform: live input file %s (the keyboard and gamepads are ignored)", P.live_input_file);
+    } else {
+        P.live_input_file = NULL;
+    }
     plat_audio_set_enabled(o->audio || overlay_audio_enabled());
     plat_log("platform: audio %s", o->audio ? "ON (--audio): a real device opens when the game opens audout" : "off: null sink, no device");
 
@@ -192,12 +247,12 @@ static void handle_event(const SDL_Event *e) {
     if (!P.scripted) pad_input_event(&P.in, e);
 }
 
-static void publish_pads(void) {
+static void publish_pads(uint32_t frame) {
     PadState pads[PAD_MAX_PLAYERS];
     uint32_t mask = 1;
     if (P.scripted) {
         memset(pads, 0, sizeof pads);
-        pad_script_state(&P.script, (uint32_t)P.frame, &pads[0]);
+        pad_script_state(&P.script, frame - P.script_base_frame, &pads[0]);
     } else {
         pad_input_compose(&P.in, pads, &mask);
     }
@@ -209,14 +264,19 @@ static void publish_pads(void) {
 
 void plat_run(void *boot_thread) {
     HANDLE bt = (HANDLE)boot_thread;
-    uint64_t next = SDL_GetTicks(), last_stat = next;
+    uint64_t next = SDL_GetTicks(), last_stat = next, next_live_input = next;
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) handle_event(&e);
         overlay_main_tick(P.win);
         uint64_t now = SDL_GetTicks();
         if (now >= next) {
-            publish_pads();
+            const uint32_t frame = plat_frame();
+            if (P.live_input_file && now >= next_live_input) {
+                reload_live_input(frame);
+                next_live_input = now + LIVE_INPUT_POLL_MS;
+            }
+            publish_pads(frame);
             next += PUBLISH_MS;
             if (now >= next + 100) next = now + PUBLISH_MS;                         /* fell far behind (a stall): do not burst */
         }

@@ -14,6 +14,7 @@ On the second date, promote it in the same turn:
 | Correction | Dates | Status |
 |---|---|---|
 | Background and hidden game runs must be muted (2026-11-24: the owner heard the task-15 baseline run playing audio after the rule was sent but before the worker read it) | 2026-11-24 | Logged |
+| The owner clarified that the current work runs and verifies an existing executable translated from the owner's dump. Resume the paused replay at the current checkpoint. | 2026-11-26 | Logged |
 
 ## Why behind each earned rule
 None yet.

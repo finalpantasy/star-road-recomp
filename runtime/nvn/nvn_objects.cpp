@@ -66,12 +66,12 @@ Pool* PoolFromVa(uint64_t va, uint64_t* off) {
 }
 uint8_t* HostPtr(uint64_t va, uint64_t size) {
   uint64_t off; Pool* p = PoolFromVa(va, &off);
-  if (!p || !p->memory || off + size > p->size) return nullptr;
+  if (!p || !p->memory || size > p->size - off) return nullptr;
   return p->memory + off;
 }
 bool ResolveBuffer(uint64_t va, uint64_t size, VkBuffer* buf, uint64_t* off) {
   uint64_t o; Pool* p = PoolFromVa(va, &o);
-  if (!p || p->buffer == VK_NULL_HANDLE || o + size > p->size) return false;
+  if (!p || p->buffer == VK_NULL_HANDLE || size > p->size - o) return false;
   *buf = p->buffer; *off = o; return true;
 }
 std::shared_ptr<CmdList> FindList(uint64_t id) {
@@ -168,6 +168,7 @@ bool TextureCreate(TextureG* g, TextureImpl* t) {
   if (t->samples > 1) t->levels = 1;                 // a multisample image has one mip level
   VkFormatProperties fp; F.vkGetPhysicalDeviceFormatProperties(g_vk.phys, t->vkFormat, &fp);
   VkFormatFeatureFlags feat = fp.optimalTilingFeatures;
+  t->optimalFeatures = feat;
   VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   if (feat & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
   if (feat & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;

@@ -77,6 +77,8 @@ NVN_API(nvnVertexAttribStateSetFormat, void, (VertexAttribG* s, int fmt, int64_t
 NVN_API(nvnVertexAttribStateSetStreamIndex, void, (VertexAttribG* s, int idx)) { s->stream = (uint8_t)idx; }
 NVN_API(nvnVertexStreamStateSetDefaults, void, (VertexStreamG* s)) { *s = VertexStreamG{0, 0}; }
 NVN_API(nvnVertexStreamStateSetStride, void, (VertexStreamG* s, int64_t stride)) { s->stride = (uint32_t)stride; }
+NVN_API(nvnVertexStreamStateSetDivisor, void, (VertexStreamG* s, int divisor)) { s->divisor = divisor > 0 ? (uint32_t)divisor : 0; }
+NVN_API(nvnVertexStreamStateGetDivisor, int, (const VertexStreamG* s)) { return (int)s->divisor; }
 
 // ---- command buffer ------------------------------------------------------------------------------------------------------
 static constexpr size_t kKeepLists = 32;    // handles a command buffer keeps alive after EndRecording
@@ -141,7 +143,9 @@ NVN_API(nvnCommandBufferBindVertexAttribState, void, (void* cb, int n, const Ver
 NVN_API(nvnCommandBufferBindVertexStreamState, void, (void* cb, int n, const VertexStreamG* s)) {
   for (int i = 0; i < n; i++) { Cmd* m = Emit(cb, Op::BindVertexStream); if (!m) return; m->i[0] = i; memcpy(m->st, &s[i], sizeof(VertexStreamG)); }
 }
-NVN_API(nvnCommandBufferBindProgram, void, (void* cb, const void* prog, int stages)) { EMIT(BindProgram); m->p[0] = (uint64_t)(uintptr_t)ImplOf<ProgramImpl>(prog); m->i[0] = stages; }
+NVN_API(nvnCommandBufferBindProgram, void, (void* cb, const void* prog, int stages)) {
+  EMIT(BindProgram); m->p[0] = (uint64_t)(uintptr_t)ImplOf<ProgramImpl>(prog); m->i[0] = stages; m->i[1] = prog != nullptr;
+}
 
 // buffer and resource binds
 NVN_API(nvnCommandBufferBindVertexBuffer, void, (void* cb, int idx, uint64_t addr, int64_t size)) { EMIT(BindVertexBuffer); m->i[0] = idx; m->l[0] = (int64_t)addr; m->l[1] = size; }
@@ -209,8 +213,14 @@ NVN_API(nvnCommandBufferDispatchComputeIndirect, void, (void* cb, uint64_t indir
 
 // clears, copies, sync
 NVN_API(nvnCommandBufferClearColor, void, (void* cb, int idx, const float* c, int mask)) { EMIT(ClearColor); m->i[0] = idx; m->i[1] = mask; memcpy(m->st, c, 16); }
+NVN_API(nvnCommandBufferClearColori, void, (void* cb, int idx, const int32_t* c, int mask)) {
+  EMIT(ClearColor); m->i[0] = idx; m->i[1] = mask; m->i[2] = (int)ClearKind::Signed; memcpy(m->st, c, 16);
+}
+NVN_API(nvnCommandBufferClearColorui, void, (void* cb, int idx, const uint32_t* c, int mask)) {
+  EMIT(ClearColor); m->i[0] = idx; m->i[1] = mask; m->i[2] = (int)ClearKind::Unsigned; memcpy(m->st, c, 16);
+}
 NVN_API(nvnCommandBufferClearDepthStencil, void, (void* cb, float depth, bool depthMask, int stencil, int stencilMask)) {
-  EMIT(ClearDepthStencil); m->f[0] = depth; m->i[0] = depthMask; m->i[1] = stencil; m->i[2] = stencilMask != 0;
+  EMIT(ClearDepthStencil); m->f[0] = depth; m->i[0] = depthMask; m->i[1] = stencil; m->i[2] = stencilMask;
 }
 NVN_API(nvnCommandBufferCopyBufferToBuffer, void, (void* cb, uint64_t src, uint64_t dst, int64_t size, int flags)) {
   (void)flags; EMIT(CopyBufToBuf); m->l[0] = (int64_t)src; m->l[1] = (int64_t)dst; m->l[2] = size;
@@ -219,17 +229,37 @@ static void PackVR(uint8_t* out, const TextureView* v, const CopyRegion* r) {
   if (v) memcpy(out, v, 16); else memset(out, 0, 16);
   if (r) memcpy(out + 16, r, 24); else memset(out + 16, 0, 24);
 }
+NVN_API(nvnCommandBufferSetCopyRowStride, void, (void* cb, int64_t stride)) {
+  if (CbImpl* c = CB(cb)) c->copyRowStride = stride;
+}
+NVN_API(nvnCommandBufferSetCopyImageStride, void, (void* cb, int64_t stride)) {
+  if (CbImpl* c = CB(cb)) c->copyImageStride = stride;
+}
+NVN_API(nvnCommandBufferGetCopyRowStride, int64_t, (const void* cb)) {
+  const CbImpl* c = CB((void*)cb); return c ? c->copyRowStride : 0;
+}
+NVN_API(nvnCommandBufferGetCopyImageStride, int64_t, (const void* cb)) {
+  const CbImpl* c = CB((void*)cb); return c ? c->copyImageStride : 0;
+}
 NVN_API(nvnCommandBufferCopyBufferToTexture, void, (void* cb, uint64_t src, TextureG* dst, const TextureView* v, const CopyRegion* r, int flags)) {
   (void)flags; EMIT(CopyBufToTex); m->obj[0] = dst; m->l[0] = (int64_t)src; m->blob.resize(40); PackVR(m->blob.data(), v, r);
+  const CbImpl* c = CB(cb); m->l[1] = c->copyRowStride; m->l[2] = c->copyImageStride;
 }
 NVN_API(nvnCommandBufferCopyTextureToBuffer, void, (void* cb, TextureG* src, const TextureView* v, const CopyRegion* r, uint64_t dst, int flags)) {
   (void)flags; EMIT(CopyTexToBuf); m->obj[0] = src; m->l[0] = (int64_t)dst; m->blob.resize(40); PackVR(m->blob.data(), v, r);
+  const CbImpl* c = CB(cb); m->l[1] = c->copyRowStride; m->l[2] = c->copyImageStride;
 }
 NVN_API(nvnCommandBufferCopyTextureToTexture, void, (void* cb, TextureG* src, const TextureView* sv, const CopyRegion* sr, TextureG* dst, const TextureView* dv, const CopyRegion* dr, int flags)) {
   EMIT(CopyTexToTex); m->obj[0] = src; m->obj[1] = dst; m->i[0] = flags; m->blob.resize(80);
   PackVR(m->blob.data(), sv, sr); PackVR(m->blob.data() + 40, dv, dr);
 }
 NVN_API(nvnCommandBufferDownsample, void, (void* cb, TextureG* src, TextureG* dst)) { EMIT(Downsample); m->obj[0] = src; m->obj[1] = dst; }
+NVN_API(nvnCommandBufferDownsampleTextureView, void, (void* cb, TextureG* src, const TextureView* sv, TextureG* dst, const TextureView* dv)) {
+  EMIT(Downsample); m->obj[0] = src; m->obj[1] = dst;
+  m->blob.resize(2 * sizeof(TextureView));
+  if (sv) memcpy(m->blob.data(), sv, sizeof(TextureView));
+  if (dv) memcpy(m->blob.data() + sizeof(TextureView), dv, sizeof(TextureView));
+}
 NVN_API(nvnCommandBufferBarrier, void, (void* cb, int bits)) { EMIT(Barrier); m->i[0] = bits; }
 NVN_API(nvnCommandBufferFenceSync, void, (void* cb, void* sync, int cond, int flags)) { (void)cond; (void)flags; EMIT(FenceSync); m->p[0] = (uint64_t)(uintptr_t)ImplOf<Sync>(sync); }
 NVN_API(nvnCommandBufferReportCounter, void, (void* cb, int counter, uint64_t addr)) {

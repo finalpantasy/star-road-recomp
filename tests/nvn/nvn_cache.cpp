@@ -12,7 +12,7 @@
 // and prints the counts. Variants need a stage key the program can find: the test draws stage bytes of its own, so it aliases the
 // SHA-256 of those bytes to the cache key (ShaderCacheAlias).
 //
-// usage: nvn_cache [--cache DIR] [--variants N] [--gs N] [--no-validation] [--no-sweep] [--sweep-only] [--out DIR]
+// usage: nvn_cache [--cache DIR] [--variants N | --variants-file FILE] [--gs N] [--no-validation] [--no-sweep] [--sweep-only] [--out DIR]
 //   exit 0 pass, 1 fail, 3 not run (no cache, no glslc or no usable Vulkan device)
 // env:   NVN_LAYER_PATH, NVN_GLSLC, NVN_TEST_DIR, NVN_OUT_DIR, NVN_CACHE_DIR
 #include <malloc.h>
@@ -251,6 +251,7 @@ int main(int argc, char** argv) {
   bool wantValidation = true, doSweep = true, sweepOnly = false;
   int nVariants = 600, minGs = 60;
   std::string outDir = ".", cacheDir = getenv("NVN_CACHE_DIR") ? getenv("NVN_CACHE_DIR") : "A:/AI/Recomps/smrpg-work/shaders/cache/v1";
+  std::string variantsFile;
   setvbuf(stdout, nullptr, _IONBF, 0);
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--no-validation")) wantValidation = false;
@@ -258,6 +259,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--sweep-only")) sweepOnly = true;
     else if (!strcmp(argv[i], "--cache") && i + 1 < argc) cacheDir = argv[++i];
     else if (!strcmp(argv[i], "--variants") && i + 1 < argc) nVariants = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--variants-file") && i + 1 < argc) variantsFile = argv[++i];
     else if (!strcmp(argv[i], "--gs") && i + 1 < argc) minGs = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--out") && i + 1 < argc) outDir = argv[++i];
   }
@@ -409,6 +411,7 @@ int main(int argc, char** argv) {
       a[0].m.set = 0; a[0].m.inputs = {{0, 0}, {1, 1}}; a[0].m.outLocs = {0};
       a[1].tag = "NVN-CACHE-TEST-FS-support"; a[1].stage = NVN_SHADER_STAGE_FRAGMENT; a[1].spv = &fsSupportSpv;
       a[1].m.set = 1; a[1].m.supportBinding = 0; a[1].m.supportSize = 1600;
+      a[1].m.inputs = {{0, 0}, {8, 8}};
       a[1].m.ubos.push_back({1, 1, -1, 65536, UBO_PROGRAM_CONSTANTS});
       for (auto& s : a) {
         uint8_t code[64]; memset(code, 0, sizeof code); strcpy((char*)code, s.tag);
@@ -436,7 +439,7 @@ int main(int argc, char** argv) {
       if (img.size() == 64 * 64 * 4) {
         Px p = At(img, 64, 32, 32);
         printf("support/constants pixel: (%d,%d,%d,%d), expected (255,255,191,96)\n", p.r, p.g, p.b, p.a);
-        CHECK(Near(p, {255, 255, 191, 96}), "viewport words, render scale slots or c[1] constants are wrong: got (%d,%d,%d,%d)", p.r, p.g, p.b, p.a);
+        CHECK(Near(p, {255, 255, 191, 96}), "support data or varying values are wrong: got (%d,%d,%d,%d)", p.r, p.g, p.b, p.a);
       }
       nvnProgramFinalize(prog);
     }
@@ -445,7 +448,11 @@ int main(int argc, char** argv) {
     std::vector<Variant> all = ReadVariants(cacheDir + "/variants.jsonl");
     printf("variants.jsonl: %zu distinct (vs, fs, gs) combinations\n", all.size());
     std::vector<Variant> picks;
-    {
+    if (!variantsFile.empty()) {
+      picks = ReadVariants(variantsFile);
+      CHECK(!picks.empty(), "no valid variant pairs in %s", variantsFile.c_str());
+      printf("targeted variants: %zu\n", picks.size());
+    } else {
       std::vector<size_t> gsIdx, plainIdx;
       for (size_t i = 0; i < all.size(); i++) (all[i].gs.empty() ? plainIdx : gsIdx).push_back(i);
       size_t wantGs = std::min<size_t>(gsIdx.size(), (size_t)minGs);
@@ -654,10 +661,7 @@ int main(int argc, char** argv) {
     //  - maxCombinedClipAndCullDistances-00710: the layer adds the ClipDistance and CullDistance sizes of a geometry shader's gl_in and
     //    gl_out blocks together (7 + 7 and 1 + 1 = 16); each block is ClipDistance[7] + CullDistance[1] = 8, the device limit.
     static const std::map<std::string, const char*> benign = {
-        {"VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710", "layer sums the gl_in and gl_out blocks of a geometry shader (each is 7 + 1 = 8)"},
-        //  - OpEntryPoint-08743: 61 of the 26,766 (vs, fs) pairs in the cache itself have a fragment input at a location the vertex
-        //    shader never writes (see the pairing line of the sweep). The value is undefined, as it is on the console; drivers read it as 0.
-        {"VUID-RuntimeSpirv-OpEntryPoint-08743", "a fragment input the vertex shader does not write (61 pairs in the cache, undefined value)"}};
+        {"VUID-RuntimeSpirv-maxCombinedClipAndCullDistances-00710", "layer sums the gl_in and gl_out blocks of a geometry shader (each is 7 + 1 = 8)"}};
     std::lock_guard<std::mutex> lk(g_vk.valLock);
     int warns = 0, benignErrors = 0;
     for (auto& kv : g_vk.valById) {

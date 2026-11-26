@@ -133,6 +133,8 @@ bool VkBringUp(const VkInitOptions& opt) {
   want(VK_EXT_4444_FORMATS_EXTENSION_NAME, &g_vk.has4444);
   want(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, &g_vk.hasIdx8);
   want(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, &g_vk.hasCustomBorder);
+  bool hasVertexDivisor = false;
+  want(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, &hasVertexDivisor);
 
   // features: enable every supported core feature except robustness
   g_vk.f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
@@ -142,6 +144,7 @@ bool VkBringUp(const VkInitOptions& opt) {
   g_vk.f4444.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT;
   g_vk.idx8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT;
   g_vk.customBorder.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
+  g_vk.vertexDivisor.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR;
   g_vk.feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   void** tail = &g_vk.feat.pNext;
   auto chain = [&](void* s) { *tail = s; tail = (void**)&((VkBaseOutStructure*)s)->pNext; *tail = nullptr; };
@@ -152,7 +155,9 @@ bool VkBringUp(const VkInitOptions& opt) {
   if (g_vk.has4444) chain(&g_vk.f4444);
   if (g_vk.hasIdx8) chain(&g_vk.idx8);
   if (g_vk.hasCustomBorder) chain(&g_vk.customBorder);
+  if (hasVertexDivisor) chain(&g_vk.vertexDivisor);
   g_vk.f.vkGetPhysicalDeviceFeatures2(g_vk.phys, &g_vk.feat);
+  g_vk.hasIdx8 = g_vk.hasIdx8 && g_vk.idx8.indexTypeUint8;
   g_vk.feat.features.robustBufferAccess = VK_FALSE;
   g_vk.f13.robustImageAccess = VK_FALSE;
   if (!g_vk.f13.dynamicRendering || !g_vk.f13.synchronization2 || !g_vk.f12.timelineSemaphore) {
@@ -162,6 +167,13 @@ bool VkBringUp(const VkInitOptions& opt) {
   g_vk.hasMinMax = g_vk.f12.samplerFilterMinmax != 0;
 
   VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+  g_vk.maxVertexDivisor = 1;
+  if (hasVertexDivisor && g_vk.vertexDivisor.vertexAttributeInstanceRateDivisor) {
+    VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR vd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &vd};
+    g_vk.f.vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+    if (vd.supportsNonZeroFirstInstance) g_vk.maxVertexDivisor = vd.maxVertexAttribDivisor;
+  }
   {
     g_vk.p11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
     g_vk.p13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES;

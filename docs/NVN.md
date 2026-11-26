@@ -7,8 +7,8 @@ Our own implementation of the NVN graphics API on Vulkan, in `runtime/nvn/` (C++
 | | |
 |---|---|
 | Procs in the table | 535 names (the whole NVN proc list), generated into `nvn_sigs.inc` by `tools/nvngen/gen_sigs.py` |
-| Implemented | 332 |
-| Logged stubs | 203 (log once, return 0, with a reason) |
+| Implemented | 341 |
+| Logged stubs | 194 (log once, return 0, with a reason) |
 | Statically referenced by the game | 265 distinct names, all present in the table (the task card says 277; the measured list from the import table has 265) |
 | Of those 265, implemented | 263 |
 | Of those 265, stubbed with a reason | 2 (listed below) |
@@ -33,7 +33,7 @@ Counts by object class (regenerate with `python -I tools/nvngen/gen_doc.py`):
 | BufferBuilder | 7 | 7 | 0 |
 | ChannelMaskState | 3 | 2 | 1 |
 | ColorState | 7 | 5 | 2 |
-| CommandBuffer | 156 | 74 | 82 |
+| CommandBuffer | 156 | 81 | 75 |
 | DepthStencilState | 13 | 7 | 6 |
 | Device | 32 | 14 | 18 |
 | DeviceBuilder | 3 | 2 | 1 |
@@ -55,10 +55,10 @@ Counts by object class (regenerate with `python -I tools/nvngen/gen_doc.py`):
 | TexturePool | 8 | 8 | 0 |
 | TextureView | 14 | 13 | 1 |
 | VertexAttribState | 5 | 3 | 2 |
-| VertexStreamState | 5 | 2 | 3 |
+| VertexStreamState | 5 | 4 | 1 |
 | Window | 12 | 9 | 3 |
 | WindowBuilder | 12 | 6 | 6 |
-| **Total** | **535** | **332** | **203** |
+| **Total** | **535** | **341** | **194** |
 <!-- proc-table:end -->
 
 ## Design
@@ -80,6 +80,12 @@ Counts by object class (regenerate with `python -I tools/nvngen/gen_doc.py`):
 - **Queue state persists.** Like the hardware, the queue keeps its bound program, texture and sampler pools, render targets and fixed function state from one command buffer to the next (`QueueImpl::hw`, created at the first submit). Per-submit fields (command buffer, scratch, deferred frees) are reset at each submit.
 - **Object lifetime.** The game finalizes pools, textures, samplers and programs in any order, and a recorded command list can name an object that has died. Rules: a finalized `Pool` stays allocated as a dead shell (textures and buffers hold raw pool pointers and may be finalized after their pool; every access checks `dead`); texture and sampler pool slots keep back-references (`poolRefs`) so finalizing a texture or sampler clears the slots that name it; finalizing a pool or program clears the queue's pointers (`QueueScrub`); a live-object set (`LiveAdd`/`LiveDel`/`IsLive`) validates the pool and program pointers a command list recorded before replay. A draw that finds its program gone is skipped as "no program bound". Textures are in the live set too (`TexOf` in the replay): the game copies `NVNtexture` structs by value, so a struct can keep an impl pointer after another copy was finalized, and a struct the game never initialized can hold any bytes there. Every recorded command that names a texture (copies, clears, render targets, downsample) resolves it through `TexOf` and is skipped when it is not live. Before this a `CopyBufferToTexture` on such a struct reached `vkCmdCopyBufferToImage` with a null image and crashed the NVIDIA driver (fault read 0x590) at the first movie.
 - **Unsupported primitives** are drawn from an expanded index list built in per-submit scratch: QUADS as `(a,b,c, a,c,d)`, QUAD_STRIP as `(a,b,d, a,d,c)` per quad, LINE_LOOP as a line strip closed back to vertex 0 (indices 0..n-1, 0), POLYGON as a triangle fan.
+- **Indirect commands** keep their arguments on the GPU. Replay validates the alignment and full argument record in the guest pool and binds indexed draws at the requested index width. Indirect QUADS, QUAD_STRIP, and LINE_LOOP still require GPU-side primitive expansion.
+- **Texture copies** honor X and Y mirror flags through blits and reverse depth slices or array layers for Z mirrors. Copies between different uncompressed, non-integer color formats use a blit even at equal dimensions, so a packed HDR source converts to sRGB correctly. Blits require device support for the source format, destination format, and requested filter.
+- **Buffer-image copies** use the row and image strides captured at recording time, with zero selecting packed rows or consecutive slices. Replay validates the last byte actually used, including partial compressed edge blocks. Direct transfers for software-decoded ASTC remain open.
+- **Color clears** preserve unselected channels and honor the scissor and selected layers. Partial masks use a draw with color write masks, while full masks use the Vulkan attachment clear. The Vulkan SDK's glslc builds the masked-clear shaders.
+- **Depth and stencil clears** handle depth writes and stencil bits independently. A partial stencil clear uses a draw with Vulkan's stencil write mask while preserving depth and unselected stencil bits, including in a combined attachment.
+- **Multisample color resolves** cover all array layers by default and honor the mip and layer ranges of explicit views. Replay checks the sample counts, dimensions, layer counts, and view formats. Vulkan averages normalized color samples and takes sample zero for integer formats. Tiled downsample entry points remain logged stubs.
 - **Device info** the game sizes its tables from: `SEPARATE_TEXTURE_BINDINGS_PER_STAGE` (0x5E) answers 128 and `SEPARATE_SAMPLER_BINDINGS_PER_STAGE` (0x5F) answers 32. A zero leaves the game's per-program binding tables unallocated (host crash at the first draw). The shim that used to answer 0x5E in `runtime/gfxcap.c` is gone. Separate textures live at c[2] offset 0x168 + 8r, separate samplers at 0x568 + 8s.
 - **Clears** are clipped to the render area: the game sets scissors of 16384 x 16384 and `vkCmdClearAttachments` needs the rectangle inside the area.
 - **Diagnostics.** A replay crash breadcrumb (`g_crumb`, with a first handler for access violations) names the replay function, command op and index of the command being replayed; the line is printed to stderr as "access violation during replay" and can be a first-chance fault that a later handler absorbs. `NVN_DUMP_MISSING=<dir>` writes every stage program that is not in the cache as `<key>.data` and `<key>.ctrl` (the corpus layout `tools/shaderxlate` reads). Every 120 presents the log carries a `stats:` line (draws, skipped draws split into no program and incomplete program, pipelines, failures, submits). A draw with an incomplete program logs the stage keys and reasons once per program.
@@ -111,12 +117,12 @@ Defaults the game overrides explicitly: depth mode `NEAR_IS_ZERO`, window origin
 
 ## Known limitations
 
-- `ClearColor` with a partial channel mask clears all channels (logged once).
 - A `LOWER_LEFT` origin flips the image vertically at present, not in the render path.
 - Mirror-clamp wrap modes map to the nearest Vulkan mode.
 - Alpha test is not emulated (the game's translated shaders must discard instead).
 - `ReportCounter` is a no-op; counter memory stays zero.
-- Vertex divisors above 1 and texel buffers are not supported.
+- Instance divisors above 1 require `VK_KHR_vertex_attribute_divisor` with support for a nonzero first instance. The runtime uses the device limit and falls back to a divisor of 1 when the requested value is unsupported.
+- Texel buffers are not supported.
 - A texture re-uploads only after `nvnMemoryPoolFlushMappedRange` or `nvnTextureWriteTexels`.
 - Packaged texture layout bits are stored, not interpreted.
 - Unbound uniform and storage buffers read a 256 byte null buffer; unbound textures read 1x1 white color dummies. The dummies cover every manifest dimension, including `2dms` and `2dms_array` (4 samples; contents undefined, because vkCmdClearColorImage cannot clear a multisample image). There is no depth dummy yet, so a shadow (depth compare) slot the game leaves unbound would not match the shader (the cache test binds real depth textures).
