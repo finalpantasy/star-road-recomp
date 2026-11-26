@@ -37,3 +37,6 @@ See [the decomp guide](../../docs/DECOMP.md).
 
 ### 2026-11-25 Claude lead
 Lead built and ran what the sandboxed worker could not. Build links smrpg_decomp. Run `task29_ab` (90 s, hidden, muted, `--continue`, SMRPG_DECOMP=ab, selftest on): selftest 10,125 comparisons per function (10,000 random plus 125 edge), 0 differences for all three; live: Math.Min 291,735 calls and Math.Max 1,438 calls, 0 differences; CommonRoutine.is_in 0 live calls in this window (needs a scene that calls it), so check_log.py reports incomplete live coverage. Runtime boot, sync and rthard pass. Default stays off until the owner accepts.
+
+### 2026-11-26 Claude lead
+Live coverage for CommonRoutine.is_in closed. Hidden, muted run `task29_is_in1` (200 s, SMRPG_DECOMP=ab, selftest on, copy of the opening autosave, input of the task-24 route): selftest 10,125 comparisons per function with 0 differences; live Math.Min 140,449 calls, Math.Max 1,445 calls, is_in 5 calls, 0 differences for all three. Default stays off until the owner accepts.
