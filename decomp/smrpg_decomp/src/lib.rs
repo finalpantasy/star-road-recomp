@@ -50,3 +50,29 @@ pub extern "C" fn smrpg_array_elem_addr(base: u64, index: u64, size: u64) -> u64
     base.wrapping_add((index as i32 as i64 as u64).wrapping_mul(size))
         .wrapping_add(0x20)
 }
+
+/// System.String.GetRawStringData: address of the first char, string + 0x14.
+#[unsafe(no_mangle)]
+pub extern "C" fn smrpg_add_0x14(a: u64, _: u64, _: u64) -> u64 {
+    a.wrapping_add(0x14)
+}
+
+/// VisualElement.get_computedStyle: address of the style field, object + 0x2c8.
+#[unsafe(no_mangle)]
+pub extern "C" fn smrpg_add_0x2c8(a: u64, _: u64, _: u64) -> u64 {
+    a.wrapping_add(0x2c8)
+}
+
+/// Byte array element address: base + (int32)index (sxtw, no shift, no header offset).
+#[unsafe(no_mangle)]
+pub extern "C" fn smrpg_add_sext32(base: u64, index: u64, _: u64) -> u64 {
+    base.wrapping_add((index as i32 as i64) as u64)
+}
+
+/// 16.16 fixed-point multiply, rounded: ((a*b) + (a*b >> 63) + 0x8000) >> 16, all arithmetic 64-bit.
+#[unsafe(no_mangle)]
+pub extern "C" fn smrpg_fixmul_16(a: u64, b: u64, _: u64) -> u64 {
+    let p = a.wrapping_mul(b) as i64;
+    let p = p.wrapping_add(p >> 63).wrapping_add(0x8000);
+    (p >> 16) as u64
+}
