@@ -5,7 +5,7 @@ Everything generated goes under A:\AI\Recomps\smrpg-work\build\ (c\ sources, obj
   python -I tools/lifter/build.py inv                    # function inventories (sdk, subsdk0 derived; main = task-2)
   python -I tools/lifter/build.py lift main sdk subsdk0  # lift to 400-function chunk files, AC1 report
   python -I tools/lifter/build.py compile [--budget 540] # compile changed chunks (object cache, resumable)
-  python -I tools/lifter/build.py link                   # runtime + chunks + registry -> bin\smrpg.exe
+  python -I tools/lifter/build.py link                   # runtime + chunks + registry -> bin\link.rsp (the game route: tools/rtprep/build_game.py); --exe tries the legacy stand-alone exe
   python -I tools/lifter/build.py status
 
 Every long step stops starting new work after --budget seconds (default 540) so one invocation stays under
@@ -502,6 +502,12 @@ def cmd_link(a):
     rsp = os.path.join(BIN, "link.rsp")
     with open(rsp, "w") as f:
         f.write("\n".join(o.replace("\\", "/") for o in objs))
+    if not getattr(a, "exe", False):
+        # The game is linked by tools/rtprep/build_game.py (CMake: HLE, platform, NVN, overlay); it reads this file. The old
+        # stand-alone link below predates runtime/hle and the crypto helper, so it is opt-in and is not the game route.
+        print("wrote %s (%d objects); the stand-alone exe is not the game route, build with tools/rtprep/build_game.py"
+              % (rsp, len(objs)))
+        return 0
     exe = os.path.join(BIN, "smrpg.exe")
     t = time.time()
     p = subprocess.run([CLANG, "@" + rsp, "-o", exe, "-g", "-Wl,--disable-high-entropy-va"], capture_output=True, text=True,
@@ -535,6 +541,7 @@ def main():
         p.add_argument("--limit", type=int, default=0)
         p.add_argument("--only", default="")
         p.add_argument("--no-synth", action="store_true")
+        p.add_argument("--exe", action="store_true", help="link: also try the legacy stand-alone exe (not the game route)")
         p.set_defaults(fn=fn)
     a = ap.parse_args()
     sys.exit(a.fn(a) or 0)

@@ -203,6 +203,146 @@ def match_split_jump_table(insns, idx, rd_mem, text_range, entries, valid_target
     return 0, 0, targets  # The emitter switches on the final target register.
 
 
+# Compact switch tables: the target is `adr base + (T[idx] << amt)` where T is a byte or halfword table and idx is bounded
+# by a compare-and-branch guard in the same straight-line run (or by an AND / UBFX mask). Every table entry must land on a
+# decodable instruction inside the function, otherwise nothing is resolved.
+def _lo32(e):
+    if e[0] == "z":
+        return e[1]
+    if e[0] == "c":
+        return ("c", e[1] & 0xFFFFFFFF)
+    return ("lo", e)
+
+
+def _bound(e, m32, m64):
+    """Largest value the expression can take, or None when unknown."""
+    if e[0] == "c":
+        return e[1]
+    if e[0] == "z":
+        return _bound32(e[1], m32)
+    return m64.get(e)
+
+
+def _bound32(s, m32):
+    cands = []
+    if s in m32:
+        cands.append(m32[s])
+    if s[0] == "c":
+        cands.append(s[1])
+    elif s[0] == "and":
+        cands.append(s[2])
+        inner = _bound32(s[1], m32)
+        if inner is not None:
+            cands.append(inner)
+    elif s[0] == "ubx":
+        inner = _bound32(s[1], m32)
+        cands.append(s[3] if inner is None else min(s[3], inner >> s[2]))
+    return min(cands) if cands else None
+
+
+def match_compact_jump_table(insns, idx, rd_mem, func_range, entries, valid_target):
+    lo = max(0, idx - 64)
+    br_addr, _, br = insns[idx]
+    boundaries = set(entries)
+    boundaries.update(f["target"] for _, nm, f in insns if nm in ("b", "bcond", "cbz", "tbz"))
+    if br_addr in boundaries:
+        return None
+    regs = {}
+    m32 = {}
+    m64 = {}
+    cmp = None
+
+    def reg(n):
+        return regs.get(n, ("o", n))
+
+    for k in range(lo, idx):
+        a, nm, f = insns[k]
+        if a in boundaries:
+            regs.clear()
+            m32.clear()
+            m64.clear()
+            cmp = None
+        if nm == "bcond" and cmp is not None and f["cond"] in (2, 8) and not a < f["target"] <= br_addr:
+            key, sf, imm = cmp
+            maximum = imm - (f["cond"] == 2)
+            if maximum >= 0:
+                tab = m64 if sf else m32
+                kk = key if sf else _lo32(key)
+                tab[kk] = min(tab.get(kk, maximum), maximum)
+            cmp = None
+            continue
+        prev_cmp, cmp = cmp, None
+        if nm is None or nm in lw.CONTROL:
+            regs.clear()
+            m32.clear()
+            m64.clear()
+            continue
+        if nm == "addsubs_imm" and f["sub"] and f["rd"] == 31 and f["rn"] != 31:
+            cmp = reg(f["rn"]), f["sf"], f["imm"]
+            continue
+        if (nm == "ccmp_imm" and f["sub"] and f["rn"] != 31 and f["cond"] == 1 and f["nzcv"] & 6 == 2):
+            # cond false: flags C=1 Z=0, so b.hi / b.hs is taken; cond true: a plain compare against imm
+            cmp = reg(f["rn"]), f["sf"], f["imm"]
+            continue
+
+        result = ("w", k)
+        dest = f.get("rd", f.get("rt", 31))
+        if nm == "movi":
+            result = ("c", f["imm"])
+        elif nm == "log_reg" and f["opc"] == 1 and f["rn"] == 31 and not f["neg"] and not f["amt"] and f["rm"] != 31:
+            src = reg(f["rm"])
+            result = src if f["sf"] else ("z", _lo32(src))
+        elif nm == "log_imm" and f["opc"] == 0 and f["rn"] != 31:
+            mask = f["imm"] & (MASK_ALL if f["sf"] else 0xFFFFFFFF)
+            if mask <= 0xFFFFFFFF:
+                result = ("z", ("and", _lo32(reg(f["rn"])), mask))
+        elif nm == "addsub_imm" and f["sf"] and not f["sub"] and reg(f["rn"])[0] == "c":
+            result = ("c", (reg(f["rn"])[1] + f["imm"]) & MASK_ALL)
+        elif nm == "bfm" and f["opc"] == 2 and f["imms"] >= f["immr"] and f["rn"] != 31:
+            width = f["imms"] - f["immr"] + 1
+            if width < 32:
+                src = reg(f["rn"])
+                s32 = _lo32(src) if (not f["sf"] or src[0] != "z") else src[1]
+                if f["sf"] and src[0] != "z":
+                    # a 64-bit field extract of an unknown value: only the field bits are known, keep it opaque
+                    s32 = None
+                if s32 is not None:
+                    result = ("z", ("ubx", s32, f["immr"], (1 << width) - 1))
+        elif nm == "ld_x" and not f["sgn"] and f["sz"] in (1, 2) and f["opt"] in (2, 3) and f["rm"] != 31 and f["rn"] != 31:
+            tbase, tix = reg(f["rn"]), reg(f["rm"])
+            if tbase[0] == "c" and f["amt"] in (0, 1):
+                ix = tix if f["opt"] == 3 else ("z", _lo32(tix))
+                maximum = _bound(ix, m32, m64)
+                if maximum is not None and 0 <= maximum < 4096:
+                    result = ("tab", tbase[1], maximum + 1, f["sz"], 1 << f["amt"])
+        elif nm in ("addsub_ext", "addsub_reg") and f["sf"] and not f["sub"] and f["rm"] != 31 and f["rn"] != 31:
+            basev, off = reg(f["rn"]), reg(f["rm"])
+            if basev[0] == "c" and off[0] == "tab" and (nm == "addsub_ext" and f["option"] in (2, 3) or
+                                                       nm == "addsub_reg" and f["shift"] == 0):
+                result = ("target", basev[1], off, f["amt"])
+        _, written = op_regs(nm, f)
+        for n in range(31):
+            if written & bit_x(n):
+                regs[n] = result if n == dest else ("w", k, n)
+
+    target = reg(br["rn"])
+    if target[0] != "target":
+        return None
+    _, base, (_, table, count, size, scale), shift = target
+    if shift > 4:
+        return None
+    targets = []
+    for i in range(count):
+        raw = rd_mem(table + i * scale, size)
+        if raw is None:
+            return None
+        targets.append((base + (raw << shift)) & MASK_ALL)
+    lo_f, hi_f = func_range
+    if any(t & 3 or not lo_f <= t < hi_f or not valid_target(t) for t in targets):
+        return None
+    return 0, 0, targets
+
+
 def match_jump_table(insns, idx, base_addr, rd_mem, func_range, text_end=None):
     """Resolve `br xN` at insns[idx] using a small symbolic walk over the preceding straight-line code.
     Returns (index_reg, index_ext_opt, [target addresses]) or None."""
@@ -534,6 +674,8 @@ class Lifter:
                         r = match_jump_table(insns, i, m["base"], m["rd_mem"], (start, end), text_range[1])
                         if r is None:
                             r = match_split_jump_table(insns, i, m["rd_mem"], text_range, jump_entries, valid_target)
+                        if r is None:
+                            r = match_compact_jump_table(insns, i, m["rd_mem"], (start, end), jump_entries, valid_target)
                         if r:
                             jt[a] = r
                             for t in r[2]:
