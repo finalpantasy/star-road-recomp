@@ -33,8 +33,8 @@ if(NOT manifest_old STREQUAL manifest_new)
 endif()
 target_include_directories(smrpg_boot PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
-# Every source module, not only lib.rs: a change to battle.rs or bridge.rs alone must rebuild the archive (task-52).
-file(GLOB decomp_sources CONFIGURE_DEPENDS "${workspace}/smrpg_decomp/src/*.rs")
+# Every source module, including subdirectories such as battle/ (task-55), not only lib.rs: a change to any one must rebuild the archive (task-52).
+file(GLOB_RECURSE decomp_sources CONFIGURE_DEPENDS "${workspace}/smrpg_decomp/src/*.rs")
 add_custom_command(OUTPUT "${archive}"
   COMMAND "${CMAKE_COMMAND}" -E env "SMRPG_DECOMPGEN_DIR=${SMRPG_DECOMPGEN_DIR}"
           "${CARGO}" build --release --locked --offline --target-dir "${target_dir}"
@@ -51,7 +51,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${glue}/leaves.d
 file(STRINGS "${manifest}" rows)
 set(chunks "")
 foreach(row IN LISTS rows)
-  if(NOT row MATCHES "^[SCGNVDPE]?LEAF[(](main_[0-9]+),")
+  if(NOT row MATCHES "^[SCGNVDPEQ]?LEAF[(](main_[0-9]+),")
     message(FATAL_ERROR "Invalid swap manifest row: ${row}")
   endif()
   list(APPEND chunks "${CMAKE_MATCH_1}")

@@ -25,6 +25,8 @@ typedef struct {
     unsigned clear_fpsr;            /* ELEAF: compare with the cumulative FPSR bits cleared on both sides (task-54) */
     unsigned replay;                /* ELEAF: a port whose callees have side effects, compared by replay (task-52) */
     unsigned probe;                 /* PLEAF: a traced row, counts live calls and runs the lifted body (task-52) */
+    int (*pre)(uint64_t *);         /* QLEAF: pre-state hook, run before the lifted body; nonzero = defer the comparison (task-55) */
+    atomic_ullong deferred;         /* QLEAF: calls whose comparison was deferred (lazy initialization still pending) */
     atomic_ullong calls, differences;
     atomic_ullong raced;            /* load rows: first pair differed, the identical retry agreed (another thread wrote the field) */
 } Leaf;
@@ -51,7 +53,9 @@ typedef struct {
     extern uint64_t rust(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 #define PLEAF(chunk, addr)     void f_##addr(Ctx *);     extern void f_##addr##_lifted(Ctx *);
 #define ELEAF(chunk, addr, rust) CLEAF(chunk, addr, rust)
+#define QLEAF(chunk, addr, rust, hook) CLEAF(chunk, addr, rust) extern int hook(uint64_t *);
 #include "manifest.def"
+#undef QLEAF
 #undef ELEAF
 #undef PLEAF
 #undef LEAF
@@ -72,7 +76,9 @@ enum {
 #define VLEAF(chunk, addr, rust, vkind, vreg, base, off, len, off2) index_##addr,
 #define PLEAF(chunk, addr) index_##addr,
 #define ELEAF(chunk, addr, rust) index_##addr,
+#define QLEAF(chunk, addr, rust, hook) index_##addr,
 #include "manifest.def"
+#undef QLEAF
 #undef ELEAF
 #undef PLEAF
 #undef LEAF
@@ -102,7 +108,9 @@ static Leaf leaves[leaf_count] = {
      .load_kind = (vkind_) == 1 ? 1 : (vkind_) == 4 ? 3 : 0, .offset2 = off2, .vkind = vkind_, .vreg = vreg_},
 #define PLEAF(chunk, addr) {HEAD(addr), .probe = 1},
 #define ELEAF(chunk, addr, sym) {HEAD(addr), .rust_regs = sym, .replay = 1, .clear_fpsr = 1},
+#define QLEAF(chunk, addr, sym, hook) {HEAD(addr), .rust_regs = sym, .replay = 1, .clear_fpsr = 1, .pre = hook},
 #include "manifest.def"
+#undef QLEAF
 #undef ELEAF
 #undef PLEAF
 #undef LEAF
@@ -187,6 +195,94 @@ static __thread Recording *tl_rec, *tl_replay;
 static __thread unsigned tl_depth;
 static __thread uint64_t tl_stub;   /* selftest: nonzero = traced callees do not run, they clobber registers pseudo-randomly */
 
+/* ---- Pre-state and store journal for replay rows (task-55) ----
+ * The port of a replay row runs after the lifted body, so it sees memory the lifted body (or a callee it ran) has
+ * already changed. Lazy initialization is the case that matters: a method tests a flag byte, runs the initializer
+ * and sets the flag, and a port that runs second would find the flag set and skip a call the lifted body made.
+ * A row with a pre-state hook (QLEAF) solves it in three parts:
+ *  - before the lifted body runs, the hook calls smrpg_guest_snapshot for every cell the port will read or write
+ *    (address, width, and whether the port itself stores to it); the hook returns nonzero when the state cannot be
+ *    captured (a first call, with the metadata slots still unresolved), and that call is run lifted only and counted
+ *    as deferred, never compared;
+ *  - in the trial the port reads those cells with smrpg_guest_pre_read, which returns the snapshot value;
+ *  - the port's stores go through smrpg_guest_store: outside a trial it stores, in a trial it only journals, and
+ *    after the trial every journaled store must equal what the lifted body left in memory, and every watched cell
+ *    the lifted body changed must have a journaled store of that value. */
+#define PRE_MAX 16
+typedef struct { uint64_t addr; unsigned size, watch; uint64_t value; } PreCell;
+typedef struct { uint64_t addr; unsigned size; uint64_t value; } StoreRec;
+static __thread PreCell tl_pre[PRE_MAX];
+static __thread unsigned tl_pre_n;
+static __thread StoreRec tl_st[PRE_MAX];
+static __thread unsigned tl_st_n;
+static __thread int tl_st_overflow;
+
+static uint64_t raw_load(uint64_t addr, unsigned size) {
+    switch (size) {
+    case 1: return __atomic_load_n((uint8_t *)(uintptr_t)addr, __ATOMIC_RELAXED);
+    case 4: return __atomic_load_n((uint32_t *)(uintptr_t)addr, __ATOMIC_RELAXED);
+    default: return __atomic_load_n((uint64_t *)(uintptr_t)addr, __ATOMIC_RELAXED);
+    }
+}
+
+static void raw_store(uint64_t addr, unsigned size, uint64_t value) {
+    switch (size) {
+    case 1: __atomic_store_n((uint8_t *)(uintptr_t)addr, (uint8_t)value, __ATOMIC_RELAXED); break;
+    case 4: __atomic_store_n((uint32_t *)(uintptr_t)addr, (uint32_t)value, __ATOMIC_RELAXED); break;
+    default: __atomic_store_n((uint64_t *)(uintptr_t)addr, value, __ATOMIC_RELAXED); break;
+    }
+}
+
+void smrpg_guest_snapshot(uint64_t addr, unsigned size, unsigned watch) {
+    if (tl_pre_n >= PRE_MAX) rt_exit(10, "decomp pre-state: too many cells");
+    tl_pre[tl_pre_n++] = (PreCell){addr, size, watch, raw_load(addr, size)};
+}
+
+uint64_t smrpg_guest_pre_read(uint64_t addr, unsigned size) {
+    if (tl_replay)
+        for (unsigned i = 0; i < tl_pre_n; ++i)
+            if (tl_pre[i].addr == addr && tl_pre[i].size == size) return tl_pre[i].value;
+    return raw_load(addr, size);
+}
+
+void smrpg_guest_store(uint64_t addr, unsigned size, uint64_t value) {
+    if (!tl_replay) {
+        raw_store(addr, size, value);
+        return;
+    }
+    if (tl_st_n >= PRE_MAX) tl_st_overflow = 1;
+    else tl_st[tl_st_n++] = (StoreRec){addr, size, value};
+}
+
+/* After the trial: 0 when the journal and the lifted body's memory agree, otherwise the first problem is logged. */
+static int check_store_journal(Leaf *leaf) {
+    int bad = tl_st_overflow;
+    if (bad) rt_log("decomp store journal addr=%#llx: more than %d stores", (unsigned long long)leaf->address, PRE_MAX);
+    for (unsigned i = 0; i < tl_st_n; ++i) {
+        uint64_t now = raw_load(tl_st[i].addr, tl_st[i].size);
+        if (now != tl_st[i].value) {
+            bad = 1;
+            rt_log("decomp store journal addr=%#llx: port stored %#llx to %#llx, memory has %#llx",
+                   (unsigned long long)leaf->address, (unsigned long long)tl_st[i].value, (unsigned long long)tl_st[i].addr,
+                   (unsigned long long)now);
+        }
+    }
+    for (unsigned i = 0; i < tl_pre_n; ++i) {
+        if (!tl_pre[i].watch) continue;
+        uint64_t now = raw_load(tl_pre[i].addr, tl_pre[i].size);
+        if (now == tl_pre[i].value) continue;
+        int covered = 0;
+        for (unsigned k = 0; k < tl_st_n; ++k)
+            if (tl_st[k].addr == tl_pre[i].addr && tl_st[k].size == tl_pre[i].size && tl_st[k].value == now) covered = 1;
+        if (!covered) {
+            bad = 1;
+            rt_log("decomp store journal addr=%#llx: the lifted body changed %#llx to %#llx and the port did not store it",
+                   (unsigned long long)leaf->address, (unsigned long long)tl_pre[i].addr, (unsigned long long)now);
+        }
+    }
+    return bad;
+}
+
 /* A stand-in callee for the selftest (the fake object graph cannot support the real one): an arbitrary result and
  * clobbered caller-saved registers, like a real callee leaves. x19 to x29, x30, sp and the exception state stay. */
 static void stub_callee(Ctx *c) {
@@ -217,6 +313,15 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     /* FPSR cumulative flags are sticky and the game sets IXC early, so a port that forgets a flag would look equal.
      * Both sides therefore start with the cumulative bits cleared and the flags each raised are compared; the
      * original bits are ORed back into the live context afterwards (game behavior unchanged). Task-54. */
+    tl_pre_n = tl_st_n = 0;
+    tl_st_overflow = 0;
+    if (leaf->pre && leaf->pre(c->x)) {   /* the state a port needs cannot be captured: run lifted only, compare nothing */
+        unsigned long long n = atomic_fetch_add(&leaf->deferred, 1);
+        if (n < 3) rt_log("decomp replay deferred addr=%#llx (lazy initialization pending)", (unsigned long long)leaf->address);
+        leaf->lifted(c);
+        atomic_fetch_add(&leaf->calls, 1);
+        return;
+    }
     const uint32_t fpsr_cum = FPSR_CUM;
     uint32_t fpsr_saved = 0;
     if (leaf->clear_fpsr) {
@@ -245,7 +350,8 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     leaf->rust_regs(trial.x);
     tl_replay = 0;
     int unused = rec.next != rec.count;
-    int differs = unused || rec.bad || memcmp(&trial, c, sizeof trial);
+    int journal_bad = check_store_journal(leaf);
+    int differs = unused || rec.bad || journal_bad || memcmp(&trial, c, sizeof trial);
     if (differs) {
         atomic_fetch_add(&leaf->differences, 1);
         rt_log("decomp mismatch addr=%#llx replay: recorded=%u used=%u call_mismatch=%d", (unsigned long long)leaf->address,
@@ -354,7 +460,9 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
     void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define PLEAF(chunk, addr) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define ELEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#define QLEAF(chunk, addr, rust, hook) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #include "manifest.def"
+#undef QLEAF
 #undef ELEAF
 #undef PLEAF
 #undef LEAF
@@ -466,6 +574,16 @@ void smrpg_guest_safepoint(uint64_t *x, uint64_t pc, uint32_t reg, uint64_t valu
     }
 }
 
+/* The same safepoint where the lifted code flushes several registers there (task-55: get_calc_attack flushes two). */
+void smrpg_guest_safepoint_n(uint64_t *x, uint64_t pc, uint32_t count, const uint32_t *regs, const uint64_t *values) {
+    Ctx *c = (Ctx *)(void *)x;
+    if (__builtin_expect(g_gc_pending != 0, 0)) {
+        for (uint32_t i = 0; i < count; ++i) c->x[regs[i]] = values[i];
+        c->pc = pc;
+        if (!tl_replay) gc_poll(c);
+    }
+}
+
 static uint64_t random_word(uint64_t *state) {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -536,6 +654,20 @@ static void prepare_battle(int kind, Ctx *c, uint64_t *fake, uint64_t *state) {
     uint64_t pick = random_word(state);
     motion[2] = (pick & 7) == 0 ? 0 : base + 8 * 40;              /* +0x10: null one time in eight */
     c->x[0] = kind == 1 ? base : kind == 2 ? base + 8 * 24 : base + 8 * 48;
+}
+
+/* get_calc_attack and get_calc_magic_attack read game globals (the flag bytes, three metadata slots). The selftest
+ * (below, prepare_caller) points them into a private region and puts the originals back afterwards. */
+static uint64_t attack_saved[5];
+static int attack_have_saved;
+static void restore_attack_globals(void) {
+    if (!attack_have_saved) return;
+    *(volatile uint8_t *)(uintptr_t)0x7103cbac09ULL = (uint8_t)attack_saved[0];
+    *(volatile uint8_t *)(uintptr_t)0x7103cbac0bULL = (uint8_t)attack_saved[1];
+    *(uint64_t *)(uintptr_t)0x7103a59328ULL = attack_saved[2];
+    *(uint64_t *)(uintptr_t)0x7103a57e48ULL = attack_saved[3];
+    *(uint64_t *)(uintptr_t)0x7103a581d0ULL = attack_saved[4];
+    attack_have_saved = 0;
 }
 
 /* Caller functions (task-44) dereference pointers they compute, so the selftest builds a valid shape in the
@@ -615,6 +747,77 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
         c->fpcr = fpcr_modes[(pick >> 24) % RT_ARRAY_LEN(fpcr_modes)];
         c->fpsr = (uint32_t)(pick >> 32) & 0x0800009fu;
+        break;
+    }
+    case 0x71021c3ea0ULL:   /* Battle.BattleCharacterParam get_calc_attack and get_calc_magic_attack (task-55). Besides the object graph they */
+    case 0x71021bc2e0ULL: { /* read game globals (flag byte, three metadata slots), which the selftest points into a private region and restores. */
+        static uint64_t region[192];
+        volatile uint8_t *flag_physical = (volatile uint8_t *)(uintptr_t)0x7103cbac09ULL, *flag_magic = (volatile uint8_t *)(uintptr_t)0x7103cbac0bULL;
+        uint64_t *slot_strawberry = (uint64_t *)(uintptr_t)0x7103a59328ULL, *slot_manager = (uint64_t *)(uintptr_t)0x7103a57e48ULL,
+                 *slot_flag = (uint64_t *)(uintptr_t)0x7103a581d0ULL;
+        if (!attack_have_saved) {
+            attack_saved[0] = *flag_physical; attack_saved[1] = *flag_magic; attack_saved[2] = *slot_strawberry;
+            attack_saved[3] = *slot_manager; attack_saved[4] = *slot_flag;
+            attack_have_saved = 1;
+        }
+        fill_fake_region(region, 192, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        static const uint32_t edge_ints[] = {0, 1, 0xffffffffu, 100, 0xffffff9cu, 0x00ffffffu, 0x7fffffffu, 0x80000000u, 0x01234567u, 5, 0x2aaaaaabu};
+        static const uint32_t lengths[] = {0, 1, 2, 3, 4, 5, 9, 0xffffffffu};
+        static const unsigned char byte_flags[] = {0, 0, 1, 1, 2, 0x80, 0xff};
+        #define EDGE_INT() (((r = random_word(state)) & 3) == 0 ? (uint32_t)(r >> 8) : edge_ints[(r >> 8) % RT_ARRAY_LEN(edge_ints)])
+        uint64_t r;
+        uint32_t v;
+        /* the param (words 0..23): _attack 0x3c, _magic_attack 0x44, _is_player 0x6c, _buff_mng 0xa0, _weapon 0xb0 */
+        v = EDGE_INT(); memcpy(bytes + 0x3c, &v, 4);
+        v = EDGE_INT(); memcpy(bytes + 0x44, &v, 4);
+        bytes[0x6c] = byte_flags[(pick >> 8) % RT_ARRAY_LEN(byte_flags)];
+        region[0xa0 / 8] = rb + 8 * 24;                           /* buff manager */
+        region[0xb0 / 8] = rb + 8 * 40;                           /* weapon */
+        region[24 + 3] = rb + 8 * 32;                             /* buff + 0x18: _add_status */
+        v = lengths[(pick >> 16) % RT_ARRAY_LEN(lengths)]; memcpy(bytes + 8 * 32 + 0x18, &v, 4);
+        for (unsigned i = 0; i < 4; ++i) { v = EDGE_INT(); memcpy(bytes + 8 * 32 + 0x20 + 4 * i, &v, 4); }
+        bytes[8 * 40 + 0x10] = byte_flags[(pick >> 24) % RT_ARRAY_LEN(byte_flags)];   /* weapon._is_exist */
+        for (unsigned i = 0; i < 3; ++i) { v = EDGE_INT(); memcpy(bytes + 8 * 40 + 0x14 + 4 * i, &v, 4); }
+        /* BattleManager class (word 64): initialized word at +0xe0, static fields at +0xb8 -> +0x10 -> manager (word 104), id at +0x168 */
+        region[64 + 0xb8 / 8] = rb + 8 * 100;
+        region[100 + 2] = rb + 8 * 104;
+        v = ((pick >> 32) & 7) == 0 ? 0 : (uint32_t)(r = random_word(state)) | 1; memcpy(bytes + 8 * 64 + 0xe0, &v, 4);
+        v = ((pick >> 36) & 1) ? 0x81c : (((pick >> 37) & 3) == 0 ? 0x81b : EDGE_INT()); memcpy(bytes + 8 * 104 + 0x168, &v, 4);
+        /* strawberry class (word 120) and the two slot holders (words 150, 152), the static flag byte (word 154) */
+        v = ((pick >> 40) & 7) == 0 ? 0 : 1; memcpy(bytes + 8 * 120 + 0xe0, &v, 4);
+        region[150] = rb + 8 * 64;
+        region[152] = rb + 8 * 120;
+        bytes[8 * 154] = ((pick >> 44) & 3) == 0 ? 0 : (unsigned char)(1 + ((pick >> 46) & 1));
+        *slot_manager = rb + 8 * 150;
+        *slot_strawberry = rb + 8 * 152;
+        *slot_flag = rb + 8 * 154;
+        *flag_physical = ((pick >> 48) & 15) == 0 ? 0 : 1;        /* lazy initialization pending one time in sixteen */
+        *flag_magic = ((pick >> 52) & 15) == 0 ? 0 : 1;
+        #undef EDGE_INT
+        c->x[0] = rb;
+        static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
+        c->fpcr = fpcr_modes[(pick >> 56) % RT_ARRAY_LEN(fpcr_modes)];
+        c->fpsr = (uint32_t)(pick >> 32) & 0x0800009fu;
+        break;
+    }
+    case 0x71021be3c0ULL: { /* Battle.BattleCharacterParam.calc_element (task-55): param +0xa8 -> ElementManager, +0x10 -> int[] (length +0x18, elements +0x20) */
+        fill_fake_region(fake, 64, state);
+        unsigned char *bytes = (unsigned char *)fake;
+        fake[0xa8 / 8] = base + 8 * 24;
+        fake[24 + 2] = base + 8 * 32;
+        static const uint32_t lengths[] = {0, 1, 2, 3, 4, 5, 6, 9, 0xffffffffu};
+        uint32_t length = lengths[(pick >> 8) % RT_ARRAY_LEN(lengths)];
+        memcpy(bytes + 8 * 32 + 0x18, &length, 4);
+        for (unsigned i = 0; i < 12; ++i) {   /* element states: 0..6 mostly (1 to 4 select a table entry), a few wild ones */
+            uint64_t r = random_word(state);
+            uint32_t state_value = (r & 7) == 0 ? (uint32_t)(r >> 8) : (uint32_t)((r >> 8) % 7);
+            memcpy(bytes + 8 * 32 + 0x20 + 4 * i, &state_value, 4);
+        }
+        c->x[0] = base;
+        c->x[1] = ((pick >> 16) & 7) == 0 ? (random_word(state) & ~0xffffffffULL) | (uint32_t)(int32_t)((int)((pick >> 20) % 12) - 3)
+                                          : (random_word(state) & ~0xffffffffULL) | ((pick >> 24) % 8);
         break;
     }
     case 0x71021bc270ULL:   /* Battle.BattleCharacterParam get_calc_defence and get_calc_magic_defence (task-54), same fake graph: */
@@ -737,6 +940,8 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     }
     if (stores && !stores_seen) rt_exit(10, "decomp selftest: store leaf never wrote");
     tl_stub = 0;
+    restore_attack_globals();
+    atomic_store(&leaf->deferred, 0);
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);
     if (atomic_load(&leaf->raced)) rt_exit(10, "decomp selftest: raced on a private region");
@@ -774,6 +979,9 @@ void decomp_summary(void) {
         Leaf *leaf = &leaves[i];
         rt_log("decomp live addr=%#llx calls=%llu differences=%llu", (unsigned long long)leaf->address,
                atomic_load(&leaf->calls), atomic_load(&leaf->differences));
+        if (atomic_load(&leaf->deferred))
+            rt_log("decomp live addr=%#llx deferred=%llu (not compared: lazy initialization pending)",
+                   (unsigned long long)leaf->address, atomic_load(&leaf->deferred));
     }
     unsigned long long raced = 0;
     for (int i = 0; i < leaf_count; ++i) raced += atomic_load(&leaves[i].raced);

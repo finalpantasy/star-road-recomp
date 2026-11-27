@@ -10,6 +10,9 @@ use crate::fp::{Float32Convert, Float32Ops, Nzcv};
 use crate::object::{GuestObject, Int32Array, guest_class};
 use crate::unity::{Camera, DEG2RAD, Quaternion, Transform, Vector3};
 
+pub mod attack;
+pub mod element;
+
 /// `Battle.BadStatusManager.BadStatusKind`, the raw 32-bit value (the game stores any int, so no Rust enum).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadStatusKind(pub u32);
@@ -1353,11 +1356,12 @@ mod tests {
 
     /// One fake object graph: param at word 0, status manager at word 24, buff manager at word 32,
     /// character at word 40, motion special at word 48.
-    struct Graph([u64; 64]);
+    struct Graph(std::boxed::Box<[u64; 64]>);
 
     impl Graph {
         fn new(join: u8, bunnage: u8, targetting: u8, status: u32, act: u32, turn: u32) -> Self {
-            let mut words = [0u64; 64];
+            // Boxed: the pointers inside must not move when `Self` is returned.
+            let mut words = std::boxed::Box::new([0u64; 64]);
             let base = words.as_ptr() as u64;
             words[13] |= u64::from(join) << 48;
             words[14] |= u64::from(bunnage) << 8;

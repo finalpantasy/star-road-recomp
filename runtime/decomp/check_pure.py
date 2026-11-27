@@ -58,7 +58,7 @@ def load_rows():
         if not os.path.exists(path):
             continue
         for line in open(path, encoding="utf8"):
-            m = re.match(r"([SCGNVDPE]?LEAF)\((\w+), ([0-9a-f]+)((?:, \w+)*)\)", line)
+            m = re.match(r"([SCGNVDPEQ]?LEAF)\((\w+), ([0-9a-f]+)((?:, \w+)*)\)", line)
             if not m:
                 continue
             kind, address, rest = m.group(1), int(m.group(3), 16), [x.strip() for x in m.group(4).split(",")[1:]]

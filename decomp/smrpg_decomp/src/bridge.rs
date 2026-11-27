@@ -37,6 +37,24 @@ unsafe extern "C" {
 
 #[cfg(not(test))]
 unsafe extern "C" {
+    /// `runtime/decomp/swap.c` (task-55): the same safepoint where the lifted code flushes several registers.
+    fn smrpg_guest_safepoint_n(
+        x: *mut u64,
+        pc: u64,
+        count: u32,
+        regs: *const u32,
+        values: *const u64,
+    );
+    /// Pre-state hook only: remember the cell's value before the lifted body runs (`watch` = the port stores to it).
+    fn smrpg_guest_snapshot(addr: u64, size: u32, watch: u32);
+    /// The value the cell had before the lifted body ran when a replay trial is running, otherwise its live value.
+    fn smrpg_guest_pre_read(addr: u64, size: u32) -> u64;
+    /// Store `size` bytes; in a replay trial it is only journaled and checked against memory afterwards.
+    fn smrpg_guest_store(addr: u64, size: u32, value: u64);
+}
+
+#[cfg(not(test))]
+unsafe extern "C" {
     /// `runtime/decomp/fp_selftest.c`: in `ab` mode, runs the same float operation on the lifted C helper and logs a
     /// mismatch of result or FPSR (task-54); otherwise returns at once.
     fn smrpg_fp_shadow(
@@ -58,6 +76,40 @@ unsafe fn smrpg_fp_shadow(_: u32, _: u32, _: u32, _: u64, _: u64, _: u32, _: u64
 pub(crate) use tests::fake_guest_bl as smrpg_guest_bl;
 #[cfg(test)]
 pub(crate) use tests::fake_safepoint as smrpg_guest_safepoint;
+#[cfg(test)]
+pub(crate) use tests::fake_safepoint_n as smrpg_guest_safepoint_n;
+#[cfg(test)]
+pub(crate) use tests::fake_store as smrpg_guest_store;
+#[cfg(test)]
+pub(crate) use tests::{
+    fake_pre_read as smrpg_guest_pre_read, fake_snapshot as smrpg_guest_snapshot,
+};
+
+/// Pre-state of a replay row (task-55, `swap.c`): the value of a guest cell before the lifted body of the row ran,
+/// while a replay trial runs; the live value otherwise. A port reads a cell the lifted body or its callees may have
+/// changed (a lazy-initialization flag, a class-initialized word) through these.
+pub mod prestate {
+    use super::*;
+
+    /// Pre-state hook: remember a cell. `watch` marks one the port stores to itself (see `store`).
+    pub fn snapshot(addr: u64, size: u32, watch: bool) {
+        unsafe { smrpg_guest_snapshot(addr, size, u32::from(watch)) }
+    }
+
+    pub fn read_u8(addr: u64) -> u8 {
+        unsafe { smrpg_guest_pre_read(addr, 1) as u8 }
+    }
+
+    pub fn read_u32(addr: u64) -> u32 {
+        unsafe { smrpg_guest_pre_read(addr, 4) as u32 }
+    }
+
+    /// A one-byte store the port makes (a lazy-initialization flag): done for real outside a replay trial, checked
+    /// against the memory the lifted body left inside one.
+    pub fn store_u8(addr: u64, value: u8) {
+        unsafe { smrpg_guest_store(addr, 1, u64::from(value)) }
+    }
+}
 
 use crate::fp::{Float32Convert, FpEnv};
 
@@ -202,6 +254,22 @@ impl Regs {
         unsafe { smrpg_guest_safepoint(self.x, pc, reg, value) }
     }
 
+    /// The lifted safepoint where the code flushes several registers when a collection is pending.
+    pub fn safepoint_n(&mut self, pc: u64, flushed: &[(u32, u64)]) {
+        let regs: [u32; 4] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.0));
+        let values: [u64; 4] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.1));
+        assert!(flushed.len() <= 4);
+        unsafe {
+            smrpg_guest_safepoint_n(
+                self.x,
+                pc,
+                flushed.len() as u32,
+                regs.as_ptr(),
+                values.as_ptr(),
+            )
+        }
+    }
+
     pub fn f32_result(&self) -> f32 {
         f32::from_bits(self.v_low(0) as u32)
     }
@@ -263,6 +331,47 @@ pub(crate) mod tests {
         SAFEPOINTS.with(|s| s.borrow_mut().push(pc));
     }
 
+    std::thread_local! {
+        pub static STORES: RefCell<Vec<(u64, u32, u64)>> = const { RefCell::new(Vec::new()) };
+        /// Pre-state a test installs: (address, size, value) answered by `fake_pre_read` before live memory.
+        pub static PRE: RefCell<Vec<(u64, u32, u64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub unsafe fn fake_safepoint_n(
+        _x: *mut u64,
+        pc: u64,
+        _count: u32,
+        _regs: *const u32,
+        _values: *const u64,
+    ) {
+        SAFEPOINTS.with(|s| s.borrow_mut().push(pc));
+    }
+
+    pub unsafe fn fake_snapshot(_addr: u64, _size: u32, _watch: u32) {}
+
+    pub unsafe fn fake_pre_read(addr: u64, size: u32) -> u64 {
+        if let Some(v) = PRE.with(|p| {
+            p.borrow()
+                .iter()
+                .find(|e| e.0 == addr && e.1 == size)
+                .map(|e| e.2)
+        }) {
+            return v;
+        }
+        unsafe {
+            match size {
+                1 => u64::from((addr as *const u8).read()),
+                4 => u64::from((addr as *const u32).read()),
+                _ => (addr as *const u64).read(),
+            }
+        }
+    }
+
+    pub unsafe fn fake_store(addr: u64, size: u32, value: u64) {
+        // Recorded only: the addresses tests use for lazy-initialization flags are game globals.
+        STORES.with(|s| s.borrow_mut().push((addr, size, value)));
+    }
+
     pub fn install(target: u64, body: Fake) {
         CALLEES.with(|c| c.borrow_mut().push((target, body)));
     }
@@ -271,6 +380,8 @@ pub(crate) mod tests {
         CALLEES.with(|c| c.borrow_mut().clear());
         CALLS.with(|c| c.borrow_mut().clear());
         SAFEPOINTS.with(|c| c.borrow_mut().clear());
+        STORES.with(|c| c.borrow_mut().clear());
+        PRE.with(|c| c.borrow_mut().clear());
     }
 
     /// Stands in for `smrpg_guest_bl` in unit tests: runs the installed fake on the register words.

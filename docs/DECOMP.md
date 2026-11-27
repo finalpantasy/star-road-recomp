@@ -294,6 +294,90 @@ Why these and not the damage formula. `SkillExecter.damage_calc` (0x71021ff580) 
 the defence methods but has the non-player branch with class-initialization checks and two garbage-collection polls, which the
 shim would have to reproduce site by site. The defence methods have none of that and are the stat the damage code reads.
 
+## Pre-state and store journal (task-55)
+
+Problem. A replay row (`ELEAF`) runs the lifted body once on live memory and the port second, on a copy of the entry
+registers. A port that reads memory the lifted body already changed sees the wrong state. IL2CPP lazy initialization is the
+case that matters: a method tests a flag byte, calls the metadata initializer, sets the flag, and tests a class's
+initialized word before it calls the class initializer. By the time the port runs, the flag is set and the word is nonzero,
+so the port would skip calls the lifted body made. Re-running the callees to get the state back is not allowed (a callee
+with side effects must never run twice on live memory).
+
+Mechanism (`runtime/decomp/swap.c`, `bridge.rs` `prestate`), row kind `QLEAF(chunk, addr, port, hook)`, a replay row with a
+pre-state hook:
+
+- Before the lifted body runs, `compare_replay` calls the hook (`int hook(uint64_t *x)`). The hook calls
+  `smrpg_guest_snapshot(addr, size, watch)` for every cell the port will read or store (`watch` marks a cell the port
+  stores to). It returns nonzero when the state cannot be captured; then the call runs lifted only, is counted in `calls`
+  and in a separate `deferred` counter (printed as `decomp live addr=... deferred=N`), and nothing is compared. This is the
+  first call of a method in a process: the flag byte is still clear and the metadata slots are unresolved tokens.
+- In the trial the port reads those cells with `prestate::read_u8` / `read_u32` (`smrpg_guest_pre_read`): the snapshot value
+  while a trial runs, the live value otherwise (so `on` mode, where the port is the only run, is unchanged). A read after a
+  callee the lifted body ran in this call changed the cell (a class initialized word after the class initializer call) is a
+  live read: the port knows from its own replayed call that the initializer ran.
+- The port's stores go through `prestate::store_u8` (`smrpg_guest_store`): a real store outside a trial; in a trial a
+  journal entry. After the trial `check_store_journal` requires every journaled store to equal what the lifted body left in
+  memory, and every watched cell the lifted body changed to have a journaled store of that value. A wrong value, a store
+  the lifted body did not make, a missing store and more than 16 stores are mismatches. A QLEAF port may therefore store to
+  guest memory; the plain replay rule "a port writes no guest memory" still holds for ELEAF and PLEAF rows.
+- Limit: a class initializer that does not set its word on the first call could give a false mismatch (the port assumes it
+  does); cells the hook did not name are not pre-state captured.
+
+GC safepoints. `Regs::safepoint_n` / `smrpg_guest_safepoint_n` flush several registers at one safepoint (the lifted code
+writes two at some of them) and set `c->pc`; in a trial they only imitate the context change, as `safepoint` does.
+
+Selftest. A pre-state row's globals (flag bytes, metadata slots) are game memory, so the selftest writes fake values
+(pointers into a private region) into those addresses for the row's iterations and restores the originals when the row
+finishes (`restore_attack_globals`); the lifted body then runs its real lazy-initialization code against the fake graph with
+stand-in callees. One call in sixteen has the flag clear, which exercises the deferral.
+
+## Attack stat ports (task-55)
+
+`Battle.BattleCharacterParam.get_calc_attack` (0x71021c3ea0) and `get_calc_magic_attack` (0x71021bc2e0) in
+`decomp/smrpg_decomp/src/battle/attack.rs`, rows `QLEAF(main_0377 / main_0376, ..., smrpg_param_calc_attack, ..._pre)`. In
+C#: `sum = _attack + _buff_mng._add_status[0]` (`_magic_attack` and index 2 for the magic method). A player character adds
+`_weapon._base_value + Random.Range(_random_min, _random_max)` when `_weapon._is_exist` (physical only) and returns
+`(int)((bonus + sum) * _buff_mng.attack_up_ratio())` (saturating cast as in the defence ports; +infinity gives
+`int.MinValue`). Any other character returns `sum`, plus 5 per lit candle
+(`BattleEventParam_StrawberryAdd.get_on_candle_num()`) when `BattleManager._instance._encounter_id` is 2076 (0x81c). Types:
+`BattleCharacterWeapon`, `BattleManager`, `Il2CppClass`, and the three metadata slots by address (`attack::slots`). The body
+spells out the compiled lazy initialization because the comparison sees every call: the method flag byte (0x7103cba000 +
+0xc09 or 0xc0b), two `initialize_runtime_metadata` calls, the `BattleManager` class-initialized word (+0xe0) and
+`il2cpp_runtime_class_init` (0x71000c4330), the static-field flag byte behind slot 0x7103a581d0 and its metadata call, and
+the three safepoints (two registers flushed at the first two).
+
+Shim `LiftedAttack` keeps the lifted function's locals (`x[0..31]`, sp) as the C does, writes exactly the listed registers
+at each call site (the lists were read off the lifted C by a script; they are the `flush` module) and restores x19, x20,
+x21, x29 and sp from the entry values at the return. Callees (traced `PLEAF`): `initialize_runtime_metadata` 0x71000c4150
+and `il2cpp_runtime_class_init` 0x71000c4330 (main_0016), `Random.Range` 0x7101797f10 (main_0273), `attack_up_ratio`
+0x71021c4070, `magic_attack_up_ratio` 0x71021c43d0 (main_0377), `get_on_candle_num` 0x7101bf7a10 (main_0320), the index
+thrower 0x71000c4510. The hook snapshots the method flag, and for a non-player also the class word, the static-field flag
+byte and the strawberry class word, and defers the call while the method flag is clear.
+
+`Battle.BattleCharacterParam.calc_element` (0x71021be3c0, 21 instructions, `battle/element.rs`, `ELEAF`): the
+`ElementManager._elements_state[kind]` state (1 to 4) selects one of four multipliers of a read-only table at 0x7102af4fa0,
+any other state means 1.0, a kind past the array length throws. The damage code compares the result with 1.0 and 2.0.
+
+## damage_calc (task-55): what is and is not ported
+
+`SkillExecter.damage_calc` (0x71021ff580, 613 instructions) is not ported; it is partly covered by traced rows. Read from
+the lifted C: about 90 call sites. 29 belong to the first-call `initialize_runtime_metadata` sequence, 8 are class
+initializer checks with safepoints, 19 build debug log lines (`DebugMonitor.write`, `Int32.ToString`, `Single.ToString`,
+`String.Concat`). The arithmetic is a handful of tests on the skill type and the element multiplier ending in
+`(int)(num * ratio)`, with calls to `calc_renkei_ratio` 0x71021f5ed0, `set_acction_command_ratio` 0x71021f7ea0,
+`calc_belome_barrior_ratio` 0x71021f5c50, `group_a_b` 0x7102201aa0, `calc_element` 0x71021be3c0, `is_barriered`
+0x71021c3bb0 and `use_damage_guard` 0x71021be280. Why not now:
+
+- The formula is the middle of `damage_calc`, not a function of its own, so it cannot be carved into a row.
+- A bit-exact comparison needs every register at each of the 90 call sites to match, so the port would be a line-by-line
+  transcription of the lifted C with a readable skeleton, roughly ten times the size of `get_calc_attack`.
+- Its callees write through out-parameters and fields. The store journal now makes that comparable, but each is 100 to 390
+  instructions of its own.
+
+Done instead: the two attack stat methods, `calc_element`, the machinery above, and traced rows (lifted body unchanged,
+live counts) for the callees listed. Next in order: `set_acction_command_ratio` (102 instructions, stores only, jump
+table), `calc_belome_barrior_ratio`, `calc_renkei_ratio`, `group_a_b`, then the driver.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.
