@@ -1,6 +1,6 @@
 # Rust function swaps
 
-The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports twenty-three leaves through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4, task-43 batch 5). Each takes guest x0 to x2 as u64 and returns the new x0. The crate has no dependencies.
+The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports twenty-eight functions through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4, task-43 batch 5, task-44 batch 6). The first twenty-three are leaves: each takes guest x0 to x2 as u64 and returns the new x0. The last five call other leaves (see "Functions that call ported leaves") and edit the guest register file in place. The crate has no dependencies.
 
 | Guest address | IL2CPP method |
 |---|---|
@@ -27,6 +27,11 @@ The Windows game build links the `smrpg_decomp` static library from the `decomp`
 | 0x7101347ed8 | Unity native setter, w1 to x0+4 (writes memory, unnamed) |
 | 0x7101e357b0 | Battle.BattleCharacterAnimator.set_idle_id(int, int) (writes x0+0x54 and +0x58) |
 | 0x7101a0aa40 | Flag.off() (clears the byte at x0+0x10) |
+| 0x71005b3d50 | Unity native, x2 = 8 then tail call to the array element address leaf (calls a leaf) |
+| 0x71005b3d70 | Unity native, x0 = *(u64 *)element_address(x0, x1, 8) (calls a leaf, stack frame) |
+| 0x71005ae5a0 | Unity native, x0 = object ? (field = null-safe *(object + 0x10)) ? *(u32 *)(field + 8) : 0 : 0 (calls a leaf, stack frame) |
+| 0x7101cccaf0 | Unity native, w1 == 0x81d ? 1 : is_in(w1, 0x7f8, 0x7fb) (tail call to a leaf) |
+| 0x71001919f0 | Unity native, x0 = (*(u64 *)(x0 + 0x10) == x1) (tail call to a leaf) |
 
 `runtime/decomp/leaves.def` pairs each address with its lifted chunk and Rust symbol. CMake rebuilds those two chunks in its private build directory. It renames each original definition and keeps direct calls, tail calls and guest table entries pointing to the public wrapper. Startup checks the registered entry for every enabled swap.
 
@@ -45,6 +50,14 @@ A store leaf is declared with `SLEAF(chunk, address, symbol, base_reg, offset, b
 In `ab` mode `compare_store` in `runtime/decomp/swap.c` copies the footprint into a private shadow buffer with the same low 4 address bits, runs Rust on a register copy with `delta` set so its stores land in the shadow, then runs lifted C on live memory, so live memory ends exactly as the lifted body leaves it. It then compares all registers and the footprint bytes (live against shadow). A leaf with a footprint gap leaves the gap bytes equal on both sides. Residual race: another thread writing the footprint between the copy and the final compare would show a false difference (never a game corruption, because Rust never touches live memory). None appeared.
 
 The selftest points the base register into a private 64-word fake region (never game memory) and requires the footprint to change in at least one call, so a pair that both skip the store cannot pass. Store leaves may not call, load from the footprint, use atomics, floating point or a write barrier, or write any register other than x0; the scan keeps only leaves of stores whose base and value registers are x0, x1, x2 or xzr. `cargo test` checks the written bytes with a fake region.
+
+## Functions that call ported leaves
+
+A function whose every callee is already a Rust leaf can be ported whole (task-44). `leaves.def` declares it with `CLEAF(chunk, address, symbol)`. The Rust symbol takes one argument, a pointer to the guest register file (`Ctx.x`, 32 u64 with `x[31]` = sp), and edits it in place, so every register the lifted body changes is reproduced, not just x0 (these functions set x1 to x3 and x30). It calls the Rust callee directly, so no callee runs twice on live memory. Only register and load-only callers qualify so far (no stores, write barriers, atomics, exclusives, floating point, lazy statics or indirect calls); the scan keeps at most about 20 operations and only `bl` or tail-call targets that are in `leaves.def`.
+
+What `ab` compares (`compare` in `runtime/decomp/swap.c`): Rust runs on a copy of the whole `Ctx`, lifted C on the live one, then `memcmp` over the entire `Ctx` (x0 to x30, sp, v0 to v31, flags, pc, exception fields, scratch). Guest stack: the lifted prologue pushes x29 and x30 below sp and the epilogue pops them, so sp, x29 and the callee-saved registers end unchanged and the Rust version leaves them alone. The pushed bytes sit below the final sp and are dead after the return, so they are not compared; the comparison does cover sp and every register. One lifter artifact is copied on purpose: before each `bl` the lifted body stores the return address in the context x30 and never restores it, so the Rust version writes the same stale x30 (a wrong value there is caught: a mutation test that changed one return address failed the selftest). In `ab` mode the lifted caller still goes through the callee wrappers, which are compared as usual, so the callee live counters in the summary include calls made by the callers.
+
+Selftest: each caller gets a private fake region and a private 16-byte aligned fake stack (`prepare_caller` in `swap.c`), with a pending exception cleared (`c.exc = 0`, lifted callers return early otherwise). The shape per function: array index and element address inside the region, a null or valid object-to-field chain, w1 at and around 0x81d and 0x7f8 to 0x7fb, an object whose +0x10 word equals x1 half the time. Callee counters are restored after each caller selftest, and a difference found in a callee fails the run, so selftest calls never count as live calls.
 
 ## Reproduce the comparison
 

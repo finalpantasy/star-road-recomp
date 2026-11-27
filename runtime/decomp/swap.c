@@ -5,12 +5,15 @@
 typedef uint64_t (*IntLeaf)(uint64_t, uint64_t, uint64_t);
 /* Store leaves take a fourth argument added to every store address (0 in normal use; see compare()). */
 typedef uint64_t (*StoreLeaf)(uint64_t, uint64_t, uint64_t, uint64_t);
+/* Functions that call ported leaves (task-44) edit the whole guest register file in place (Ctx.x). */
+typedef void (*RegsLeaf)(uint64_t *);
 #define MAX_FOOTPRINT 32
 typedef struct {
     uint64_t address;
     GuestFn entry, lifted;
     IntLeaf rust;
     StoreLeaf rust_store;           /* set instead of rust for a leaf that writes guest memory */
+    RegsLeaf rust_regs;             /* set instead of rust for a function that calls ported leaves */
     unsigned base_reg, offset, bytes; /* store footprint: bytes at x[base_reg] + offset */
     atomic_ullong calls, differences;
 } Leaf;
@@ -23,31 +26,44 @@ typedef struct {
     void f_##addr(Ctx *); \
     extern void f_##addr##_lifted(Ctx *); \
     extern uint64_t rust(uint64_t, uint64_t, uint64_t, uint64_t);
+#define CLEAF(chunk, addr, rust) \
+    void f_##addr(Ctx *); \
+    extern void f_##addr##_lifted(Ctx *); \
+    extern void rust(uint64_t *);
 #include "leaves.def"
 #undef LEAF
 #undef SLEAF
+#undef CLEAF
 
 enum {
 #define LEAF(chunk, addr, rust) index_##addr,
 #define SLEAF(chunk, addr, rust, base, off, len) index_##addr,
+#define CLEAF(chunk, addr, rust) index_##addr,
 #include "leaves.def"
 #undef LEAF
 #undef SLEAF
+#undef CLEAF
     leaf_count
 };
 
 static Leaf leaves[leaf_count] = {
-#define LEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0, 0, 0, 0, 0},
+#define LEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0, 0, 0, 0, 0, 0},
 #define SLEAF(chunk, addr, rust, base, off, len) \
-    {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, rust, base, off, len, 0, 0},
+    {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, rust, 0, base, off, len, 0, 0},
+#define CLEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, 0, rust, 0, 0, 0, 0, 0},
 #include "leaves.def"
 #undef LEAF
 #undef SLEAF
+#undef CLEAF
 };
 
 static enum { OFF, ON, AB } mode;
 
 static void run_rust(const Leaf *leaf, Ctx *c) {
+    if (leaf->rust_regs) {
+        leaf->rust_regs(c->x);
+        return;
+    }
     c->x[0] = leaf->rust_store ? leaf->rust_store(c->x[0], c->x[1], c->x[2], 0)
                                : leaf->rust(c->x[0], c->x[1], c->x[2]);
 }
@@ -106,9 +122,11 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
 
 #define LEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define SLEAF(chunk, addr, rust, base, off, len) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#define CLEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #include "leaves.def"
 #undef LEAF
 #undef SLEAF
+#undef CLEAF
 
 static uint64_t random_word(uint64_t *state) {
     *state ^= *state << 13;
@@ -135,7 +153,56 @@ static void fill_fake_region(uint64_t *words, unsigned count, uint64_t *state) {
     }
 }
 
+/* Caller functions (task-44) dereference pointers they compute, so the selftest builds a valid shape in the
+ * private fake region for each one (never game memory). Register-only callers keep the random registers. */
+static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *state, int edge_phase) {
+    uint64_t pick = random_word(state);
+    uint64_t base = (uint64_t)(uintptr_t)fake;
+    /* The lifted prologue pushes x29 and x30 below sp, so sp must be a real 16-byte aligned stack. The Rust
+     * body has no stack; those bytes are dead once the function returns and are not compared. */
+    static _Alignas(16) uint64_t stack[16];
+    c->x[31] = (uint64_t)(uintptr_t)&stack[8];
+    switch (address) {
+    case 0x71005b3d70ULL:   /* x0 + (int)x1 * 8 + 0x20 is loaded: keep it inside the 64 words */
+        fill_fake_region(fake, 64, state);
+        c->x[0] = base + 8 * (8 + (pick & 15));
+        c->x[1] = (random_word(state) & ~0xffffffffULL) | (uint32_t)(int32_t)((int)((pick >> 8) % 20) - 4);
+        break;
+    case 0x71005ae5a0ULL: { /* null, or object -> field (null or in range) -> u32 at field + 8 */
+        fill_fake_region(fake, 64, state);
+        unsigned object = (pick >> 8) % 20;
+        if ((pick & 7) == 0) c->x[0] = 0;
+        else {
+            c->x[0] = base + 8 * object;
+            fake[object + 2] = (pick & 8) ? 0 : base + 8 * (32 + ((pick >> 16) % 28));
+        }
+        break;
+    }
+    case 0x7101cccaf0ULL:   /* w1 at, around and far from the 0x81d compare and the 0x7f8..0x7fb range */
+        if (!edge_phase) {
+            static const uint32_t edge_w1[] = {0x81d, 0x7f7, 0x7f8, 0x7f9, 0x7fa, 0x7fb, 0x7fc, 0x81c, 0x81e};
+            if (pick % 3) c->x[1] = (c->x[1] & ~0xffffffffULL) | edge_w1[(pick >> 8) % RT_ARRAY_LEN(edge_w1)];
+        }
+        break;
+    case 0x71001919f0ULL:   /* x0 -> object whose +0x10 word is compared with x1 (equal about half the time) */
+        fill_fake_region(fake, 64, state);
+        c->x[0] = base + 8 * ((pick >> 8) % 40);
+        if (pick & 1) c->x[1] = *(uint64_t *)(uintptr_t)(c->x[0] + 0x10);
+        break;
+    default:
+        break;
+    }
+}
+
 static void selftest(Leaf *leaf, GuestFn entry) {
+    /* A caller's lifted body goes through the other leaves' wrappers, which count calls and differences.
+     * Keep those counters as they were so only real game calls reach the live summary; any difference a
+     * callee finds during this selftest is a failure. */
+    unsigned long long saved_calls[leaf_count], saved_differences[leaf_count];
+    for (int i = 0; i < leaf_count; ++i) {
+        saved_calls[i] = atomic_load(&leaves[i].calls);
+        saved_differences[i] = atomic_load(&leaves[i].differences);
+    }
     uint64_t seed = leaf->address;
     uint64_t fake[64];
     unsigned long long stores_seen = 0;   /* runs where the footprint changed, so a no-op pair cannot pass */
@@ -151,10 +218,12 @@ static void selftest(Leaf *leaf, GuestFn entry) {
         Ctx c;
         memset(&c, 0xa5, sizeof c);
         for (unsigned j = 0; j < 32; ++j) c.x[j] = random_word(&seed);
+        c.exc = 0;   /* a real call never starts with a pending exception; lifted callers check it after each call */
         if (i < edge_cases) {
             unsigned k = i;
             for (unsigned j = 0; j < 3; ++j, k /= nedge) c.x[j] = edges[k % nedge];
         }
+        if (leaf->rust_regs) prepare_caller(leaf->address, &c, fake, &seed, i < edge_cases);
         if (pointer_leaf) {
             fill_fake_region(fake, RT_ARRAY_LEN(fake), &seed);
             /* null one time in eight, otherwise an 8-byte aligned slot with room for the +0x10 field */
@@ -174,6 +243,11 @@ static void selftest(Leaf *leaf, GuestFn entry) {
             continue;
         }
         entry(&c);
+    }
+    for (int i = 0; i < leaf_count; ++i) {
+        if (&leaves[i] == leaf) continue;
+        if (atomic_load(&leaves[i].differences) != saved_differences[i]) rt_exit(10, "decomp selftest: callee differs");
+        atomic_store(&leaves[i].calls, saved_calls[i]);
     }
     if (leaf->rust_store && !stores_seen) rt_exit(10, "decomp selftest: store leaf never wrote");
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
