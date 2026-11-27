@@ -90,6 +90,7 @@ impl Frame {
     ) -> Result<(), GuestException> {
         self.x[30] = return_address;
         self.flush(list, with_sp);
+        self.regs.set_x(30, self.x[30]);
         let outcome = self.regs.invoke_out(target, area);
         self.reload();
         outcome.map(|_| ())
@@ -107,6 +108,7 @@ impl Frame {
         self.x[30] = return_address;
         self.flush(list, with_sp);
         self.flush_v(vlist);
+        self.regs.set_x(30, self.x[30]);
         let outcome = self.regs.invoke(target);
         self.reload();
         outcome.map(|_| ())
@@ -125,6 +127,7 @@ impl Frame {
         self.x[30] = return_address;
         self.flush(list, with_sp);
         self.flush_v(vlist);
+        self.regs.set_x(30, self.x[30]);
         let outcome = self.regs.invoke_out(target, area);
         self.reload();
         outcome.map(|_| ())

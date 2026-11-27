@@ -511,6 +511,40 @@ What remains for the driver, in order (the first item is done):
    ported and the driver port calls their Rust code directly (a traced call is recorded and matched; a callee reached through `smrpg_guest_bl` that is neither a traced row nor on the pure
    allowlist stops the run). Footprints it needs: belome x2 4 bytes in; renkei and `group_a_b` x1 (= `x29 - 4`) 4 bytes in; `Single.ToString` x0 (= sp + 8) 4 bytes in.
 
+## damage_calc (task-59): `group_a_b` ported, the driver not
+
+`Battle.SkillExecter.group_a_b(ref int damage)` (0x7102201aa0, 390 instructions, `QLEAF`) is in `decomp/smrpg_decomp/src/battle/damage.rs` (module doc comment in C# terms, IL2CPP names,
+`Frame` register tracking as in `calc_renkei_ratio`). It is the buff and status step of the damage formula. For a combination skill (`SkillObject._skill_type == RENKEI`, 13): if
+`_target.is_defense_up()` or `_target._is_guard` the damage is halved (`cinc lt; asr 1`), otherwise it is scaled by `(count of afraid characters) / -3 * 0.5 + 1`; then if `_target.is_fear()`
+the damage becomes `damage * 3 / 2`, otherwise it is scaled by `(count of characters with attack up) / 3 * 0.5 + 1`. For any other skill type: halve when `_acter.is_fear()`, `_target.is_defense_up()` or
+`_target._is_guard`; then `* 3 / 2` when `_acter.is_attack_up()` or `_target.is_fear()`. Each change writes a debug line (`Int32.ToString`, `String.Concat`, `DebugMonitor.write`; the factor lines use
+`Single.ToString`). The two counts are a `foreach` over `BattleManager._instance._pc_list` (`List<BattleCharacterParam>`: GetEnumerator into a 24 byte struct on the stack, MoveNext, get_Current,
+the test on `current._character` at +0x20, Dispose), compiled twice, each with its own lazy `BattleManager` class initialization and a static-field byte flag. Floats go through `fp.rs`; the scaled value
+is `fcvtzs` with `+inf` replaced by `int.MinValue`. Exception landing pads (`finally` of the enumerator) are not ported: a callee that throws returns the port at once.
+
+Names recovered from `methods.tsv`: 0x71021bc4c0 `is_defense_up`, 0x71021bc4b0 `is_attack_up`, 0x71021be020 `is_fear` (`_badstatus_mng._status == 5`), 0x7101b52040 `List<T>.GetEnumerator`,
+0x71018fe040 `Enumerator.MoveNext`, 0x7100183d20 `Enumerator.get_Current`, 0x71018fe030 `Enumerator.Dispose` (an empty `ret`), 0x7101d6a050 `Single.ToString`. Fields: `SkillObject._skill_type` +0x20,
+`BattleCharacterParam._is_guard` +0x76, `_badstatus_mng` +0x98, `_buff_mng` +0xa0, `BattleManager._pc_list` +0xd8.
+
+New rows in `leaves.def`: `QLEAF` 0x7102201aa0 (hook `smrpg_skill_group_a_b_pre`: flag byte, damage cell, class initialized word and static flag byte); `PLEAF` 0x71021be020 (`is_fear`) and 0x7100183d20 (`get_Current`);
+`OLEAF` 0x7101b52040 (x1, 24 bytes, out), 0x71018fe040 (x0, 24 bytes, in and out) and 0x7101d6a050 (x0, 4 bytes, in). `is_defense_up`, `is_attack_up` and `Dispose` were already ported generated rows, so the port
+calls them through the bridge (pure). `OUT_MAX` in `swap.c` and the `invoke_out` assert in `bridge.rs` went from 16 to 24 bytes (the assert was a panic that aborted the selftest with no log line);
+`Frame::call_out`, `call_v` and `call_out_v` now write x30 themselves (the lists of earlier ports contained 30; this one's do not).
+
+Lazy state in `ab` mode: the first `foreach` of a call reads the class word and the static flag byte through the pre-state snapshot and stores the flag (journaled); later reads in the same call are live
+(the lifted body already ran, and its first `foreach` may have initialized them). A clear lazy-initialization flag byte defers the whole call (not compared, as for `calc_renkei_ratio`).
+
+Selftest graph (`prepare_caller`, `case 0x7102201aa0`): executer, acter, target (+0x76 flag bytes 0, 1, 2, 0x80, 0xff), element character, the three characters' buff and bad status managers (status 5 often,
+flag bytes), skill object with `_skill_type` 13 about 40 percent of the time, damage cell (0, +-1, 2, 3, 7, int extremes, float-like bit patterns), the class cell chain to a stand-in list, the byte flag (clear one time in four),
+class initialized word (clear one time in four), the flag byte (clear one time in sixteen: deferred) and nine metadata slots pointed at private cells and restored after the row. `run_traced` gives the stand-in
+`get_Current` a fixed fake element.
+
+What remains for the driver (`damage_calc` 0x71021ff580, 613 instructions), unchanged by this task: the 29 first-call metadata calls, 19 debug writes, 8 class checks with polls, the formula
+(skill type tests, element multiplier, `(int)(num * ratio)`) and the register tracking between them. All callees are now ported or traced: `calc_attack`, `calc_magic_attack`, `calc_element`, `calc_defence`,
+`calc_magic_defence`, `calc_belome_barrior_ratio`, `calc_renkei_ratio`, `group_a_b`, `is_barriered`, `set_acction_command_ratio`, `use_damage_guard`. Footprints the driver needs: belome x2 4 bytes in; renkei and `group_a_b`
+x1 (= `x29 - 4`) 4 bytes in; `Single.ToString` x0 (= `sp + 8`) 4 bytes in. As a replay row the driver calls `group_a_b` through the bridge only when `group_a_b` is a traced row; it is now a replay row (`QLEAF`), so the
+driver has to call the Rust function directly and the row must stay a replay row for its own comparison (a replay row reached from inside another recorded call is not recorded, `compare_replay`).
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

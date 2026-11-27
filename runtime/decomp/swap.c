@@ -200,7 +200,7 @@ static void compare_store(Leaf *leaf, Ctx *c) {
  * difference. An out footprint (OLEAF) is kept next to the call. */
 #define REC_START 64
 #define REC_LIMIT 4096
-#define OUT_MAX 16
+#define OUT_MAX 24
 typedef struct { uint64_t target; Ctx pre, post; unsigned char out_pre[OUT_MAX], out_post[OUT_MAX]; } RecCall;
 typedef struct { RecCall *calls; unsigned count, next, cap; int bad; int hide_callee_fpsr; uint32_t raised; } Recording;
 #define FPSR_CUM 0x0800009fu   /* IOC DZC OFC UFC IXC IDC QC: the cumulative FPSR bits */
@@ -320,12 +320,14 @@ static void stub_callee(Ctx *c) {
 
 static __thread uint64_t tl_stub_instance;   /* selftest: what the stand-in GlobalWork.get_inst returns (a fake object, never a random word) */
 static __thread uint64_t tl_stub_new;        /* selftest (task-58): what the stand-in Object.new (0x71000c44d0) returns: a fake List<int> */
+static __thread uint64_t tl_stub_current;    /* selftest (task-59): what the stand-in List<T>.Enumerator.get_Current (0x7100183d20) returns: a fake element */
 
 static void run_traced(Leaf *leaf, Ctx *c) {
     if (tl_stub) {
         stub_callee(c);
         if (leaf->address == 0x7101886a00ULL && tl_stub_instance) c->x[0] = tl_stub_instance;
         if (leaf->address == 0x71000c44d0ULL && tl_stub_new) c->x[0] = tl_stub_new;
+        if (leaf->address == 0x7100183d20ULL && tl_stub_current) c->x[0] = tl_stub_current;
     } else {
         leaf->lifted(c);
     }
@@ -789,6 +791,20 @@ static void restore_renkei_globals(void) {
     tl_stub_new = 0;
 }
 
+/* group_a_b (task-59): the flag byte and nine metadata slots (data page + offset), restored after its selftest. */
+static const uint64_t group_slot_address[9] = {
+    0x7103a57000ULL + 0xe48, 0x7103a58000ULL + 0x1d0, 0x7103a58000ULL + 0x240, 0x7103a58000ULL + 0x248, 0x7103a58000ULL + 0x250,
+    0x7103a58000ULL + 0x258, 0x7103a83000ULL + 0x540, 0x7103a83000ULL + 0xc28, 0x7103a83000ULL + 0xc30};
+static uint64_t group_saved[10];
+static int group_have_saved;
+static void restore_group_globals(void) {
+    if (!group_have_saved) return;
+    *(volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd73) = (uint8_t)group_saved[0];
+    for (int i = 0; i < 9; ++i) *(uint64_t *)(uintptr_t)group_slot_address[i] = group_saved[1 + i];
+    group_have_saved = 0;
+    tl_stub_current = 0;
+}
+
 static void restore_belome_globals(void) {
     if (!belome_have_saved) return;
     *(volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5d) = (uint8_t)belome_saved[0];
@@ -1038,6 +1054,64 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->x[1] = rb + 8 * 200;                                 /* the damage cell */
         break;
     }
+    case 0x7102201aa0ULL: { /* Battle.SkillExecter.group_a_b (task-59): the executer (+0x10 monitor, +0x20 acter, +0x28 target, +0x30 skill object), the target
+                             * (+0x76 _is_guard), the skill object (+0x20 _skill_type, 13 = RENKEI), the damage cell, the BattleManager class cell (class
+                             * +0xb8 statics, +0xe0 initialized word; statics +0x10 instance; instance +0xd8 _pc_list; +0x10 its list), the byte flag cell,
+                             * the stand-in enumerator element, the flag byte and nine metadata slots, pointed at private cells and restored after the row. */
+        static uint64_t region[320];
+        volatile uint8_t *flag = (volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd73);
+        if (!group_have_saved) {
+            group_saved[0] = *flag;
+            for (int i = 0; i < 9; ++i) group_saved[1 + i] = *(uint64_t *)(uintptr_t)group_slot_address[i];
+            group_have_saved = 1;
+        }
+        fill_fake_region(region, 320, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        uint64_t r;
+        uint32_t v;
+        #define WORD(n) (rb + 8 * (n))
+        region[2] = WORD(220);                                  /* executer +0x10 _monitor */
+        region[4] = WORD(8);                                    /* +0x20 _acter */
+        region[5] = WORD(24);                                   /* +0x28 _target */
+        region[6] = WORD(70);                                   /* +0x30 _skill_obj */
+        static const unsigned char guards[] = {0, 0, 1, 2, 0x80, 0xff};
+        bytes[8 * 24 + 0x76] = guards[(pick >> 8) % RT_ARRAY_LEN(guards)];   /* target _is_guard */
+        static const uint32_t types[] = {13, 13, 13, 13, 13, 13, 0, 1, 2, 12, 14, 0xffffffffu, 0x80000000u, 0xc, 0xe};
+        v = types[(pick >> 12) % RT_ARRAY_LEN(types)]; memcpy(bytes + 8 * 70 + 0x20, &v, 4);   /* skill object _skill_type */
+        static const uint32_t damages[] = {0, 1, 2, 3, 7, 100, 9999, 0xffffffffu, 0xfffffffeu, 0xfffffff9u, 0x7fffffffu, 0x80000000u, 0x80000001u,
+                                           0x55555555u, 0x2aaaaaaau, 0x3f800000u, 0x7f800000u, 0x4b800000u, 0x3b000000u};
+        r = random_word(state);
+        v = (r & 7) == 0 ? (uint32_t)(r >> 8) : damages[(r >> 8) % RT_ARRAY_LEN(damages)]; memcpy(bytes + 8 * 90, &v, 4);   /* the damage cell */
+        region[100] = WORD(104);                                /* the class cell holds the class pointer */
+        region[104 + 0xb8 / 8] = WORD(140);                     /* class +0xb8 static fields */
+        region[140 + 2] = WORD(150);                            /* statics +0x10 _instance */
+        region[150 + 0xd8 / 8] = WORD(190);                     /* instance +0xd8 _pc_list */
+        region[190 + 2] = WORD(200);                            /* _pc_list +0x10 the list */
+        v = ((pick >> 20) & 3) == 0 ? 0 : (uint32_t)(r = random_word(state)) | 1; memcpy(bytes + 8 * 104 + 0xe0, &v, 4);   /* class initialized word */
+        bytes[8 * 230] = ((pick >> 24) & 3) == 0 ? 0 : (((pick >> 26) & 7) == 0 ? 0x80 : 1);   /* the static-field byte flag */
+        for (unsigned i = 0; i < 9; ++i) *(uint64_t *)(uintptr_t)group_slot_address[i] = WORD(232 + 2 * i);   /* each slot points at a cell */
+        *(uint64_t *)(uintptr_t)group_slot_address[0] = WORD(100);   /* the BattleManager class slot */
+        *(uint64_t *)(uintptr_t)group_slot_address[1] = WORD(230);   /* the pointer to the byte flag */
+        /* the characters' buff and bad status managers: is_attack_up +0x10, is_defense_up +0x11 (bytes at +0xa0), is_fear: status == 5 (+0x98 -> +0x10) */
+        static const uint32_t statuses[] = {5, 5, 5, 0, 1, 4, 6, 0xffffffffu};
+        static const unsigned char buff_flags[] = {0, 0, 1, 1, 2, 0xff};
+        static const unsigned character_word[3] = {8, 24, 160};   /* acter, target, element */
+        for (unsigned k = 0; k < 3; ++k) {
+            region[character_word[k] + 0x98 / 8] = WORD(260 + 8 * k);
+            region[character_word[k] + 0xa0 / 8] = WORD(264 + 8 * k);
+            v = statuses[random_word(state) % RT_ARRAY_LEN(statuses)]; memcpy(bytes + 8 * (262 + 8 * k), &v, 4);
+            bytes[8 * (266 + 8 * k)] = buff_flags[random_word(state) % RT_ARRAY_LEN(buff_flags)];
+            bytes[8 * (266 + 8 * k) + 1] = buff_flags[random_word(state) % RT_ARRAY_LEN(buff_flags)];
+        }
+        region[224] = WORD(160);                                /* element +0x20: a character */
+        *flag = ((pick >> 32) & 15) == 0 ? 0 : 1;               /* lazy initialization pending one time in sixteen */
+        tl_stub_current = WORD(220);
+        #undef WORD
+        c->x[0] = rb;                                           /* the executer */
+        c->x[1] = rb + 8 * 90;                                  /* the damage cell */
+        break;
+    }
     case 0x71021f7ea0ULL: { /* Battle.SkillExecter.set_acction_command_ratio (task-56): +0x18 result record, +0x20 acter param (+0x6c _is_player),
                              * +0x30 skill object (+0x14 _skill_id). Every skill id of the 129 entry table and its neighbors, enemy and player. */
         fill_fake_region(fake, 64, state);
@@ -1207,6 +1281,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     restore_attack_globals();
     restore_belome_globals();
     restore_renkei_globals();
+    restore_group_globals();
     atomic_store(&leaf->deferred, 0);
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);

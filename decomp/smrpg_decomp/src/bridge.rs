@@ -366,7 +366,7 @@ impl Regs {
     /// in `on` mode it runs on the live stack. The row must be declared `OLEAF(chunk, addr, reg, bytes, in)` in
     /// `runtime/decomp/leaves.def` with `bytes == slot.len()` (task-57). Returns x0.
     pub fn invoke_out(&mut self, target: u64, slot: &mut [u8]) -> Result<u64, GuestException> {
-        assert!(slot.len() <= 16);
+        assert!(slot.len() <= 24);
         let pending =
             unsafe { smrpg_guest_bl_out(self.x, target, slot.as_mut_ptr(), slot.len() as u32) };
         if pending != 0 {

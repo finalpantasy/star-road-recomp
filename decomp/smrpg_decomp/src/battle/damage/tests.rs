@@ -152,3 +152,39 @@ fn the_barrier_flag_and_count() {
     param.use_damage_guard(&mut Journal);
     STORES.with(|s| assert_eq!(*s.borrow(), [(base + 8 * 32 + 0x49, 1, 1)]));
 }
+
+#[test]
+fn group_halving_rounds_toward_zero() {
+    use super::{halve, three_halves};
+    for (value, half) in [
+        (0, 0),
+        (1, 0),
+        (2, 1),
+        (3, 1),
+        (-1, 0),
+        (-2, -1),
+        (-3, -1),
+        (i32::MAX, i32::MAX / 2),
+        (i32::MIN, i32::MIN / 2),
+    ] {
+        assert_eq!(halve(value), half, "halve({value})");
+        assert_eq!(halve(value), value.wrapping_div(2), "div({value})");
+    }
+    // `value * 3` wraps to 32 bits before the halving, as `add w8, w8, w8, lsl #1` does
+    assert_eq!(three_halves(10), 15);
+    assert_eq!(three_halves(-11), -16);
+    assert_eq!(
+        three_halves(i32::MAX),
+        (i32::MAX.wrapping_mul(3)).wrapping_div(2)
+    );
+}
+
+#[test]
+fn group_metadata_returns_step_by_twelve() {
+    use super::{group_site, group_slots};
+    assert_eq!(group_slots::INIT_ORDER.len(), 8);
+    assert_eq!(
+        group_site::FIRST_INIT_RETURN + group_site::INIT_STEP * 7,
+        0x7102201b2c
+    );
+}
