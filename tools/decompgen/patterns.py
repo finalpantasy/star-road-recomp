@@ -12,7 +12,9 @@ from collections import namedtuple
 
 # kind: LEAF (registers only), GLEAF (load, x[base] + offset), NLEAF (null-safe load), SLEAF (store),
 # (the boolean setter's scratch register x8 is not part of the lifted reference's output, see set_bool).
-Spec = namedtuple("Spec", "pattern variant kind rust_body base_reg offset nbytes")
+# v2 (task-50): VLEAF (float or SIMD register leaf; vkind 1 load, 2 store, 3 constant, 4 load through a field) and DLEAF
+# (integer load through a field). vreg is the vector register, offset2 the second-level load offset.
+Spec = namedtuple("Spec", "pattern variant kind rust_body base_reg offset nbytes vkind vreg offset2", defaults=(0, 0, 0))
 
 ARGS = "abc"                       # Rust parameter names for guest x0..x2
 GUEST_LD = {1: "guest_ld8", 2: "guest_ld16", 4: "guest_ld32", 8: "guest_ld64"}
@@ -74,11 +76,12 @@ def const_return(insns, pc):
     return Spec("const", "wide_x" if state[1] else "wide_w", "LEAF", _hex(state[0]), 0, 0, 0)
 
 
-def _plain_mem(i, op):
-    """True for a plain base + unsigned scaled immediate access: no write-back, no register offset, no vector."""
-    if i["op"] != op or i.get("v") != 0 or i.get("wb") is not None or i.get("rm") is not None:
+def _plain_mem(i, op, vector=0, rn_ok=lambda n: n <= 2):
+    """True for a plain base + unsigned scaled immediate access: no write-back, no register offset. vector=0 is an
+    integer access, vector=1 a float or SIMD register access."""
+    if i["op"] != op or i.get("v") != vector or i.get("wb") is not None or i.get("rm") is not None:
         return False
-    return i["rn"] <= 2 and 0 <= i["imm"] < (1 << 16) and i["imm"] % i["nbytes"] == 0
+    return rn_ok(i["rn"]) and 0 <= i["imm"] < (1 << 16) and i["imm"] % i["nbytes"] == 0
 
 
 def _load_expr(i, address):
@@ -187,9 +190,138 @@ def mov_reg(insns, pc):
     return Spec("mov_reg", "x" if i["sf"] else "w", "LEAF", body, 0, 0, 0)
 
 
+SCRATCH = range(8, 18)     # x8..x17: not flushed to the context at ret (lifter MASK_RET covers x0..x7 and x19..x29)
+VREGS = range(16)          # v0..v15 are flushed at ret (MASK_RET covers v0..v15); v16..v31 are not
+VBYTES = (4, 8)            # s and d registers; q (16 bytes) is not matched
+
+
+def vfp_expand_imm(dbl, imm8):
+    """Same expansion as tools/lifter/lower_simd_a.py vfp_expand_imm (single and double only)."""
+    a, bb, cd, efgh = (imm8 >> 7) & 1, (imm8 >> 6) & 1, (imm8 >> 4) & 3, imm8 & 15
+    if not dbl:
+        return (a << 31) | ((bb ^ 1) << 30) | ((0x1F if bb else 0) << 25) | (cd << 23) | (efgh << 19)
+    return (a << 63) | ((bb ^ 1) << 62) | ((0xFF if bb else 0) << 54) | (cd << 52) | (efgh << 48)
+
+
+def _vspec(pattern, variant, vkind, body, vreg, base, off, nbytes, off2=0):
+    return Spec(pattern, variant, "VLEAF", body, base, off, nbytes, vkind, vreg, off2)
+
+
+def vget(insns, pc):
+    """ldr sN/dN, [xB, #imm]; ret (N = 0..15). The load zeroes every other lane of the vector register."""
+    if len(insns) != 2 or not _is_ret(insns[1]):
+        return None
+    i = insns[0]
+    if not _plain_mem(i, "ldr", vector=1) or i["nbytes"] not in VBYTES or i["rt"] not in VREGS:
+        return None
+    address = "%s.wrapping_add(%s)" % (ARGS[i["rn"]], _hex(i["imm"]))
+    body = "unsafe { %s }" % _load_expr(i, address)
+    return _vspec("vget", "%s%d" % ("s" if i["nbytes"] == 4 else "d", i["rt"]), 1, body, i["rt"], i["rn"], i["imm"], i["nbytes"])
+
+
+def vset(insns, pc):
+    """str sN/dN, [xB, #imm]; ret. Stores the low 32 or 64 bits of the vector register."""
+    if len(insns) != 2 or not _is_ret(insns[1]):
+        return None
+    i = insns[0]
+    if not _plain_mem(i, "str", vector=1) or i["nbytes"] not in VBYTES or i["rt"] not in VREGS:
+        return None
+    n = i["nbytes"]
+    value = "vlo as u32" if n == 4 else "vlo"
+    body = "unsafe { %s(%s.wrapping_add(delta).wrapping_add(%s), %s) };\n0" % (
+        GUEST_ST[n], ARGS[i["rn"]], _hex(i["imm"]), value)
+    return _vspec("vset", "%s%d" % ("s" if n == 4 else "d", i["rt"]), 2, body, i["rt"], i["rn"], i["imm"], n)
+
+
+def vconst(insns, pc):
+    """fmov sN/dN, #imm; or fmov sN, wzr / dN, xzr; or movi (vzero); then ret. Writes {value, 0}."""
+    if len(insns) != 2 or not _is_ret(insns[1]):
+        return None
+    i = insns[0]
+    if i.get("rd") not in VREGS:
+        return None
+    if i["op"] == "fmov_imm":
+        value = vfp_expand_imm(i["dbl"], i["imm8"])
+        return _vspec("vconst", "%s%d_imm" % ("d" if i["dbl"] else "s", i["rd"]), 3, _hex(value), i["rd"], 0, 0, 0)
+    if i["op"] == "fmov_gen" and not i["to_gen"] and i["rn"] == 31:
+        return _vspec("vconst", "%s%d_zr" % ("d" if i["sf"] else "s", i["rd"]), 3, "0", i["rd"], 0, 0, 0)
+    if i["op"] == "vzero":
+        return _vspec("vconst", "%s%d_zero" % ("q" if i["q"] else "d", i["rd"]), 3, "0", i["rd"], 0, 0, 0)
+    return None
+
+
+def _two_level(insns, vector):
+    """(first, second, T) for ldr xT, [xB, #a]; ldr ..., [xT, #b]; ret, or None. T is x0 (integer) or a scratch
+    register that the lifted reference does not flush at ret (the same argument as set_bool)."""
+    if len(insns) != 3 or not _is_ret(insns[2]):
+        return None
+    f, i = insns[0], insns[1]
+    if not _plain_mem(f, "ldr") or f["nbytes"] != 8 or f["signed"]:
+        return None
+    t = f["rt"]
+    if t not in SCRATCH and not (t == 0 and not vector):
+        return None
+    if not _plain_mem(i, "ldr", vector=vector, rn_ok=lambda n: n == t):
+        return None
+    return f, i, t
+
+
+def getter2(insns, pc):
+    """ldr xT, [xB, #a]; ldr{,b,h,sb,sh,sw} x0/w0, [xT, #b]; ret: a field of a field, no null check."""
+    parts = _two_level(insns, 0)
+    if not parts or parts[1]["rt"] != 0:
+        return None
+    f, i, _t = parts
+    first = "%s.wrapping_add(%s)" % (ARGS[f["rn"]], _hex(f["imm"]))
+    body = "unsafe {\n    let p = guest_ld64(%s);\n    %s\n}" % (first, _load_expr(i, "p.wrapping_add(%s)" % _hex(i["imm"])))
+    return Spec("get2", _load_variant(i), "DLEAF", body, f["rn"], f["imm"], 8, 0, 0, i["imm"])
+
+
+def vget2(insns, pc):
+    """ldr xT, [xB, #a]; ldr sN/dN, [xT, #b]; ret."""
+    parts = _two_level(insns, 1)
+    if not parts or parts[1]["nbytes"] not in VBYTES or parts[1]["rt"] not in VREGS:
+        return None
+    f, i, _t = parts
+    first = "%s.wrapping_add(%s)" % (ARGS[f["rn"]], _hex(f["imm"]))
+    body = "unsafe {\n    let p = guest_ld64(%s);\n    %s\n}" % (first, _load_expr(i, "p.wrapping_add(%s)" % _hex(i["imm"])))
+    return _vspec("vget2", "%s%d" % ("s" if i["nbytes"] == 4 else "d", i["rt"]), 4, body, i["rt"], f["rn"], f["imm"], 8, i["imm"])
+
+
+def get_cmp(insns, pc):
+    """ldr{,b,h,w} xT/wT, [xB, #imm]; cmp xT/wT, #k (k <= 15) or cmp xT/wT, xM (M = 1 or 2, not B); cset w0, eq/ne; ret.
+    A boolean getter. The compare is equality only, so the flag values themselves never matter."""
+    if len(insns) != 4 or not _is_ret(insns[3]):
+        return None
+    ld, cmp, cs = insns[0], insns[1], insns[2]
+    if not _plain_mem(ld, "ldr") or ld["signed"] or ld["nbytes"] not in (1, 2, 4, 8) or ld["rt"] not in SCRATCH:
+        return None
+    t = ld["rt"]
+    if cs["op"] != "csel" or (cs["sf"], cs["kind"], cs["rd"], cs["rn"], cs["rm"]) != (0, 1, 0, 31, 31) or cs["cond"] not in (0, 1):
+        return None
+    if cmp["op"] == "addsub_imm" and (cmp["sub"], cmp["s"], cmp["rd"], cmp["rn"]) == (1, 1, 31, t) and cmp["imm"] <= 15:
+        other, kind = _hex(cmp["imm"]), "imm"
+    elif cmp["op"] == "addsub_reg" and (cmp["sub"], cmp["s"], cmp["rd"], cmp["rn"], cmp["shift"], cmp["amt"]) == (1, 1, 31, t, 0, 0) \
+            and cmp["rm"] in (1, 2) and cmp["rm"] != ld["rn"]:
+        other, kind = ARGS[cmp["rm"]], "x%d" % cmp["rm"]
+    else:
+        return None
+    n = ld["nbytes"]
+    loaded = "%s(%s.wrapping_add(%s))" % (GUEST_LD[n], ARGS[ld["rn"]], _hex(ld["imm"]))
+    loaded = loaded if n == 8 else "u64::from(%s)" % loaded
+    mask = "u64::MAX" if cmp["sf"] else "0xffffffff"
+    # csinc w0, wzr, wzr, cond is 1 when cond is false: cond eq -> result is "not equal", cond ne -> "equal"
+    op = "!=" if cs["cond"] == 0 else "=="
+    body = "unsafe {\n    let v = %s;\n    u64::from((v & %s) %s (%s & %s))\n}" % (loaded, mask, op, other, mask)
+    variant = "u%d_%s_%s_%s" % (n * 8, "ne" if cs["cond"] == 0 else "eq", kind, "x" if cmp["sf"] else "w")
+    return Spec("get_cmp", variant, "GLEAF", body, ld["rn"], ld["imm"], n)
+
+
 # The shapes are disjoint (different lengths or instruction kinds), so the order does not matter.
-PATTERNS = [empty, const_return, getter, nullsafe_getter, setter, set_bool, add_imm, mov_reg]
-FAMILIES = ["empty", "const", "get", "get_nullsafe", "set", "set_bool", "add_imm", "mov_reg"]
+PATTERNS = [empty, const_return, getter, nullsafe_getter, setter, set_bool, add_imm, mov_reg,
+            vget, vset, vconst, getter2, vget2, get_cmp]
+FAMILIES = ["empty", "const", "get", "get_nullsafe", "set", "set_bool", "add_imm", "mov_reg",
+            "vget", "vset", "vconst", "get2", "vget2", "get_cmp"]
 
 
 def match(insns, pc):

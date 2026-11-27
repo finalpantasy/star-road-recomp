@@ -11,7 +11,7 @@ import collections
 import re
 import sys
 
-ROW = r"[SCGN]?LEAF\(\w+, ([0-9a-f]+),"
+ROW = r"[SCGNVD]?LEAF\(\w+, ([0-9a-f]+),"
 GEN_DIR = Path(r"A:\AI\Recomps\smrpg-work\decompgen")
 
 
@@ -80,7 +80,9 @@ def summary(log):
     for key in sorted(groups, key=lambda k: (not k.startswith("hand"), k.startswith("  "), k)):
         r = groups[key]
         print(f"{key:<18} {r[0]:>5} {r[1]:>5} {r[2]:>14} {r[3]:>12}")
-    print(f"selftest clean for {len(manual) + len(generated)} rows; live differences: {differences_total}")
+    raced = re.findall(r"decomp raced addr=0x([0-9a-f]+)", log)
+    print(f"selftest clean for {len(manual) + len(generated)} rows; live differences: {differences_total}; "
+          f"raced loads (retry agreed): {len(raced)}" + (" at " + " ".join(sorted(set(raced))) if raced else ""))
     if differences_total:
         raise ValueError("live differences")
 

@@ -4,7 +4,7 @@ Scans every function of the main module (the lifter's inventory and decoder), ma
 patterns.py, ranks the matches by direct call sites and writes, for the chosen ones:
 
   gen.rs         Rust, one function per match (included by decomp/smrpg_decomp through build.rs)
-  gen.def        manifest rows (LEAF, GLEAF, NLEAF, SLEAF) appended to runtime/decomp/leaves.def at configure time
+  gen.def        manifest rows (LEAF, GLEAF, NLEAF, SLEAF, DLEAF, VLEAF) appended to runtime/decomp/leaves.def at configure time
   gen.index.tsv  address, pattern, variant, symbol, chunk, call sites, name (read by check_log.py --summary)
   gen.report.txt match counts per pattern over the whole binary
 
@@ -134,7 +134,9 @@ def rust_function(pc, spec, name):
     params = ", ".join("%s: u64" % c if used(spec.rust_body, c) else "_: u64" for c in "abc")
     if spec.kind == "SLEAF":
         params += ", delta: u64"
-    unsafe = "unsafe " if spec.kind in ("GLEAF", "NLEAF", "SLEAF") else ""
+    if spec.kind == "VLEAF":   # vector rows: x0..x2, the low 64 bits of the vector register, the store redirect
+        params += ", %s: u64, %s: u64" % tuple(c if used(spec.rust_body, c) else "_" for c in ("vlo", "delta"))
+    unsafe = "unsafe " if spec.kind in ("GLEAF", "NLEAF", "SLEAF", "DLEAF") or (spec.kind == "VLEAF" and spec.vkind != 3) else ""
     note = "%s (%s %s)" % (name or "unnamed", spec.pattern, spec.variant)
     body = spec.rust_body
     if "\n" in body:
@@ -152,13 +154,17 @@ def manifest_row(pc, chunk, spec):
     head = "%s(main_%04d, %x, %s" % (spec.kind, chunk, pc, sym)
     if spec.kind in ("GLEAF", "NLEAF", "SLEAF"):
         head += ", %d, %d, %d" % (spec.base_reg, spec.offset, spec.nbytes)
+    elif spec.kind == "DLEAF":
+        head += ", %d, %d, %d, %d" % (spec.base_reg, spec.offset, spec.nbytes, spec.offset2)
+    elif spec.kind == "VLEAF":
+        head += ", %d, %d, %d, %d, %d, %d" % (spec.vkind, spec.vreg, spec.base_reg, spec.offset, spec.nbytes, spec.offset2)
     return head + ")"
 
 
 def hand_written():
     """Addresses already swapped by hand in runtime/decomp/leaves.def (a function must not be declared twice)."""
     text = open(os.path.join(HERE, "..", "..", "runtime", "decomp", "leaves.def")).read()
-    return {int(x, 16) for x in re.findall(r"[SCGN]?LEAF\(\w+, ([0-9a-f]+),", text)}
+    return {int(x, 16) for x in re.findall(r"[SCGNVD]?LEAF\(\w+, ([0-9a-f]+),", text)}
 
 
 def chunk_has_definition(pc, chunk, cache):

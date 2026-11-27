@@ -44,7 +44,7 @@ class Matcher(unittest.TestCase):
     def test_getter_refusals(self):
         self.assertIsNone(match(0xF8408C00, RET))   # ldr x0, [x0, #8]! (write-back)
         self.assertIsNone(match(0xF9400401, RET))   # ldr x1, [x0, #8] (writes x1, not x0)
-        self.assertIsNone(match(0xBD400800, RET))   # ldr s0, [x0, #8] (vector register)
+        self.assertEqual(match(0xBD400800, RET).pattern, "vget")   # ldr s0, [x0, #8]: a vector register is never `get`
         self.assertIsNone(match(0xF9400800))        # no ret
         self.assertIsNone(match(0xF9400800, 0xD503201F, RET))   # extra instruction
 
@@ -107,7 +107,93 @@ class Matcher(unittest.TestCase):
         import generate
         row = generate.manifest_row(0x7101347ed8, 207, match(0xB9000401, RET))
         self.assertEqual(row, "SLEAF(main_0207, 7101347ed8, smrpg_g_set_7101347ed8, 0, 4, 4)")
-        self.assertTrue(re.fullmatch(r"[SCGN]?LEAF\((main_[0-9]+), ([0-9a-f]+), \w+(?:, \d+)*\)", row))
+        self.assertTrue(re.fullmatch(r"[SCGNVD]?LEAF\((main_[0-9]+), ([0-9a-f]+), \w+(?:, \d+)*\)", row))
+
+    # ---- task-50: the words below are real functions of the main module (address in each comment) ----
+    def test_float_getter_and_setter(self):
+        spec = match(0xBD401C00, RET)               # 0x710003f1e0 ldr s0, [x0, #0x1c]
+        self.assertEqual((spec.pattern, spec.kind, spec.vkind, spec.vreg, spec.base_reg, spec.offset, spec.nbytes),
+                         ("vget", "VLEAF", 1, 0, 0, 0x1c, 4))
+        self.assertEqual(spec.rust_body, "unsafe { u64::from(guest_ld32(a.wrapping_add(0x1c))) }")
+        spec = match(0xFD400800, RET)               # 0x71001f7270 ldr d0, [x0, #0x10]
+        self.assertEqual((spec.vkind, spec.nbytes, spec.rust_body), (1, 8, "unsafe { guest_ld64(a.wrapping_add(0x10)) }"))
+        spec = match(0xBD001C00, RET)               # 0x710003f1f0 str s0, [x0, #0x1c]
+        self.assertEqual((spec.pattern, spec.vkind, spec.nbytes), ("vset", 2, 4))
+        self.assertIn("guest_st32(a.wrapping_add(delta).wrapping_add(0x1c), vlo as u32)", spec.rust_body)
+        self.assertEqual(match(0xFD000800, RET).nbytes, 8)    # 0x71001f6340 str d0, [x0, #0x10]
+        self.assertIsNone(match(0x3D400800, RET))             # ldr b0, [x0, #2]: 1 byte, not s or d
+        self.assertIsNone(match(0x3DC00800, RET))             # ldr q0, [x0, #0x20]: 16 bytes
+        self.assertIsNone(match(0xBD401C10, RET))             # ldr s16, [x0, #0x1c]: v16 is not flushed at ret
+        self.assertIsNone(match(0xBC401400, RET))             # ldr s0, [x0], #1 (post-index write-back)
+        self.assertIsNone(match(0xBD401C00))                  # no ret
+
+    def test_float_constants(self):
+        spec = match(0x1E2E1000, RET)               # 0x71002bd6d0 fmov s0, #1.0
+        self.assertEqual((spec.pattern, spec.vkind, spec.rust_body), ("vconst", 3, "0x3f800000"))
+        self.assertEqual(match(0x1E669000, RET).rust_body, "0x4034000000000000")   # 0x7100f7a81c fmov d0, #20.0
+        self.assertEqual(match(0x1E2703E0, RET).rust_body, "0")      # 0x7100290590 fmov s0, wzr
+        self.assertEqual(match(0x9E6703E0, RET).variant, "d0_zr")    # 0x7100c18580 fmov d0, xzr
+        self.assertEqual(match(0x1E2703E2, RET).vreg, 2)             # 0x7102059d80 fmov s2, wzr
+        self.assertEqual(match(0x6F00E400, RET).variant, "q0_zero")  # 0x7101359ec0 movi v0.2d, #0
+        self.assertIsNone(match(0x1E2703F1, RET))                    # fmov s17, wzr: v17 is not flushed at ret
+        self.assertIsNone(match(0x1E2603E0, RET))                    # fmov w0, s31: to a general register
+        self.assertIsNone(match(0x1E2703E0))                         # no ret
+
+    def test_expand_imm_matches_the_lifter(self):
+        import lower_simd_a
+        for dbl in (0, 1):
+            for imm8 in range(256):
+                self.assertEqual(patterns.vfp_expand_imm(dbl, imm8), lower_simd_a.vfp_expand_imm(dbl, imm8), (dbl, imm8))
+
+    def test_field_of_field(self):
+        spec = match(0xF9400808, 0xB9401900, RET)   # 0x7100171d60 ldr x8, [x0, #0x10]; ldr w0, [x8, #0x18]
+        self.assertEqual((spec.pattern, spec.kind, spec.variant, spec.base_reg, spec.offset, spec.offset2),
+                         ("get2", "DLEAF", "u32", 0, 0x10, 0x18))
+        self.assertIn("guest_ld64(a.wrapping_add(0x10))", spec.rust_body)
+        self.assertEqual(match(0xF9400028, 0x79C0A900, RET).variant, "s16w")   # 0x710033f0a4 ldrsh w0, [x8, #0x54]
+        self.assertEqual(match(0xF9400008, 0xF9400500, RET).variant, "u64")     # 0x710005f524 ldr x8, [x0]; ldr x0, [x8, #8]
+        self.assertEqual(match(0xF9400008, 0x3944B900, RET).variant, "u8")      # 0x710004c9d8
+        spec = match(0xF940FC08, 0xBD400900, RET)   # 0x71002e3158 ldr x8, [x0, #0x1f8]; ldr s0, [x8, #8]
+        self.assertEqual((spec.pattern, spec.vkind, spec.offset, spec.offset2, spec.nbytes), ("vget2", 4, 0x1f8, 8, 8))
+        self.assertIsNone(match(0xF9400808, 0xB9401920, RET))   # ldr w0, [x9, #0x18]: not the loaded register
+        self.assertIsNone(match(0xF9400808, 0xB9401901, RET))   # ldr w1, [x8, #0x18]: not x0
+        self.assertIsNone(match(0xB9400808, 0xB9401900, RET))   # first load is 32 bits: not a pointer
+        self.assertIsNone(match(0xF9400803, 0xB9401860, RET))   # the loaded register is x3 (flushed at ret)
+        self.assertIsNone(match(0xF9400808, 0xB9401900))        # no ret
+
+    def test_boolean_getter(self):
+        spec = match(0xB9401008, 0x7100011F, 0x1A9F17E0, RET)   # 0x7100156b00 ldr w8, [x0, #0x10]; cmp w8, #0; cset w0, eq
+        self.assertEqual((spec.pattern, spec.kind, spec.variant, spec.offset, spec.nbytes),
+                         ("get_cmp", "GLEAF", "u32_eq_imm_w", 0x10, 4))
+        self.assertIn("(v & 0xffffffff) == (0x0 & 0xffffffff)", spec.rust_body)
+        self.assertEqual(match(0xB9401008, 0x6B01011F, 0x1A9F17E0, RET).variant, "u32_eq_x1_w")    # 0x7100164c20
+        self.assertEqual(match(0xB9401008, 0x7100011F, 0x1A9F07E0, RET).variant, "u32_ne_imm_w")   # 0x7100162980
+        self.assertEqual(match(0xB9402028, 0x6B02011F, 0x1A9F07E0, RET).variant, "u32_ne_x2_w")    # 0x7100302df8
+        self.assertEqual(match(0xF9400808, 0xF100011F, 0x1A9F17E0, RET).variant, "u64_eq_imm_x")   # 0x71001a3800
+        self.assertEqual(match(0xF9400808, 0xEB01011F, 0x1A9F17E0, RET).variant, "u64_eq_x1_x")    # 0x710017dcc0
+        self.assertEqual(match(0xF9403008, 0xF100011F, 0x1A9F07E0, RET).variant, "u64_ne_imm_x")   # 0x710005bce4
+        self.assertIsNone(match(0xB9401008, 0x7100411F, 0x1A9F17E0, RET))   # cmp w8, #16: the selftest cannot hit equality
+        self.assertIsNone(match(0xB9401008, 0x6B03011F, 0x1A9F17E0, RET))   # cmp w8, w3: not an argument register
+        self.assertIsNone(match(0xB9400428, 0x6B01011F, 0x1A9F17E0, RET))  # ldr w8, [x1, ...] compared with w1
+        self.assertIsNone(match(0xB9401008, 0x7100011F, 0x1A9F27E0, RET))   # cset w0, hs: not an equality test
+        self.assertIsNone(match(0xB9401008, 0x7100011F, 0x9A9F17E0, RET))   # cset x0: 64-bit result
+        self.assertIsNone(match(0xB9401008, 0x3100011F, 0x1A9F17E0, RET))   # cmn w8, #0 (adds)
+        self.assertIsNone(match(0xB9801008, 0x7100011F, 0x1A9F17E0, RET))   # ldrsw: signed load
+        self.assertIsNone(match(0xB9401008, 0x7100011F, 0x1A9F17E0))        # no ret
+
+    def test_new_manifest_rows(self):
+        import generate
+        row = generate.manifest_row(0x710003f1e0, 11, match(0xBD401C00, RET))
+        self.assertEqual(row, "VLEAF(main_0011, 710003f1e0, smrpg_g_vget_710003f1e0, 1, 0, 0, 28, 4, 0)")
+        row = generate.manifest_row(0x7100171d60, 38, match(0xF9400808, 0xB9401900, RET))
+        self.assertEqual(row, "DLEAF(main_0038, 7100171d60, smrpg_g_get2_7100171d60, 0, 16, 8, 24)")
+        row = generate.manifest_row(0x71002e3158, 63, match(0xF940FC08, 0xBD400900, RET))
+        self.assertEqual(row, "VLEAF(main_0063, 71002e3158, smrpg_g_vget2_71002e3158, 4, 0, 0, 504, 8, 8)")
+        self.assertTrue(re.fullmatch(r"[SCGNVD]?LEAF\((main_[0-9]+), ([0-9a-f]+), \w+(?:, \d+)*\)", row))
+        fn = generate.rust_function(0x710003f1f0, match(0xBD001C00, RET), None)
+        self.assertIn("(a: u64, _: u64, _: u64, vlo: u64, delta: u64) -> u64", fn)
+        fn = generate.rust_function(0x7100290590, match(0x1E2703E0, RET), None)
+        self.assertIn('fn smrpg_g_vconst_7100290590(_: u64, _: u64, _: u64, _: u64, _: u64) -> u64', fn)
 
 
 if __name__ == "__main__":
