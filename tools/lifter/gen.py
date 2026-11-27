@@ -108,12 +108,23 @@ def gen_interp_switch():
     return "\n".join(out) + "\n"
 
 
+def write_if_changed(path, text):
+    """Write text only when it differs, so an unchanged header keeps its timestamp and does not force a rebuild."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    return True
+
+
 def write_all(d=GEN_DIR):
     os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "ops_gen.h"), "w") as f:
-        f.write(gen_ops_header())
-    with open(os.path.join(d, "interp_gen.inc"), "w") as f:
-        f.write(gen_interp_switch())
+    write_if_changed(os.path.join(d, "ops_gen.h"), gen_ops_header())
+    write_if_changed(os.path.join(d, "interp_gen.inc"), gen_interp_switch())
     return d
 
 

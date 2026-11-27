@@ -261,8 +261,7 @@ def write_prelude():
     import gen
     os.makedirs(GEN, exist_ok=True)
     gen.write_all(GEN)
-    with open(os.path.join(GEN, "prelude.h"), "w") as f:
-        f.write('#include "ir_ops.h"\n#include "mode_lift.h"\n#include "ops_gen.h"\n')
+    gen.write_if_changed(os.path.join(GEN, "prelude.h"), '#include "ir_ops.h"\n#include "mode_lift.h"\n#include "ops_gen.h"\n')
 
 
 def cmd_lift(a):
