@@ -48,6 +48,18 @@ unsafe extern "C" {
         regs: *const u32,
         values: *const u64,
     );
+    /// `runtime/decomp/swap.c` (task-58): the safepoint of `smrpg_guest_safepoint_n` that also flushes vector registers.
+    fn smrpg_guest_safepoint_nv(
+        x: *mut u64,
+        pc: u64,
+        count: u32,
+        regs: *const u32,
+        values: *const u64,
+        vcount: u32,
+        vregs: *const u32,
+        vlow: *const u64,
+        vhigh: *const u64,
+    );
     /// Pre-state hook only: remember the cell's value before the lifted body runs (`watch` = the port stores to it).
     fn smrpg_guest_snapshot(addr: u64, size: u32, watch: u32);
     /// The value the cell had before the lifted body ran when a replay trial is running, otherwise its live value.
@@ -83,6 +95,8 @@ pub(crate) use tests::fake_guest_bl_out as smrpg_guest_bl_out;
 pub(crate) use tests::fake_safepoint as smrpg_guest_safepoint;
 #[cfg(test)]
 pub(crate) use tests::fake_safepoint_n as smrpg_guest_safepoint_n;
+#[cfg(test)]
+pub(crate) use tests::fake_safepoint_nv as smrpg_guest_safepoint_nv;
 #[cfg(test)]
 pub(crate) use tests::fake_store as smrpg_guest_store;
 #[cfg(test)]
@@ -123,6 +137,11 @@ pub mod prestate {
     pub fn store_u32(addr: u64, value: u32) {
         unsafe { smrpg_guest_store(addr, 4, u64::from(value)) }
     }
+
+    /// An eight-byte store (a reference field), journaled the same way (task-58).
+    pub fn store_u64(addr: u64, value: u64) {
+        unsafe { smrpg_guest_store(addr, 8, value) }
+    }
 }
 
 use crate::fp::{Float32Convert, FpEnv};
@@ -158,6 +177,12 @@ impl Regs {
     pub fn v_low(&self, n: usize) -> u64 {
         assert!(n < 32);
         unsafe { self.x.add(V0 + 2 * n).read() }
+    }
+
+    /// High 64 bits of vector register `n`.
+    pub fn v_high(&self, n: usize) -> u64 {
+        assert!(n < 32);
+        unsafe { self.x.add(V0 + 2 * n + 1).read() }
     }
 
     /// Writes a float argument the way `fmov s<n>, ...` does: the other bits of the register become zero.
@@ -229,6 +254,12 @@ impl Regs {
         }) as u32)
     }
 
+    /// `fdiv` (op 1) on single-precision values, through `fp_op` (task-58).
+    pub fn f32_div(&mut self, a: f32, b: f32) -> f32 {
+        let (x, y) = (u64::from(a.to_bits()), u64::from(b.to_bits()));
+        f32::from_bits(self.fp_op(1, x, y, 0, |env| u64::from(env.fdiv32(a, b).to_bits())) as u32)
+    }
+
     /// `scvtf s, w`.
     pub fn f32_from_i32(&mut self, value: i32) -> f32 {
         let bits = u64::from(value as u32);
@@ -280,6 +311,30 @@ impl Regs {
                 flushed.len() as u32,
                 regs.as_ptr(),
                 values.as_ptr(),
+            )
+        }
+    }
+
+    /// The lifted safepoint where the code flushes registers and vector registers (`vregs` = (n, low) pairs; the
+    /// scalar float ops zero the upper half) when a collection is pending (task-58).
+    pub fn safepoint_nv(&mut self, pc: u64, flushed: &[(u32, u64)], vflushed: &[(u32, u64, u64)]) {
+        assert!(flushed.len() <= 4 && vflushed.len() <= 2);
+        let regs: [u32; 4] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.0));
+        let values: [u64; 4] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.1));
+        let vregs: [u32; 2] = core::array::from_fn(|i| vflushed.get(i).map_or(0, |f| f.0));
+        let vlow: [u64; 2] = core::array::from_fn(|i| vflushed.get(i).map_or(0, |f| f.1));
+        let vhigh: [u64; 2] = core::array::from_fn(|i| vflushed.get(i).map_or(0, |f| f.2));
+        unsafe {
+            smrpg_guest_safepoint_nv(
+                self.x,
+                pc,
+                flushed.len() as u32,
+                regs.as_ptr(),
+                values.as_ptr(),
+                vflushed.len() as u32,
+                vregs.as_ptr(),
+                vlow.as_ptr(),
+                vhigh.as_ptr(),
             )
         }
     }
@@ -372,6 +427,21 @@ pub(crate) mod tests {
         _count: u32,
         _regs: *const u32,
         _values: *const u64,
+    ) {
+        SAFEPOINTS.with(|s| s.borrow_mut().push(pc));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fake_safepoint_nv(
+        _x: *mut u64,
+        pc: u64,
+        _count: u32,
+        _regs: *const u32,
+        _values: *const u64,
+        _vcount: u32,
+        _vregs: *const u32,
+        _vlow: *const u64,
+        _vhigh: *const u64,
     ) {
         SAFEPOINTS.with(|s| s.borrow_mut().push(pc));
     }

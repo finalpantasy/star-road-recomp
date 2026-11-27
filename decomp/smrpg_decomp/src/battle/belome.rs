@@ -180,7 +180,7 @@ impl ListInt {
 }
 
 impl CharaSkillResultLogger {
-    const MULTI_NUMBER: u64 = 0x50;
+    pub(crate) const MULTI_NUMBER: u64 = 0x50;
 
     fn multi_number(self) -> Option<ListInt> {
         self.optional_field(Self::MULTI_NUMBER)
@@ -216,7 +216,7 @@ impl BattleCharacterParam {
 impl SkillExecter {
     const TARGET: u64 = 0x28;
 
-    fn target(self) -> BattleCharacterParam {
+    pub(crate) fn target(self) -> BattleCharacterParam {
         self.object_field(Self::TARGET)
     }
 }

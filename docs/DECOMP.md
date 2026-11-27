@@ -452,6 +452,65 @@ What remains for the driver, in order (call-site breakdown of the driver is in t
 2. `group_a_b` (0x7102201aa0, 390 instructions): not decoded yet; it takes the same `int&` at `x29 - 4`.
 3. The driver (613 instructions): its 29 metadata calls, 19 debug writes, 8 class initializer checks and the four formula callees. `calc_belome_barrior_ratio`, `set_acction_command_ratio` and the small tests are ported, so the driver port calls their Rust code directly (a traced call is recorded and matched; a ported callee that is reached through `smrpg_guest_bl` in `ab` mode stops the run, because it is not a traced row and not on the pure allowlist), with its snapshot hook naming the cells those ports read.
 
+## damage_calc (task-58): `calc_renkei_ratio` ported, `group_a_b` and the driver not, and what made the build slow
+
+`Battle.SkillExecter.calc_renkei_ratio(ref int damage)` (0x71021f5ed0, 284 instructions, `QLEAF`) is ported in `decomp/smrpg_decomp/src/battle/renkei.rs`
+with IL2CPP names and field offsets (`SkillExecter` +0x10 `_monitor`; `BattleCharacterParam` +0x8c `_target_counter`, +0xb8 `_result_logger`;
+`CharaSkillResultLogger` +0x2c `_number_state` (DAMAGE = 2), +0x50 `_multi_number`). It scales `damage` by skill id (0x2d2: x9/8, 0x2bd: x5/4,
+0x2c9: x6/4, 0x2ba: x8/4, each a signed divide by 8 or 4 through `add bias; asr`) and for 0x2c3 multiplies by 1.7f (`+inf` becomes `int.MinValue`),
+builds a `List<int>`, and for each of the target's hits adds `max((int)(((float)Random.Range(0, 21) * 0.01f + 0.9f) / 5f * (float)damage), 1)`.
+All float work goes through `Regs::f32_arith`, `f32_div` (new), `f32_from_i32`, `i32_from_f32_trunc` and `f32_compare` (fp.rs, each checked against
+the lifted helper in `ab` mode: 382,981 shadow checks, 0 differences in the final selftest run).
+
+What the port needed that did not exist before:
+
+- `Frame` (frame.rs) now carries vector registers (`v`, `set_s`, `call_v`, `call_out_v`, `leave_v8`: the epilogue reloads d8 and clears its upper half),
+  writes x30 at every call, and `leave` restores x19 to x29. `Regs::v_high`, `Regs::f32_div`, `Regs::safepoint_nv` and `prestate::store_u64` are new;
+  `swap.c` has `smrpg_guest_safepoint_nv` (the loop poll flushes x0, x8, x9, x22, v0, v1).
+- New traced rows in `leaves.def` (every callee of a replay row must be a row): `OLEAF 0x710213a840` `Int32.ToString` (x0 = the int's address, 4 bytes,
+  in: the slot of `damage` itself, `sp + 8` or `x29 - 4`), `OLEAF 0x7101b4fcc0` `List<int>..ctor` (x0 + 0x10, 16 bytes, out only: the port gets the header the
+  constructor wrote), `PLEAF` `String.Concat` 0x71020147d0 and 0x7102023cb0, `Object.new` 0x71000c44d0 and the write barrier 0x71000c4090.
+  `DebugMonitor.write` (0x71018bebc0), `writeLine` (0x71018bebf0) and `Math.Max` (0x710213e670) are ported `LEAF` rows on the pure allowlist, so the port calls them through the bridge.
+- The pre-state hook snapshots `damage` (the lifted body stored the result before the port reads it), `_multi_number`, `_number_state` and the class
+  initialized word. The port keeps `damage` in a local after its own stores. The class word is read from the snapshot on the first loop pass and live afterwards,
+  because the first pass may call the initializer.
+- Selftest graph in `swap.c` (`prepare_caller`, case 0x71021f5ed0): executer, target, result logger, skill object, damage cell (0 to 0x7fffffff, negatives, float-looking bit
+  patterns), 0 to 6 hits and the 32-bit extremes, a stand-in `List<int>` that `Object.new` returns, a class cell, the flag byte and the 13 metadata slots (restored after the row).
+  The caller stack of the selftest grew from 16 to 64 words: this function's frame is 0x70 bytes and the old buffer overflowed into the `leaves[]` table (the symptom was
+  "callee differs" with a huge difference count; `swap.c` now names the callee and the row).
+- `swap.c` `ON` mode counts calls of replay rows and prints `decomp on addr=... calls=...` at exit, so an `on` run shows the route reached them.
+
+Result: selftest 25,625 calls, 0 differences, 0 live differences, the A/B battle route and the task42 route 0 `decomp mismatch`. Two mutations are caught (`backlog/tasks/task-58.md`).
+
+Why the build was slow (task-57: 15 min; task-58: measured). Three separate causes, none of them in `wrap_chunk.py`:
+
+1. `flags.make` order. CMake writes one `Custom options` line per wrapped chunk into the target's `flags.make`, in the order of the `chunks` list, and every
+   object of the target depends on `flags.make`. Rows are read hand-written first, so the first hand-written row for a chunk that only had generated rows
+   moved that chunk forward, rewrote `flags.make` and rebuilt all 400+ objects. Task-57's four new chunks did this; so did task-58's first row set (a build killed
+   after 11 minutes). Fix: `list(SORT chunks)` in `game.cmake`. The set of chunks is fixed (every chunk has generated rows), so a new row in an existing chunk no longer changes `flags.make`.
+2. `gen_game/prelude.h` and `ops_gen.h`. Every lifted and wrapped chunk includes them (the depfile lists them and `runtime/rt.h`, `ir_ops.h`, `ir_simd_a.h`,
+   `ir_simd_b.h`, `mode_lift.h`). `tools/lifter/gen.py` and `build.py` rewrite them unconditionally, so any lifter `gen` or `build` run (not this task: they were
+   rewritten at 12:41 today by another run) touches both and the next `build_game.py` recompiles everything (a full rebuild with no source change: 7 min 57 s,
+   load 60 percent). Not fixed here (tools/ is not in this task's scope): the writers should rewrite only when the content changes.
+3. One wrapped chunk costs minutes. A new row in an existing chunk recompiles that 1.5 to 2.6 MB lifted C file at `-O2`: measured 225 s and 577 s for the same
+   single-chunk change (main_0262 plus `swap.c`) on a machine at 60 percent CPU load from other programs. A Rust-only change builds in 28 s. Rows therefore go in chunks that
+   have to change anyway, and one batch of rows per build.
+
+Measured builds: no-change baseline after another run touched `prelude.h` 7 min 57 s; first row set (flags order bug) killed at 11 min; first build with the sort fix
+11 min 27 s (one time: `flags.make` changed order once); `swap.c`-only 1 to 2 min; Rust-only 28 s; one row in one existing chunk 225 s to 577 s.
+
+What remains for the driver, in order (the first item is done):
+
+1. ~~`calc_renkei_ratio`~~ (this task).
+2. `group_a_b` (0x7102201aa0, 390 instructions, lazy init flag 0x7103cba000 + 0xd73 and 8 slots, the skill type `_calc_type == 0xd` branch, `damage / 2` through
+   `cinc; asr`, an enumerator loop (0x7101b52040 fills a 24 byte struct at sp, then 0x71018fe040 and 0x7100183d20 per element, a counter of the hits of `0x71021bc4b0`; the callee names are not confirmed), `Int32.ToString` and
+   `String.Concat` debug lines). Callees with no row yet: 0x71021bc4c0, 0x71021bc4b0 (`BattleCharacterParam` predicates), 0x71021be020, 0x7101b52040, 0x71018fe030, 0x71018fe040,
+   0x7100183d20, 0x71000ba3b0, 0x7101d6a050, 0x710153a0f0, 0x710153a100, 0x710153a110, 0x710003e500. The struct 0x7101b52040 writes is on the caller's stack: an `OLEAF` with x1 and 24 bytes
+   (past the 16 byte `OUT_MAX`, so raise it). It needs the same register-exact `Frame` port as renkei.
+3. The driver (613 instructions): its 29 metadata calls, 19 debug writes, 8 class initializer checks. `calc_belome_barrior_ratio`, `calc_renkei_ratio` and `set_acction_command_ratio` are
+   ported and the driver port calls their Rust code directly (a traced call is recorded and matched; a callee reached through `smrpg_guest_bl` that is neither a traced row nor on the pure
+   allowlist stops the run). Footprints it needs: belome x2 4 bytes in; renkei and `group_a_b` x1 (= `x29 - 4`) 4 bytes in; `Single.ToString` x0 (= sp + 8) 4 bytes in.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

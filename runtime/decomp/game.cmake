@@ -57,6 +57,11 @@ foreach(row IN LISTS rows)
   list(APPEND chunks "${CMAKE_MATCH_1}")
 endforeach()
 list(REMOVE_DUPLICATES chunks)
+# Sorted (task-58): CMake writes one "Custom options" line per wrapped chunk into flags.make, in this list's order, and every
+# object of the target depends on flags.make. Rows come hand-written first, so the first hand-written row for a chunk that
+# had only generated rows moved it forward, rewrote flags.make and rebuilt all 400+ objects (task-57: 15 min, task-58 measured
+# the same). A sorted list does not change when a row is added to a chunk that already has rows.
+list(SORT chunks)
 foreach(chunk IN LISTS chunks)
   set(original "${SMRPG_WORK}/build/c/${chunk}.c")
   set(wrapped "${CMAKE_CURRENT_BINARY_DIR}/${chunk}_decomp.c")

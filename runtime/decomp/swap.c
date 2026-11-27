@@ -319,11 +319,13 @@ static void stub_callee(Ctx *c) {
 }
 
 static __thread uint64_t tl_stub_instance;   /* selftest: what the stand-in GlobalWork.get_inst returns (a fake object, never a random word) */
+static __thread uint64_t tl_stub_new;        /* selftest (task-58): what the stand-in Object.new (0x71000c44d0) returns: a fake List<int> */
 
 static void run_traced(Leaf *leaf, Ctx *c) {
     if (tl_stub) {
         stub_callee(c);
         if (leaf->address == 0x7101886a00ULL && tl_stub_instance) c->x[0] = tl_stub_instance;
+        if (leaf->address == 0x71000c44d0ULL && tl_stub_new) c->x[0] = tl_stub_new;
     } else {
         leaf->lifted(c);
     }
@@ -479,8 +481,10 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
         return;
     }
     if (mode == OFF) leaf->lifted(c);
-    else if (mode == ON) run_rust(leaf, c);
-    else compare(leaf, c);
+    else if (mode == ON) {
+        if (leaf->rust_regs) atomic_fetch_add(&leaf->calls, 1);   /* task-58: live counts of the replay and bridge rows in `on` mode (evidence the route reached them) */
+        run_rust(leaf, c);
+    } else compare(leaf, c);
 }
 
 #define LEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
@@ -666,6 +670,18 @@ void smrpg_guest_safepoint_n(uint64_t *x, uint64_t pc, uint32_t count, const uin
     }
 }
 
+/* The same where the lifted code also flushes vector registers (task-58: calc_renkei_ratio's loop poll flushes v0 and v1). */
+void smrpg_guest_safepoint_nv(uint64_t *x, uint64_t pc, uint32_t count, const uint32_t *regs, const uint64_t *values, uint32_t vcount,
+                              const uint32_t *vregs, const uint64_t *vlow, const uint64_t *vhigh) {
+    Ctx *c = (Ctx *)(void *)x;
+    if (__builtin_expect(g_gc_pending != 0, 0)) {
+        for (uint32_t i = 0; i < count; ++i) c->x[regs[i]] = values[i];
+        for (uint32_t i = 0; i < vcount; ++i) { c->v[vregs[i]][0] = (long long)vlow[i]; c->v[vregs[i]][1] = (long long)vhigh[i]; }
+        c->pc = pc;
+        if (!tl_replay) gc_poll(c);
+    }
+}
+
 static uint64_t random_word(uint64_t *state) {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -758,6 +774,21 @@ static void restore_attack_globals(void) {
  * into a private region and puts the originals back afterwards. */
 static uint64_t belome_saved[4];
 static int belome_have_saved;
+/* calc_renkei_ratio (task-58): the flag byte and the 13 metadata slots (data page + offset), restored after its selftest. */
+static const uint64_t renkei_slot_address[13] = {
+    0x7103a4d000ULL + 0x788, 0x7103a4d000ULL + 0x700, 0x7103a4d000ULL + 0x6f8, 0x7103a46000ULL + 0xa90,
+    0x7103a83000ULL + 0x520, 0x7103a83000ULL + 0x528, 0x7103a83000ULL + 0x530, 0x7103a83000ULL + 0x538, 0x7103a83000ULL + 0x540,
+    0x7103a83000ULL + 0x548, 0x7103a83000ULL + 0x550, 0x7103a83000ULL + 0x558, 0x7103a83000ULL + 0x560};
+static uint64_t renkei_saved[14];
+static int renkei_have_saved;
+static void restore_renkei_globals(void) {
+    if (!renkei_have_saved) return;
+    *(volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5e) = (uint8_t)renkei_saved[0];
+    for (int i = 0; i < 13; ++i) *(uint64_t *)(uintptr_t)renkei_slot_address[i] = renkei_saved[1 + i];
+    renkei_have_saved = 0;
+    tl_stub_new = 0;
+}
+
 static void restore_belome_globals(void) {
     if (!belome_have_saved) return;
     *(volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5d) = (uint8_t)belome_saved[0];
@@ -775,8 +806,8 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
     uint64_t base = (uint64_t)(uintptr_t)fake;
     /* The lifted prologue pushes x29 and x30 below sp, so sp must be a real 16-byte aligned stack. The Rust
      * body has no stack; those bytes are dead once the function returns and are not compared. */
-    static _Alignas(16) uint64_t stack[16];
-    c->x[31] = (uint64_t)(uintptr_t)&stack[8];
+    static _Alignas(16) uint64_t stack[64];   /* task-58: calc_renkei_ratio's frame is 0x70 bytes, the old 16 words overflowed it */
+    c->x[31] = (uint64_t)(uintptr_t)&stack[40];
     switch (address) {
     case 0x71005b3d70ULL:   /* x0 + (int)x1 * 8 + 0x20 is loaded: keep it inside the 64 words */
         fill_fake_region(fake, 64, state);
@@ -959,6 +990,54 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->x[2] = rb + 8 * 240;                                /* the ratio cell */
         break;
     }
+    case 0x71021f5ed0ULL: { /* Battle.SkillExecter.calc_renkei_ratio (task-58): the executer (+0x10 monitor, +0x28 target, +0x30 skill object), the target
+                             * (+0x8c hit counter, +0xb8 result logger with +0x2c state and +0x50 list), the skill object (+0x14 id), the damage cell,
+                             * the stand-in List<int> that Object.new returns, a class cell with its initialized word (+0xe0), the flag byte and
+                             * the 13 metadata slots, pointed at private cells and restored after the row. */
+        static uint64_t region[256];
+        volatile uint8_t *flag = (volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5e);
+        if (!renkei_have_saved) {
+            renkei_saved[0] = *flag;
+            for (int i = 0; i < 13; ++i) renkei_saved[1 + i] = *(uint64_t *)(uintptr_t)renkei_slot_address[i];
+            renkei_have_saved = 1;
+        }
+        fill_fake_region(region, 256, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        uint64_t r;
+        uint32_t v;
+        #define WORD(n) (rb + 8 * (n))
+        region[2] = WORD(220);                                  /* executer +0x10 _monitor */
+        region[5] = WORD(24);                                   /* +0x28 _target */
+        region[6] = WORD(70);                                   /* +0x30 _skill_obj */
+        static const uint32_t counters[] = {0, 1, 1, 2, 3, 4, 6, 0xffffffffu, 0x80000000u};
+        v = counters[(pick >> 8) % RT_ARRAY_LEN(counters)]; memcpy(bytes + 8 * 24 + 0x8c, &v, 4);   /* target _target_counter */
+        region[24 + 0xb8 / 8] = WORD(48);                       /* target +0xb8 _result_logger */
+        region[48 + 0x50 / 8] = WORD(60);                       /* logger +0x50 _multi_number (the row replaces it) */
+        region[100 + 2] = WORD(104);                            /* the stand-in List<int>: +0x10 _items */
+        memcpy(bytes + 8 * 100 + 0x18, &(uint32_t){0}, 4);
+        static const uint32_t skill_ids[] = {0x2ba, 0x2bd, 0x2c3, 0x2c3, 0x2c3, 0x2c9, 0x2d2, 0x2b9, 0x2bb, 0x2bc, 0x2be, 0x2c2, 0x2c4, 0x2c8, 0x2ca,
+                                             0x2d1, 0x2d3, 0, 1, 0x7fffffffu, 0x80000000u, 0xffffffffu, 0x100};
+        r = random_word(state);
+        v = (r & 7) == 0 ? (uint32_t)(r >> 8) % 0x300 : skill_ids[(r >> 8) % RT_ARRAY_LEN(skill_ids)]; memcpy(bytes + 8 * 70 + 0x14, &v, 4);
+        static const uint32_t damages[] = {0, 1, 7, 8, 9, 100, 9999, 0xffffffffu, 0xfffffff9u, 0xfffffff8u, 0x7fffffffu, 0x80000000u, 0x20000000u,
+                                           0x40000000u, 0x1fffffffu, 0x10000000u, 0x3f800000u, 0x7f800000u, 0x4b800000u, 0x3b000000u};
+        r = random_word(state);
+        v = (r & 7) == 0 ? (uint32_t)(r >> 8) : damages[(r >> 8) % RT_ARRAY_LEN(damages)]; memcpy(bytes + 8 * 200, &v, 4);   /* the damage cell */
+        v = ((pick >> 20) & 3) == 0 ? 0 : (uint32_t)(r = random_word(state)) | 1; memcpy(bytes + 8 * 122 + 0xe0, &v, 4);   /* class initialized word */
+        region[120] = WORD(122);                                /* the class cell holds the class pointer */
+        for (unsigned i = 0; i < 13; ++i) {                     /* every metadata slot points at a cell whose first word is another pointer */
+            region[160 + i] = WORD(180 + i);
+            *(uint64_t *)(uintptr_t)renkei_slot_address[i] = WORD(160 + i);
+        }
+        *(uint64_t *)(uintptr_t)renkei_slot_address[3] = WORD(120);   /* the class slot */
+        *flag = ((pick >> 24) & 15) == 0 ? 0 : 1;               /* lazy initialization pending one time in sixteen */
+        tl_stub_new = WORD(100);
+        #undef WORD
+        c->x[0] = rb;                                           /* the executer */
+        c->x[1] = rb + 8 * 200;                                 /* the damage cell */
+        break;
+    }
     case 0x71021f7ea0ULL: { /* Battle.SkillExecter.set_acction_command_ratio (task-56): +0x18 result record, +0x20 acter param (+0x6c _is_player),
                              * +0x30 skill object (+0x14 _skill_id). Every skill id of the 129 entry table and its neighbors, enemy and player. */
         fill_fake_region(fake, 64, state);
@@ -1116,13 +1195,18 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     }
     for (int i = 0; is_caller && i < leaf_count; ++i) {
         if (&leaves[i] == leaf) continue;
-        if (atomic_load(&leaves[i].differences) != saved_differences[i]) rt_exit(10, "decomp selftest: callee differs");
+        if (atomic_load(&leaves[i].differences) != saved_differences[i]) {
+            rt_log("decomp selftest: callee %#llx differs while testing %#llx (%llu new differences)", (unsigned long long)leaves[i].address,
+                   (unsigned long long)leaf->address, (unsigned long long)(atomic_load(&leaves[i].differences) - saved_differences[i]));
+            rt_exit(10, "decomp selftest: callee differs");
+        }
         atomic_store(&leaves[i].calls, saved_calls[i]);
     }
     if (stores && !stores_seen) rt_exit(10, "decomp selftest: store leaf never wrote");
     tl_stub = 0;
     restore_attack_globals();
     restore_belome_globals();
+    restore_renkei_globals();
     atomic_store(&leaf->deferred, 0);
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);
@@ -1155,6 +1239,11 @@ void decomp_start(void) {
 }
 
 void decomp_summary(void) {
+    if (mode == ON) {
+        for (int i = 0; i < leaf_count; ++i)
+            if (leaves[i].rust_regs) rt_log("decomp on addr=%#llx calls=%llu", (unsigned long long)leaves[i].address, atomic_load(&leaves[i].calls));
+        return;
+    }
     if (mode != AB) return;
     decomp_fp_shadow_summary();
     for (int i = 0; i < leaf_count; ++i) {
