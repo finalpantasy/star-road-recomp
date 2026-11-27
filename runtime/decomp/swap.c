@@ -218,11 +218,13 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     /* A caller's lifted body goes through the other leaves' wrappers, which count calls and differences.
      * Keep those counters as they were so only real game calls reach the live summary; any difference a
      * callee finds during this selftest is a failure. */
-    unsigned long long saved_calls[leaf_count], saved_differences[leaf_count];
-    for (int i = 0; i < leaf_count; ++i) {
-        saved_calls[i] = atomic_load(&leaves[i].calls);
-        saved_differences[i] = atomic_load(&leaves[i].differences);
-    }
+    static unsigned long long saved_calls[leaf_count], saved_differences[leaf_count];   /* static: thousands of rows */
+    const int is_caller = leaf->rust_regs != 0;   /* only a caller's lifted body reaches other leaves' wrappers */
+    if (is_caller)
+        for (int i = 0; i < leaf_count; ++i) {
+            saved_calls[i] = atomic_load(&leaves[i].calls);
+            saved_differences[i] = atomic_load(&leaves[i].differences);
+        }
     uint64_t seed = leaf->address;
     uint64_t fake[64];
     unsigned long long stores_seen = 0;   /* runs where the footprint changed, so a no-op pair cannot pass */
@@ -272,7 +274,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
         }
         entry(&c);
     }
-    for (int i = 0; i < leaf_count; ++i) {
+    for (int i = 0; is_caller && i < leaf_count; ++i) {
         if (&leaves[i] == leaf) continue;
         if (atomic_load(&leaves[i].differences) != saved_differences[i]) rt_exit(10, "decomp selftest: callee differs");
         atomic_store(&leaves[i].calls, saved_calls[i]);

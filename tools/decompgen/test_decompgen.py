@@ -65,6 +65,27 @@ class Matcher(unittest.TestCase):
         self.assertIsNone(match(0xB9000408, RET))   # str w8, [x0, #4]: value from a scratch register
         self.assertIsNone(match(0x2D000401, RET))   # stp s1, s1, [x0]: vector pair
 
+    def test_set_bool(self):
+        spec = match(0x12000028, 0x39010008, RET)   # and w8, w1, #1; strb w8, [x0, #0x40]; ret
+        self.assertEqual((spec.pattern, spec.variant, spec.kind, spec.base_reg, spec.offset, spec.nbytes),
+                         ("set_bool", "w8", "SLEAF", 0, 0x40, 1))
+        self.assertEqual(spec.rust_body, "unsafe { store_low_bit(a.wrapping_add(delta).wrapping_add(0x40), b) };\na")
+        self.assertEqual(match(0x12000049, 0x39000409, RET).rust_body,       # and w9, w2, #1; strb w9, [x0, #1]
+                         "unsafe { store_low_bit(a.wrapping_add(delta).wrapping_add(0x1), c) };\na")
+        self.assertIsNone(match(0x12000028, 0x39004009, RET))   # strb stores w9, not the masked w8
+        self.assertIsNone(match(0x12000428, 0x39004008, RET))   # and w8, w1, #3: a wider mask
+        self.assertIsNone(match(0x92400028, 0x39004008, RET))   # and x8, x1, #1: 64-bit form
+        self.assertIsNone(match(0x72000028, 0x39004008, RET))   # ands: sets flags
+        self.assertIsNone(match(0x12000020, 0x39004000, RET))   # and w0, w1, #1: dest is x0 (the argument)
+        self.assertIsNone(match(0x12000028, 0x79004008, RET))   # strh stores 16 bits
+        self.assertIsNone(match(0x12000028, 0x38010C08, RET))   # strb w8, [x0, #16]! (write-back)
+        self.assertIsNone(match(0x12000028, 0x39004008))        # no ret
+        self.assertIsNone(match(0x12000068, 0x39004008, RET))   # and w8, w3, #1: source is not an argument
+        import generate
+        row = generate.manifest_row(0x71002cdf10, 63, spec)
+        self.assertEqual(row, "SLEAF(main_0063, 71002cdf10, smrpg_g_set_bool_71002cdf10, 0, 64, 1)")
+        self.assertIn("(a: u64, b: u64, _: u64, delta: u64)", generate.rust_function(0x71002cdf10, spec, None))
+
     def test_constants(self):
         self.assertEqual(match(0x52800020, RET).rust_body, "0x1")                   # mov w0, #1
         self.assertEqual(match(0x52824680, 0x72AACF00, RET).rust_body, "0x56781234")   # movz + movk lsl 16

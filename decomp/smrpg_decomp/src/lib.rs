@@ -276,6 +276,18 @@ unsafe fn guest_st16(addr: u64, value: u16) {
     }
 }
 
+/// Boolean setter body (task-46): `and w8, w<src>, #1; strb w8, [x<base>, #offset]` stores the low bit of `src`.
+/// `addr` already includes the store delta of the A/B shadow comparison. The original also leaves the low bit in
+/// x8, which the lifted reference never writes back (see tools/decompgen/patterns.py set_bool).
+///
+/// # Safety
+/// `addr` must be a mapped guest address.
+#[inline(always)]
+#[allow(dead_code)]
+unsafe fn store_low_bit(addr: u64, src: u64) {
+    unsafe { guest_st8(addr, (src & 1) as u8) }
+}
+
 // The bulk-generated functions (python -I tools/decompgen/generate.py). They derive from the game binary, so
 // the file lives on A: and build.rs finds it (SMRPG_DECOMPGEN_DIR). Without it the crate builds without them.
 #[cfg(smrpg_gen)]
@@ -385,6 +397,33 @@ mod tests {
             };
         }
         words
+    }
+
+    #[test]
+    fn store_low_bit_matches_reference() {
+        for seed in 1..200 {
+            let m = region(seed);
+            let base = m.as_ptr() as u64;
+            for value in [
+                0u64,
+                1,
+                2,
+                3,
+                0xffff_ffff_ffff_fffe,
+                u64::MAX,
+                seed,
+                seed << 33 | 1,
+            ] {
+                let before = m;
+                unsafe { store_low_bit(base + 0x10, value) };
+                let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 512) };
+                let old = unsafe { core::slice::from_raw_parts(before.as_ptr() as *const u8, 512) };
+                assert_eq!(bytes[0x10], (value & 1) as u8);
+                for i in (0..512).filter(|&i| i != 0x10) {
+                    assert_eq!(bytes[i], old[i]);
+                }
+            }
+        }
     }
 
     #[test]

@@ -13,6 +13,8 @@ default output directory is on A: next to the lifted chunks and the build pulls 
 
   python -I tools/decompgen/generate.py                 # top 300 by direct call sites, at most 12 lifted chunks
   python -I tools/decompgen/generate.py --limit 1000 --max-chunks 40
+  python -I tools/decompgen/generate.py --limit 100000 --max-chunks 0   # every match (task-46)
+  python -I tools/decompgen/generate.py --limit 100000 --max-chunks 0 --chunks 0:40   # staged build: chunks 0 to 39 only
   python -I tools/decompgen/generate.py --stats-only    # counts only, writes only the report
 """
 import argparse
@@ -178,6 +180,10 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--limit", type=int, default=300, help="functions to generate, by direct call sites")
     ap.add_argument("--max-chunks", type=int, default=12, help="at most this many lifted chunks (0 = no cap)")
+    ap.add_argument("--chunks", default="", metavar="LO:HI",
+                    help="write only functions in lifted chunks LO <= n < HI (staged builds, task-46); counts stay global")
+    ap.add_argument("--exclude-chunks", default="", metavar="N,N",
+                    help="never write functions of these lifted chunks (a chunk whose rebuild is too slow, task-46)")
     ap.add_argument("--stats-only", action="store_true")
     a = ap.parse_args()
 
@@ -189,6 +195,12 @@ def main():
     cache = {}
     manual = hand_written()
     ok = [f for f in found if f[0] not in manual and chunk_has_definition(f[0], f[1], cache)]
+    if a.chunks:
+        lo, hi = (int(x) for x in a.chunks.split(":"))
+        ok = [f for f in ok if lo <= f[1] < hi]
+    if a.exclude_chunks:
+        skip = {int(x) for x in a.exclude_chunks.split(",")}
+        ok = [f for f in ok if f[1] not in skip]
     chosen = pick(ok, sites, a.limit, a.max_chunks)
     chosen_counts = collections.Counter(s.pattern for _p, _c, s in chosen)
     chunks = sorted({c for _p, c, _s in chosen})

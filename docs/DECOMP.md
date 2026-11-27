@@ -1,6 +1,6 @@
 # Rust function swaps
 
-The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports twenty-eight functions through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4, task-43 batch 5, task-44 batch 6). The first twenty-three are leaves: each takes guest x0 to x2 as u64 and returns the new x0. The last five call other leaves (see "Functions that call ported leaves") and edit the guest register file in place. The crate has no dependencies. Task-45 adds up to 300 more, generated in bulk (see "Bulk generator").
+The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports twenty-eight functions through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4, task-43 batch 5, task-44 batch 6). The first twenty-three are leaves: each takes guest x0 to x2 as u64 and returns the new x0. The last five call other leaves (see "Functions that call ported leaves") and edit the guest register file in place. The crate has no dependencies. Task-45 adds up to 300 more and task-46 up to 3,778 more, generated in bulk (see "Bulk generator").
 
 | Guest address | IL2CPP method |
 |---|---|
@@ -59,7 +59,7 @@ What `ab` compares (`compare` in `runtime/decomp/swap.c`): Rust runs on a copy o
 
 Selftest: each caller gets a private fake region and a private 16-byte aligned fake stack (`prepare_caller` in `swap.c`), with a pending exception cleared (`c.exc = 0`, lifted callers return early otherwise). The shape per function: array index and element address inside the region, a null or valid object-to-field chain, w1 at and around 0x81d and 0x7f8 to 0x7fb, an object whose +0x10 word equals x1 half the time. Callee counters are restored after each caller selftest, and a difference found in a callee fails the run, so selftest calls never count as live calls.
 
-## Bulk generator (task-45)
+## Bulk generator (task-45, task-46)
 
 `tools/decompgen/` ports exact trivial-function shapes in bulk. `python -I tools/decompgen/generate.py` reads every main-module function of at most five instructions (the lifter's inventory and decoder, `tools/lifter/dec.py`), matches a closed pattern set (`patterns.py`) and ranks the matches by direct call sites (`bl` and `b` to the entry). Anything that is not the exact shape is skipped. Patterns, each with one Rust template:
 
@@ -72,8 +72,9 @@ Selftest: each caller gets a private fake region and a private 16-byte aligned f
 | set | `str`, `strb`, `strh` of x0..x2 or the zero register to `[x0..x2, #imm]`, then `ret` (no barrier, no call) | SLEAF |
 | add_imm | `add` or `sub` x0 or w0, `x0..x2`, `#imm` without flags, then `ret` | LEAF |
 | mov_reg | `orr x0 or w0, xzr, x1 or x2`, then `ret` | LEAF |
+| set_bool | `and wT, wS, #1; strb wT, [xN, #imm]; ret` (T a scratch register 3..28, S and N 0..2) | SLEAF |
 
-Not matched on purpose: write-back or register-offset addressing, vector registers (float getters and setters), flag-setting instructions, a second written register (`and w8, w1, #1; strb w8, ...` also writes x8 and needs a register-file row with a store shadow), anything with a call or branch other than the null check. The semantic proof of each template is the A/B selftest against the lifted C for every generated function: sign and zero extension, w against x writes clearing the upper half, and the byte, halfword, word and doubleword store widths are all compared byte for byte over the whole register context. `python -I tools/decompgen/test_decompgen.py` pins which instruction words are accepted and which near misses are refused.
+Not matched on purpose: write-back or register-offset addressing, vector registers (float getters and setters), flag-setting instructions, anything with a call or branch other than the null check. The semantic proof of each template is the A/B selftest against the lifted C for every generated function: sign and zero extension, w against x writes clearing the upper half, and the byte, halfword, word and doubleword store widths are all compared byte for byte over the whole register context. The boolean setter (task-46) also leaves the low bit in x8. The lifted reference never exposes it: at `ret` the lifter flushes only x0..x7 and x19..x29 to the context (`MASK_RET` in `tools/lifter/lift.py`), so x8 is a dead scratch register, and a first version that wrote x8 through a register-file row was caught by the whole-context selftest (`regs=1`). The port is a plain store of the low bit with the ordinary `SLEAF` store shadow; the whole context stays compared. `python -I tools/decompgen/test_decompgen.py` pins which instruction words are accepted and which near misses are refused.
 
 New row kinds in the manifest: `GLEAF(chunk, address, symbol, base_reg, offset, bytes)` and `NLEAF(...)` (null-safe) declare loads. They call like `LEAF`; the selftest points `x[base_reg] + offset` into a private fake region (NLEAF also passes null one time in eight). Generated stores reuse `SLEAF` with its shadow comparison. `swap.c`, `game.cmake`, `wrap_chunk.py` and `check_log.py` read the hand-written rows from `leaves.def` followed by the generated rows (`game.cmake` concatenates them into `manifest.def` in the build directory and rewrites it only when the text changes).
 
@@ -83,10 +84,14 @@ Where the output lives: `A:\AI\Recomps\smrpg-work\decompgen\` (`gen.rs`, `gen.de
 python -I tools/decompgen/generate.py --stats-only            # counts only
 python -I tools/decompgen/generate.py                          # default: top 300 by call sites, at most 12 lifted chunks
 python -I tools/decompgen/generate.py --limit 1000 --max-chunks 40
+python -I tools/decompgen/generate.py --limit 100000 --max-chunks 0   # every match (12,032 functions in 351 chunks)
+python -I tools/decompgen/generate.py --limit 100000 --max-chunks 120 --chunks 0:200 --exclude-chunks 169   # the task-46 built set
 python -I runtime/decomp/check_log.py --summary A:/AI/Recomps/smrpg-work/build/logs/task45_ab.log
 ```
 
-The cap on lifted chunks exists because the build recompiles every chunk that holds a swapped function (about 3 MB of C each); 300 functions spread over all chunks would rebuild most of the 393. `--max-chunks 0` removes the cap. Functions already in `leaves.def` are excluded. `check_log.py --summary` keeps the selftest and mismatch checks for every row but reports live against selftest-only counts instead of failing on a function the run never called.
+The cap on lifted chunks exists because the build recompiles every chunk that holds a swapped function (about 3 MB of C each); 300 functions spread over all chunks would rebuild most of the 393. `--max-chunks 0` removes the cap. `--chunks LO:HI` keeps only chunks LO to HI-1 and `--exclude-chunks N,N` drops chunks (counts in the report stay global); `wrap_chunk.py` leaves an unchanged wrapped file alone, so a build after a manifest change only recompiles the chunks that really changed. Functions already in `leaves.def` are excluded. `check_log.py --summary` keeps the selftest and mismatch checks for every row but reports live against selftest-only counts instead of failing on a function the run never called.
+
+Build cost (task-46, `-j 16`, BelowNormal). Compiling a wrapped chunk takes seconds to minutes (main_0169, 7.3 MB of C, ran past 8 minutes at -O2 and was killed), but the dominant cost is the final link: every wrapped chunk object adds about 4.5 MB to `smrpg.exe` (437 MB with 15 chunks, 1.13 GB with 185) and linking that took 9 minutes. A full set of 351 chunks cannot be linked inside the 10 minute limit, so the built set is the 120 best chunks (by functions plus call sites) of chunks 0 to 199 without main_0169: 3,778 of the 12,032 generated functions (the other 8,254 stay lifted; their Rust is generated and type-checked, not linked). Link time, not compile time, is the cap to attack next (for example a split link or less debug info), not the generator. The selftest cost is about 4 ms per row (3,806 rows in 15.3 s), so all 12,032 would take about 50 s; the selftest runs only with `SMRPG_DECOMP=ab` and `SMRPG_DECOMP_SELFTEST=1`, never in the default `on` mode (`on` starts in 0.35 s with 3,806 rows registered).
 
 ## Reproduce the comparison
 

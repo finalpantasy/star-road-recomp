@@ -10,7 +10,8 @@ A/B compare of the whole register context stays valid.
 """
 from collections import namedtuple
 
-# kind: LEAF (registers only), GLEAF (load, x[base] + offset), NLEAF (null-safe load), SLEAF (store).
+# kind: LEAF (registers only), GLEAF (load, x[base] + offset), NLEAF (null-safe load), SLEAF (store),
+# (the boolean setter's scratch register x8 is not part of the lifted reference's output, see set_bool).
 Spec = namedtuple("Spec", "pattern variant kind rust_body base_reg offset nbytes")
 
 ARGS = "abc"                       # Rust parameter names for guest x0..x2
@@ -136,6 +137,26 @@ def setter(insns, pc):
     return Spec("set", variant, "SLEAF", body, i["rn"], i["imm"], n)
 
 
+def set_bool(insns, pc):
+    """and wT, wS, #1; strb wT, [xN, #imm]; ret (S, N = 0..2, T = a scratch register 3..28, usually w8).
+
+    The original also leaves x[T] = x[S] & 1. The lifted reference does not expose it: at `ret` the lifter flushes
+    only x0..x7 and x19..x29 to the context (lifter MASK_RET), so x8 is a dead scratch register by the same ABI
+    assumption as every other lifted function, and the whole-context A/B compare passes with x8 untouched. The
+    port is therefore a plain store of the low bit (SLEAF, store shadow); writing x8 would be a real difference
+    (it was tried first and the selftest caught it)."""
+    if len(insns) != 3 or not _is_ret(insns[2]):
+        return None
+    a, s = insns[0], insns[1]
+    if a["op"] != "log_imm" or (a["sf"], a["opc"], a["imm"]) != (0, 0, 1) or a["rn"] > 2 or not 3 <= a["rd"] <= 28:
+        return None
+    if not _plain_mem(s, "str") or s["nbytes"] != 1 or s["rt"] != a["rd"]:
+        return None
+    body = "unsafe { store_low_bit(%s.wrapping_add(delta).wrapping_add(%s), %s) };\na" % (
+        ARGS[s["rn"]], _hex(s["imm"]), ARGS[a["rn"]])
+    return Spec("set_bool", "w%d" % a["rd"], "SLEAF", body, s["rn"], s["imm"], 1)
+
+
 def add_imm(insns, pc):
     """add or sub x0/w0, xN/wN, #imm (no flags); ret. A field address."""
     if len(insns) != 2 or not _is_ret(insns[1]):
@@ -167,8 +188,8 @@ def mov_reg(insns, pc):
 
 
 # The shapes are disjoint (different lengths or instruction kinds), so the order does not matter.
-PATTERNS = [empty, const_return, getter, nullsafe_getter, setter, add_imm, mov_reg]
-FAMILIES = ["empty", "const", "get", "get_nullsafe", "set", "add_imm", "mov_reg"]
+PATTERNS = [empty, const_return, getter, nullsafe_getter, setter, set_bool, add_imm, mov_reg]
+FAMILIES = ["empty", "const", "get", "get_nullsafe", "set", "set_bool", "add_imm", "mov_reg"]
 
 
 def match(insns, pc):
