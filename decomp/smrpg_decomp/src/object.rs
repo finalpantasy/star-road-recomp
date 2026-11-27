@@ -75,3 +75,27 @@ macro_rules! guest_class {
     };
 }
 pub(crate) use guest_class;
+
+guest_class!(
+    /// A managed `int[]`: the length at +0x18, the elements from +0x20 (task-54).
+    Int32Array
+);
+
+impl Int32Array {
+    const LENGTH: u64 = 0x18;
+    const ELEMENTS: u64 = 0x20;
+
+    /// The `Length` word. The compiled code compares it as an unsigned 32-bit value.
+    pub fn len(self) -> u32 {
+        self.u32_field(Self::LENGTH)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Element `index`, read without a bounds test: the caller has compared `index` with `len()` itself.
+    pub fn element(self, index: u64) -> i32 {
+        self.i32_field(Self::ELEMENTS + 4 * index)
+    }
+}

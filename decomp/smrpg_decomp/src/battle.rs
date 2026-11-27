@@ -6,8 +6,8 @@
 //! and reproduce the register residue the lifted code leaves behind (see docs/DECOMP.md, "Readable ports").
 
 use crate::bridge::{GuestException, Regs};
-use crate::fp::Float32Ops;
-use crate::object::{GuestObject, guest_class};
+use crate::fp::{Float32Convert, Float32Ops, Nzcv};
+use crate::object::{GuestObject, Int32Array, guest_class};
 use crate::unity::{Camera, DEG2RAD, Quaternion, Transform, Vector3};
 
 /// `Battle.BadStatusManager.BadStatusKind`, the raw 32-bit value (the game stores any int, so no Rust enum).
@@ -880,22 +880,13 @@ impl LiftedCamera {
 
 impl Float32Ops for LiftedCamera {
     fn fadd(&mut self, a: f32, b: f32) -> f32 {
-        let mut env = self.regs.fp_env();
-        let r = env.fadd32(a, b);
-        self.regs.set_fpsr(env.fpsr);
-        r
+        self.regs.f32_arith(2, a, b)
     }
     fn fsub(&mut self, a: f32, b: f32) -> f32 {
-        let mut env = self.regs.fp_env();
-        let r = env.fsub32(a, b);
-        self.regs.set_fpsr(env.fpsr);
-        r
+        self.regs.f32_arith(3, a, b)
     }
     fn fmul(&mut self, a: f32, b: f32) -> f32 {
-        let mut env = self.regs.fp_env();
-        let r = env.fmul32(a, b);
-        self.regs.set_fpsr(env.fpsr);
-        r
+        self.regs.f32_arith(0, a, b)
     }
 }
 
@@ -1035,6 +1026,297 @@ pub unsafe extern "C" fn smrpg_camera_adjust_camera_transform(x: *mut u64) {
         let regs = Regs::from_raw(x);
         let camera = BattleCamera::at(regs.x(0));
         let _ = camera.adjust_camera_transform(&mut LiftedCamera::new(regs));
+    }
+}
+
+// ---- BattleCharacterParam.get_calc_defence and get_calc_magic_defence (task-54) ----
+//
+// The defence stat the damage code reads: the base stat plus the buff manager's added status, and for a player
+// character scaled by the buff manager's ratio. Live in a battle (see backlog/tasks/task-54.md for the counts).
+
+impl BuffManager {
+    const ADD_STATUS: u64 = 0x18;
+
+    /// `_add_status`: the added status values, one per stat (1 is defence, 3 is magic defence).
+    pub fn add_status(self) -> Int32Array {
+        self.object_field(Self::ADD_STATUS)
+    }
+}
+
+impl BattleCharacterParam {
+    const DEFENCE: u64 = 0x40;
+    const MAGIC_DEFENCE: u64 = 0x48;
+    const IS_PLAYER: u64 = 0x6c;
+
+    /// `_is_player`, the raw byte (the compiled code passes it on as it is).
+    pub fn is_player_byte(self) -> u8 {
+        self.u8_field(Self::IS_PLAYER)
+    }
+}
+
+/// Which of the two methods: they have the same shape and differ in the stat, the `_add_status` index, the
+/// buff manager ratio method and the code addresses the shim needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefenceStat {
+    /// `get_calc_defence` (0x71021bc270)
+    Physical,
+    /// `get_calc_magic_defence` (0x71021bc440)
+    Magic,
+}
+
+impl DefenceStat {
+    fn base_offset(self) -> u64 {
+        match self {
+            Self::Physical => BattleCharacterParam::DEFENCE,
+            Self::Magic => BattleCharacterParam::MAGIC_DEFENCE,
+        }
+    }
+
+    /// Index into `_add_status`.
+    fn add_status_index(self) -> u64 {
+        match self {
+            Self::Physical => 1,
+            Self::Magic => 3,
+        }
+    }
+}
+
+/// The values the method has loaded when it calls the buff manager (the compiled code keeps them in registers).
+#[derive(Clone, Copy, Debug)]
+pub struct ScaleSite {
+    pub buff: BuffManager,
+    pub is_player_byte: u8,
+    pub base: i32,
+    pub added: i32,
+    pub sum: i32,
+}
+
+/// The game functions the two methods call, and the float arithmetic of `(int)(sum * ratio)`.
+pub trait StatCalls: Float32Convert {
+    /// `BuffManager.defense_up_ratio` (0x71021c4240) or `magic_defense_up_ratio` (0x71021c4560).
+    fn defense_up_ratio(
+        &mut self,
+        stat: DefenceStat,
+        site: ScaleSite,
+    ) -> Result<f32, GuestException>;
+    /// The `IndexOutOfRangeException` throw (0x71000c4510): `_add_status` is too short. Always an exception.
+    fn throw_index_out_of_range(
+        &mut self,
+        stat: DefenceStat,
+        param: BattleCharacterParam,
+        buff: BuffManager,
+        array: Int32Array,
+        length: u32,
+    ) -> GuestException;
+    /// Return `result`.
+    fn leave(&mut self, result: i32);
+}
+
+/// C#'s `(int)(value * ratio)` as the compiled code does it: the float product, converted toward zero with
+/// saturation, except that a product of exactly +infinity gives `int.MinValue` (the x86 result of the cast).
+fn scale_by_ratio<F: Float32Convert>(value: i32, ratio: f32, f: &mut F) -> i32 {
+    let value_as_float = f.float_from_i32(value);
+    let product = f.fmul(ratio, value_as_float);
+    let truncated = f.trunc_to_i32(product);
+    if f.compare(product, f32::INFINITY).z {
+        i32::MIN
+    } else {
+        truncated
+    }
+}
+
+impl BattleCharacterParam {
+    /// `get_calc_defence`: `_defence + _buff_mng._add_status[1]`, times the buff manager's defense-up ratio for
+    /// a player character.
+    pub fn calc_defence<C: StatCalls>(self, calls: &mut C) -> Result<i32, GuestException> {
+        self.calc_defence_stat(DefenceStat::Physical, calls)
+    }
+
+    /// `get_calc_magic_defence`: the same with `_magic_defence`, `_add_status[3]` and the magic ratio.
+    pub fn calc_magic_defence<C: StatCalls>(self, calls: &mut C) -> Result<i32, GuestException> {
+        self.calc_defence_stat(DefenceStat::Magic, calls)
+    }
+
+    fn calc_defence_stat<C: StatCalls>(
+        self,
+        stat: DefenceStat,
+        calls: &mut C,
+    ) -> Result<i32, GuestException> {
+        let buff = self.buff_mng();
+        let added_status = buff.add_status();
+        let length = added_status.len();
+        if u64::from(length) <= stat.add_status_index() {
+            return Err(calls.throw_index_out_of_range(stat, self, buff, added_status, length));
+        }
+        let base = self.i32_field(stat.base_offset());
+        let added = added_status.element(stat.add_status_index());
+        let sum = base.wrapping_add(added);
+        let is_player_byte = self.is_player_byte();
+        if is_player_byte == 0 {
+            calls.leave(sum);
+            return Ok(sum);
+        }
+        let site = ScaleSite {
+            buff,
+            is_player_byte,
+            base,
+            added,
+            sum,
+        };
+        let ratio = calls.defense_up_ratio(stat, site)?;
+        let scaled = scale_by_ratio(sum, ratio, calls);
+        calls.leave(scaled);
+        Ok(scaled)
+    }
+}
+
+mod stat_site {
+    //! Callee addresses and the address after each `bl` in the two methods.
+    pub const THROW_INDEX: u64 = 0x71000c4510;
+    pub const PHYSICAL_RATIO: u64 = 0x71021c4240;
+    pub const MAGIC_RATIO: u64 = 0x71021c4560;
+    pub const PHYSICAL_RET_RATIO: u64 = 0x71021bc2ac;
+    pub const MAGIC_RET_RATIO: u64 = 0x71021bc47c;
+    pub const PHYSICAL_RET_THROW: u64 = 0x71021bc2e0;
+    pub const MAGIC_RET_THROW: u64 = 0x71021bc4b0;
+}
+
+/// Both methods push a 32-byte frame (x29, x30, x19) and keep x29 = sp. Like the other shims it writes a register
+/// to the context only where the lifted code flushes it: before the ratio call x0, x8, x9, x10, x19, x29, x30 and
+/// sp, before the throw x0, x8, x9, x10, x29, x30 and sp, at the return x0, x19, x29, sp and v0, v1 (floats as the
+/// instructions leave them: `{bits, 0}`). x8 to x10 and x30 keep what the callee left.
+struct LiftedStat {
+    regs: Regs,
+    entry_x19: u64,
+    entry_x29: u64,
+    entry_sp: u64,
+}
+
+impl LiftedStat {
+    fn new(regs: Regs) -> Self {
+        Self {
+            entry_x19: regs.x(19),
+            entry_x29: regs.x(29),
+            entry_sp: regs.sp(),
+            regs,
+        }
+    }
+
+    /// The prologue's `stp x29, x30, [sp, #-32]!` and `add x29, sp, #0`, flushed at the first call.
+    fn push_frame(&mut self) {
+        let sp = self.entry_sp.wrapping_sub(32);
+        self.regs.set_x(29, sp);
+        self.regs.set_x(31, sp);
+    }
+}
+
+impl Float32Ops for LiftedStat {
+    fn fadd(&mut self, a: f32, b: f32) -> f32 {
+        let r = self.regs.f32_arith(2, a, b);
+        self.regs.set_f32(0, r);
+        r
+    }
+    fn fsub(&mut self, a: f32, b: f32) -> f32 {
+        let r = self.regs.f32_arith(3, a, b);
+        self.regs.set_f32(0, r);
+        r
+    }
+    /// `fmul s0, s0, s1`.
+    fn fmul(&mut self, a: f32, b: f32) -> f32 {
+        let r = self.regs.f32_arith(0, a, b);
+        self.regs.set_f32(0, r);
+        r
+    }
+}
+
+impl Float32Convert for LiftedStat {
+    /// `scvtf s1, w19`.
+    fn float_from_i32(&mut self, value: i32) -> f32 {
+        let r = self.regs.f32_from_i32(value);
+        self.regs.set_f32(1, r);
+        r
+    }
+    /// `fcvtzs w8, s0` (x8 is not flushed).
+    fn trunc_to_i32(&mut self, value: f32) -> i32 {
+        self.regs.i32_from_f32_trunc(value)
+    }
+    /// `fmov s1, w9` (+infinity), then `fcmp s0, s1`.
+    fn compare(&mut self, a: f32, b: f32) -> Nzcv {
+        self.regs.set_f32(1, b);
+        self.regs.f32_compare(a, b)
+    }
+}
+
+impl StatCalls for LiftedStat {
+    fn defense_up_ratio(
+        &mut self,
+        stat: DefenceStat,
+        site: ScaleSite,
+    ) -> Result<f32, GuestException> {
+        let (target, return_address) = match stat {
+            DefenceStat::Physical => (stat_site::PHYSICAL_RATIO, stat_site::PHYSICAL_RET_RATIO),
+            DefenceStat::Magic => (stat_site::MAGIC_RATIO, stat_site::MAGIC_RET_RATIO),
+        };
+        self.push_frame();
+        self.regs.set_x(0, site.buff.address());
+        self.regs.set_x(8, u64::from(site.is_player_byte));
+        self.regs.set_x(9, u64::from(site.added as u32));
+        self.regs.set_x(10, u64::from(site.base as u32));
+        self.regs.set_x(19, u64::from(site.sum as u32));
+        self.regs.set_x(30, return_address);
+        self.regs.invoke(target)?;
+        Ok(self.regs.f32_result())
+    }
+
+    fn throw_index_out_of_range(
+        &mut self,
+        stat: DefenceStat,
+        param: BattleCharacterParam,
+        buff: BuffManager,
+        array: Int32Array,
+        length: u32,
+    ) -> GuestException {
+        self.push_frame();
+        self.regs.set_x(0, buff.address());
+        self.regs.set_x(8, param.address());
+        self.regs.set_x(9, array.address());
+        self.regs.set_x(10, u64::from(length));
+        let return_address = match stat {
+            DefenceStat::Physical => stat_site::PHYSICAL_RET_THROW,
+            DefenceStat::Magic => stat_site::MAGIC_RET_THROW,
+        };
+        self.regs.set_x(30, return_address);
+        // If the thrower returns without an exception the compiled function simply ends: no epilogue.
+        let _ = self.regs.invoke(stat_site::THROW_INDEX);
+        GuestException
+    }
+
+    fn leave(&mut self, result: i32) {
+        // `mov w0, w19`, then x19, x29 and sp come back from the frame; v0 and v1 are flushed as they are.
+        self.regs.set_x(0, u64::from(result as u32));
+        self.regs.set_x(19, self.entry_x19);
+        self.regs.set_x(29, self.entry_x29);
+        self.regs.set_x(31, self.entry_sp);
+    }
+}
+
+/// 0x71021bc270 `BattleCharacterParam.get_calc_defence`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_param_calc_defence(x: *mut u64) {
+    unsafe {
+        let regs = Regs::from_raw(x);
+        let param = BattleCharacterParam::at(regs.x(0));
+        let _ = param.calc_defence(&mut LiftedStat::new(regs));
+    }
+}
+
+/// 0x71021bc440 `BattleCharacterParam.get_calc_magic_defence`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_param_calc_magic_defence(x: *mut u64) {
+    unsafe {
+        let regs = Regs::from_raw(x);
+        let param = BattleCharacterParam::at(regs.x(0));
+        let _ = param.calc_magic_defence(&mut LiftedStat::new(regs));
     }
 }
 
@@ -1952,5 +2234,433 @@ mod camera_tests {
             }
         }
         assert_eq!(cases, 3 * 2 * 7 * 40);
+    }
+}
+
+#[cfg(test)]
+mod stat_tests {
+    extern crate std;
+    use super::*;
+    use crate::bridge::tests::{CALLS, clear, fake_guest_bl, install};
+    use crate::fp::FpEnv;
+    use crate::{guest_ld8, guest_ld32, guest_ld64};
+    use std::vec::Vec;
+
+    /// Fake object graph: the param at word 0 (0xa0 bytes), the buff manager at word 24, the `int[]` at word 32.
+    struct Graph(std::boxed::Box<[u64; 48]>);
+
+    const BUFF_WORD: usize = 24;
+    const ARRAY_WORD: usize = 32;
+
+    impl Graph {
+        fn new(player: u8, length: u32, defence: i32, magic_defence: i32, added: [i32; 4]) -> Self {
+            let mut g = Self(std::boxed::Box::new([0; 48])); // boxed: the pointers inside must not move
+            let base = g.0.as_ptr() as u64;
+            g.0[0xa0 / 8] = base + 8 * BUFF_WORD as u64;
+            g.0[BUFF_WORD + 3] = base + 8 * ARRAY_WORD as u64; // buff + 0x18
+            g.set32(0x40, defence as u32);
+            g.set32(0x48, magic_defence as u32);
+            g.0[0x6c / 8] |= u64::from(player) << ((0x6c % 8) * 8);
+            g.set32(8 * ARRAY_WORD + 0x18, length);
+            for (i, a) in added.iter().enumerate() {
+                g.set32(8 * ARRAY_WORD + 0x20 + 4 * i, *a as u32);
+            }
+            g
+        }
+
+        fn set32(&mut self, byte: usize, value: u32) {
+            let bytes = self.0.as_mut_ptr() as *mut u8;
+            unsafe { bytes.add(byte).cast::<u32>().write_unaligned(value) };
+        }
+
+        fn address(&self) -> u64 {
+            self.0.as_ptr() as u64
+        }
+
+        fn param(&self) -> BattleCharacterParam {
+            unsafe { BattleCharacterParam::at(self.address()) }
+        }
+    }
+
+    // ---- the readable body, against a recorder and an independent host-float reference ----
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Ratio(DefenceStat, i32),
+        Throw(DefenceStat, u32),
+        Leave(i32),
+    }
+
+    struct Recorder {
+        env: FpEnv,
+        ratio: f32,
+        events: Vec<Event>,
+    }
+
+    impl Float32Ops for Recorder {
+        fn fadd(&mut self, a: f32, b: f32) -> f32 {
+            self.env.fadd32(a, b)
+        }
+        fn fsub(&mut self, a: f32, b: f32) -> f32 {
+            self.env.fsub32(a, b)
+        }
+        fn fmul(&mut self, a: f32, b: f32) -> f32 {
+            self.env.fmul32(a, b)
+        }
+    }
+
+    impl Float32Convert for Recorder {
+        fn float_from_i32(&mut self, value: i32) -> f32 {
+            self.env.float_from_i32(value)
+        }
+        fn trunc_to_i32(&mut self, value: f32) -> i32 {
+            self.env.trunc_to_i32(value)
+        }
+        fn compare(&mut self, a: f32, b: f32) -> Nzcv {
+            self.env.compare(a, b)
+        }
+    }
+
+    impl StatCalls for Recorder {
+        fn defense_up_ratio(
+            &mut self,
+            stat: DefenceStat,
+            site: ScaleSite,
+        ) -> Result<f32, GuestException> {
+            self.events.push(Event::Ratio(stat, site.sum));
+            Ok(self.ratio)
+        }
+        fn throw_index_out_of_range(
+            &mut self,
+            stat: DefenceStat,
+            _: BattleCharacterParam,
+            _: BuffManager,
+            _: Int32Array,
+            length: u32,
+        ) -> GuestException {
+            self.events.push(Event::Throw(stat, length));
+            GuestException
+        }
+        fn leave(&mut self, result: i32) {
+            self.events.push(Event::Leave(result));
+        }
+    }
+
+    /// What the C# says, with host floats: `(int)(sum * ratio)`, +infinity giving `int.MinValue` as the x86 cast
+    /// does (the ARM `fcvtzs` would saturate), NaN giving 0.
+    fn host_scale(sum: i32, ratio: f32) -> i32 {
+        let product = ratio * (sum as f32);
+        if product == f32::INFINITY {
+            i32::MIN
+        } else {
+            product as i32
+        }
+    }
+
+    const INTS: [i32; 9] = [
+        0,
+        1,
+        -1,
+        100,
+        -100,
+        0x00ff_ffff,
+        0x7fff_ffff,
+        i32::MIN,
+        0x0123_4567,
+    ];
+    const RATIOS: [u32; 14] = [
+        0x3f80_0000, // 1.0
+        0x3fc0_0000, // 1.5
+        0x3f00_0000, // 0.5
+        0,
+        0x8000_0000,
+        0xbf80_0000,
+        0x7f80_0000, // +inf
+        0xff80_0000, // -inf
+        0x7fc0_0000, // NaN
+        0x7f80_0001, // signaling NaN
+        0x4f00_0000, // 2^31
+        0x4f80_0000,
+        0x7f7f_ffff,
+        0x0000_0001,
+    ];
+
+    #[test]
+    fn defence_follows_the_game_order_and_the_float_cast() {
+        let mut cases = 0;
+        for stat in [DefenceStat::Physical, DefenceStat::Magic] {
+            let (index, physical) = if stat == DefenceStat::Physical {
+                (1usize, true)
+            } else {
+                (3, false)
+            };
+            for player in [0u8, 1, 0x80, 0xff] {
+                for length in [0u32, 1, 2, 3, 4, 100, u32::MAX] {
+                    for &base in &INTS {
+                        for &add in &INTS {
+                            for &ratio in &RATIOS {
+                                let added = [add ^ 5, add, add ^ 9, add];
+                                let (defence, magic) = if physical {
+                                    (base, !base)
+                                } else {
+                                    (!base, base)
+                                };
+                                let g = Graph::new(player, length, defence, magic, added);
+                                let mut r = Recorder {
+                                    env: FpEnv::new(0, 0),
+                                    ratio: f32::from_bits(ratio),
+                                    events: Vec::new(),
+                                };
+                                let result = if physical {
+                                    g.param().calc_defence(&mut r)
+                                } else {
+                                    g.param().calc_magic_defence(&mut r)
+                                };
+                                if (length as usize) <= index {
+                                    assert_eq!(result, Err(GuestException));
+                                    assert_eq!(r.events, [Event::Throw(stat, length)]);
+                                    continue;
+                                }
+                                let sum = base.wrapping_add(added[index]);
+                                if player == 0 {
+                                    assert_eq!(result, Ok(sum));
+                                    assert_eq!(r.events, [Event::Leave(sum)]);
+                                } else {
+                                    let want = host_scale(sum, f32::from_bits(ratio));
+                                    assert_eq!(result, Ok(want), "sum {sum} ratio {ratio:#x}");
+                                    assert_eq!(
+                                        r.events,
+                                        [Event::Ratio(stat, sum), Event::Leave(want)]
+                                    );
+                                }
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 10_000);
+    }
+
+    // ---- the shim, against a transcription of the lifted C (main_0376.c, f_71021bc270 and f_71021bc440) ----
+
+    const WORDS: usize = 100;
+    const FPCR_WORD: usize = 97; // fpcr is the high half of word 97, fpsr the low half of word 98
+
+    fn call(file: &mut [u64; WORDS], target: u64) -> bool {
+        unsafe { fake_guest_bl(file.as_mut_ptr(), target) != 0 }
+    }
+
+    /// The lifted body, line by line: locals for the registers it keeps in C variables, the flush list at each call
+    /// as the C writes it, the reload of x0, v0 and v1 after the ratio call, and the flush at the return.
+    #[allow(unused_assignments)]
+    fn lifted_reference(file: &mut [u64; WORDS], magic: bool) {
+        let (limit, base_offset, element_offset, ratio, ret_ratio, ret_throw) = if magic {
+            (
+                3u32,
+                0x48u64,
+                0x2cu64,
+                0x71021c4560u64,
+                0x71021bc47cu64,
+                0x71021bc4b0u64,
+            )
+        } else {
+            (1, 0x40, 0x24, 0x71021c4240, 0x71021bc2ac, 0x71021bc2e0)
+        };
+        let mut x0 = file[0];
+        let (mut x8, mut x9, mut x10);
+        let mut x19 = file[19];
+        let mut x29 = file[29];
+        let mut x30 = file[30];
+        let mut sp = file[31];
+        let mut v0 = [file[32], file[33]];
+        let mut v1 = [file[34], file[35]];
+        let entry_x19 = x19;
+        let entry_x29 = x29;
+        let entry_sp = sp;
+        // stp x29, x30, [sp, #-32]!; str x19; add x29, sp, #0
+        sp = sp.wrapping_sub(32);
+        x29 = sp;
+        x8 = x0;
+        x0 = unsafe { guest_ld64(x0 + 0xa0) };
+        x9 = unsafe { guest_ld64(x0 + 0x18) };
+        x10 = u64::from(unsafe { guest_ld32(x9 + 0x18) });
+        if (x10 as u32) <= limit {
+            x30 = ret_throw;
+            file[0] = x0;
+            file[8] = x8;
+            file[9] = x9;
+            file[10] = x10;
+            file[29] = x29;
+            file[30] = x30;
+            file[31] = sp;
+            call(file, 0x71000c4510);
+            return;
+        }
+        x10 = u64::from(unsafe { guest_ld32(x8 + base_offset) });
+        x9 = u64::from(unsafe { guest_ld32(x9 + element_offset) });
+        x19 = u64::from((x9 as u32).wrapping_add(x10 as u32));
+        x8 = u64::from(unsafe { guest_ld8(x8 + 0x6c) });
+        if x8 != 0 {
+            x30 = ret_ratio;
+            file[0] = x0;
+            file[8] = x8;
+            file[9] = x9;
+            file[10] = x10;
+            file[19] = x19;
+            file[29] = x29;
+            file[30] = x30;
+            file[31] = sp;
+            if call(file, ratio) {
+                return;
+            }
+            x0 = file[0];
+            v0 = [file[32], file[33]];
+            v1 = [file[34], file[35]];
+            let mut env = FpEnv::new((file[FPCR_WORD] >> 32) as u32, file[98] as u32);
+            // scvtf s1, w19; fmul s0, s0, s1; fcvtzs w8, s0; fmov s1, w9; fcmp s0, s1; csel w19
+            v1 = [
+                u64::from(env.float_from_i32(x19 as u32 as i32).to_bits()),
+                0,
+            ];
+            let product = env.fmul32(f32::from_bits(v0[0] as u32), f32::from_bits(v1[0] as u32));
+            v0 = [u64::from(product.to_bits()), 0];
+            x8 = u64::from(env.trunc_to_i32(product) as u32);
+            x9 = 0x7f80_0000;
+            v1 = [x9, 0];
+            let flags = env.compare(product, f32::from_bits(v1[0] as u32));
+            x9 = 0x8000_0000;
+            x19 = if flags.z { x9 } else { x8 };
+            file[98] = (file[98] & !0xffff_ffff) | u64::from(env.fpsr);
+        }
+        // mov w0, w19; ldr x19, [sp, #0x10]; ldp x29, x30, [sp], #32
+        x0 = x19 & 0xffff_ffff;
+        x19 = entry_x19;
+        x29 = entry_x29;
+        sp = entry_sp;
+        file[0] = x0;
+        file[19] = x19;
+        file[29] = x29;
+        file[32] = v0[0];
+        file[33] = v0[1];
+        file[34] = v1[0];
+        file[35] = v1[1];
+        file[31] = sp;
+    }
+
+    /// A fake callee that leaves a result in every register a real callee may clobber, derived from every
+    /// register it is given, so a wrong staged register at any call changes the final file.
+    fn scramble_with(r: &mut [u64], float_result: bool) {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (i, w) in r.iter().enumerate() {
+            h = (h ^ *w ^ ((i as u64) << 56)).wrapping_mul(0x0000_0100_0000_01b3);
+            h ^= h >> 29;
+        }
+        r[0] = h & 0xffff_ffff_ffff_fff0;
+        r[1] = h.rotate_left(7);
+        r[8] = h.rotate_left(13);
+        r[9] = h.rotate_left(17);
+        r[10] = h.rotate_left(19);
+        for n in 0..8usize {
+            r[32 + 2 * n] = h.rotate_left(n as u32 * 11) & 0xffff_ffff;
+            r[33 + 2 * n] = 0;
+        }
+        if float_result {
+            let pick = RATIOS[(h >> 40) as usize % RATIOS.len()];
+            r[32] = if h & 3 == 0 {
+                h & 0xffff_ffff
+            } else {
+                u64::from(pick)
+            };
+        }
+    }
+
+    fn ratio_callee(r: &mut [u64]) {
+        scramble_with(r, true);
+    }
+
+    fn throw_callee(r: &mut [u64]) {
+        scramble_with(r, false);
+        r[0] = u64::MAX;
+        r[1] = u64::MAX;
+    }
+
+    fn install_all() {
+        clear();
+        install(0x71021c4240, ratio_callee);
+        install(0x71021c4560, ratio_callee);
+        install(0x71000c4510, throw_callee);
+    }
+
+    fn random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn shim_matches_the_lifted_transcription_in_every_branch_and_fp_mode() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let modes = [
+            0u32,
+            1 << 24,
+            1 << 25,
+            (1 << 24) | (1 << 25),
+            1 << 22,
+            2 << 22,
+            3 << 22,
+        ];
+        let mut cases = 0;
+        for magic in [false, true] {
+            for player in [0u8, 1, 0xff] {
+                for length in [0u32, 1, 2, 3, 4, 9] {
+                    for fpcr in modes {
+                        for pick in 0..24 {
+                            let base = INTS[(random(&mut seed) >> 8) as usize % INTS.len()];
+                            let added = [
+                                INTS[pick % INTS.len()],
+                                INTS[(pick + 3) % INTS.len()],
+                                0x1234,
+                                INTS[(pick + 5) % INTS.len()],
+                            ];
+                            let g = Graph::new(player, length, base, !base, added);
+                            let mut file = [0u64; WORDS];
+                            for w in file.iter_mut().take(96) {
+                                *w = random(&mut seed);
+                            }
+                            file[0] = g.address();
+                            file[31] = 0x7000_0000;
+                            file[FPCR_WORD] =
+                                (u64::from(fpcr) << 32) | (random(&mut seed) & 0xffff_ffff);
+                            file[98] = random(&mut seed) & 0x0000_0000_0800_009f;
+                            let mut expected = file;
+                            install_all();
+                            lifted_reference(&mut expected, magic);
+                            let expected_calls: Vec<u64> = CALLS.with(|c| c.borrow().clone());
+                            install_all();
+                            unsafe {
+                                if magic {
+                                    smrpg_param_calc_magic_defence(file.as_mut_ptr());
+                                } else {
+                                    smrpg_param_calc_defence(file.as_mut_ptr());
+                                }
+                            }
+                            let calls: Vec<u64> = CALLS.with(|c| c.borrow().clone());
+                            assert_eq!(calls, expected_calls, "call order");
+                            for i in 0..WORDS {
+                                assert_eq!(
+                                    file[i], expected[i],
+                                    "word {i} (magic {magic} player {player} length {length} fpcr {fpcr:#x})"
+                                );
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 3 * 6 * 7 * 24);
     }
 }

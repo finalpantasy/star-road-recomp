@@ -869,6 +869,31 @@ pub trait Float32Ops {
     fn fmul(&mut self, a: f32, b: f32) -> f32;
 }
 
+/// Single-precision conversions and compares a port needs beyond `Float32Ops` (task-54): `scvtf s, w`, `fcvtzs w, s`
+/// and `fcmp`. Like `Float32Ops`, the guest implementation reads and writes the context's FPSR on every call.
+pub trait Float32Convert: Float32Ops {
+    /// `scvtf`: 32-bit signed integer to single.
+    fn float_from_i32(&mut self, value: i32) -> f32;
+    /// `fcvtzs`: single to 32-bit signed integer, rounding toward zero, saturating (NaN gives 0).
+    fn trunc_to_i32(&mut self, value: f32) -> i32;
+    /// `fcmp`: the NZCV flags.
+    fn compare(&mut self, a: f32, b: f32) -> Nzcv;
+}
+
+impl Float32Convert for FpEnv {
+    fn float_from_i32(&mut self, value: i32) -> f32 {
+        f32::from_bits(
+            self.fromfix_bits(Fmt::Single, u64::from(value as u32), false, false, 0) as u32,
+        )
+    }
+    fn trunc_to_i32(&mut self, value: f32) -> i32 {
+        self.tofix_bits(Fmt::Single, u64::from(value.to_bits()), false, false, 0, 3) as u32 as i32
+    }
+    fn compare(&mut self, a: f32, b: f32) -> Nzcv {
+        self.fcmp32(a, b)
+    }
+}
+
 impl Float32Ops for FpEnv {
     fn fadd(&mut self, a: f32, b: f32) -> f32 {
         self.fadd32(a, b)

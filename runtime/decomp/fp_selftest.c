@@ -3,6 +3,7 @@
  * selftests (SMRPG_DECOMP=ab SMRPG_DECOMP_SELFTEST=1): edge and random operands, every FPCR mode the soft path
  * implements (flush to zero, default NaN, the four rounding modes and their mixes), a random FPSR going in, and the
  * result and the FPSR coming out must be identical. Not part of a normal run. */
+#include <stdatomic.h>
 #include "rt_internal.h"
 #include "ir_ops.h"
 #include "swap.h"
@@ -146,4 +147,51 @@ void decomp_fp_selftest(void) {
     }
     rt_log("decomp fp selftest cases=%llu differences=%llu", checked - start_checked, differences);
     if (differences) rt_exit(10, "decomp fp selftest failed");
+}
+
+/* ---- Live per-operation check (task-54) ----
+ * The row compare sees the union of the flags a call raises, so a port that forgets IXC for one sign of result is
+ * hidden by another operation in the same call that raises it. In `ab` mode every float operation a port runs
+ * through the shim (bridge.rs `Regs::fp_op`) is also run here on the lifted C helper with the same FPCR, the same
+ * FPSR going in and the same operands; result and FPSR coming out must be equal. Operations: 0 fmul, 2 fadd, 3 fsub
+ * (single precision), 32 fcmp (the NZCV nibble), 48 fcvtzs w, s (`extra` as in the selftest), 64 scvtf s, w. */
+static int shadow_on;
+static atomic_ullong shadow_checked, shadow_differences;
+
+void decomp_fp_shadow_enable(void) { shadow_on = 1; }
+
+void smrpg_fp_shadow(uint32_t op, uint32_t fpcr, uint32_t fpsr_before, uint64_t a, uint64_t b, uint32_t extra, uint64_t rust,
+                     uint32_t rust_fpsr) {
+    if (!shadow_on) return;
+    Ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.fpcr = fpcr;
+    ctx.fpsr = fpsr_before;
+    v128 va = {(long long)a, 0}, vb = {(long long)b, 0};
+    uint64_t ref;
+    int sf = extra & 1, uns = (extra >> 1) & 1, rm = (extra >> 2) & 7, fbits = (int)(extra >> 8);
+    switch (op) {
+    case 0: case 2: case 3: ref = sa_get(0, sa_fp2(&ctx, 0, (int)op, va, vb)); break;
+    case 32: {
+        u8 fl[4];
+        sa_fcmp(&ctx, 0, 0, va, vb, 0, fl);
+        ref = (uint64_t)fl[0] << 3 | (uint64_t)fl[1] << 2 | (uint64_t)fl[2] << 1 | fl[3];
+        break; }
+    case 48: ref = sa_fcvti(&ctx, 0, sf, rm, uns, fbits, va); break;
+    case 64: ref = sa_get(0, sa_cvtf(&ctx, 0, sf, uns, fbits, a)); break;
+    default: return;
+    }
+    atomic_fetch_add(&shadow_checked, 1);
+    if (ref != rust || ctx.fpsr != rust_fpsr) {
+        if (atomic_fetch_add(&shadow_differences, 1) < 12)
+            rt_log("decomp mismatch fp shadow op=%u fpcr=%#x fpsr_before=%#x a=%#llx b=%#llx extra=%#x: rust=%#llx/%#x lifted=%#llx/%#x",
+                   op, fpcr, fpsr_before, (unsigned long long)a, (unsigned long long)b, extra, (unsigned long long)rust, rust_fpsr,
+                   (unsigned long long)ref, ctx.fpsr);
+    }
+}
+
+void decomp_fp_shadow_summary(void) {
+    if (!shadow_on) return;
+    rt_log("decomp fp shadow checked=%llu differences=%llu", (unsigned long long)atomic_load(&shadow_checked),
+           (unsigned long long)atomic_load(&shadow_differences));
 }

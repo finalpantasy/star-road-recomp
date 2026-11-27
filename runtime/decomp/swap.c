@@ -22,6 +22,7 @@ typedef struct {
     unsigned load_kind;             /* generated loads: 1 = getter (GLEAF), 2 = null-safe (NLEAF), 3 = through a field (DLEAF, VLEAF 4) */
     unsigned offset2;               /* second-level load offset of a load_kind 3 row */
     unsigned vkind, vreg;           /* VLEAF: 1 load, 2 store, 3 constant, 4 load through a field; the register */
+    unsigned clear_fpsr;            /* ELEAF: compare with the cumulative FPSR bits cleared on both sides (task-54) */
     unsigned replay;                /* ELEAF: a port whose callees have side effects, compared by replay (task-52) */
     unsigned probe;                 /* PLEAF: a traced row, counts live calls and runs the lifted body (task-52) */
     atomic_ullong calls, differences;
@@ -100,7 +101,7 @@ static Leaf leaves[leaf_count] = {
     {HEAD(addr), .rust_vec = sym, .base_reg = base, .offset = off, .bytes = len, \
      .load_kind = (vkind_) == 1 ? 1 : (vkind_) == 4 ? 3 : 0, .offset2 = off2, .vkind = vkind_, .vreg = vreg_},
 #define PLEAF(chunk, addr) {HEAD(addr), .probe = 1},
-#define ELEAF(chunk, addr, sym) {HEAD(addr), .rust_regs = sym, .replay = 1},
+#define ELEAF(chunk, addr, sym) {HEAD(addr), .rust_regs = sym, .replay = 1, .clear_fpsr = 1},
 #include "manifest.def"
 #undef ELEAF
 #undef PLEAF
@@ -180,7 +181,8 @@ static void compare_store(Leaf *leaf, Ctx *c) {
  * recorded; a callee reached through an untraced function is not seen, so the row's callees must all be traced. */
 #define REC_MAX 12
 typedef struct { uint64_t target; Ctx pre, post; } RecCall;
-typedef struct { RecCall calls[REC_MAX]; unsigned count, next; int overflow, bad; } Recording;
+typedef struct { RecCall calls[REC_MAX]; unsigned count, next; int overflow, bad; int hide_callee_fpsr; uint32_t raised; } Recording;
+#define FPSR_CUM 0x0800009fu   /* IOC DZC OFC UFC IXC IDC QC: the cumulative FPSR bits */
 static __thread Recording *tl_rec, *tl_replay;
 static __thread unsigned tl_depth;
 static __thread uint64_t tl_stub;   /* selftest: nonzero = traced callees do not run, they clobber registers pseudo-randomly */
@@ -212,11 +214,22 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
         leaf->lifted(c);
         return;
     }
+    /* FPSR cumulative flags are sticky and the game sets IXC early, so a port that forgets a flag would look equal.
+     * Both sides therefore start with the cumulative bits cleared and the flags each raised are compared; the
+     * original bits are ORed back into the live context afterwards (game behavior unchanged). Task-54. */
+    const uint32_t fpsr_cum = FPSR_CUM;
+    uint32_t fpsr_saved = 0;
+    if (leaf->clear_fpsr) {
+        fpsr_saved = c->fpsr & fpsr_cum;
+        c->fpsr &= ~fpsr_cum;
+    }
     Ctx pristine, trial;
     memcpy(&pristine, c, sizeof pristine);
     Recording rec;
     rec.count = rec.next = 0;
     rec.overflow = rec.bad = 0;
+    rec.hide_callee_fpsr = leaf->clear_fpsr;
+    rec.raised = 0;
     tl_rec = &rec;
     tl_depth = 0;
     leaf->lifted(c);   /* live memory sees only this run */
@@ -224,6 +237,7 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     atomic_fetch_add(&leaf->calls, 1);
     if (rec.overflow) {
         rt_log("decomp replay skipped addr=%#llx (more than %d traced calls)", (unsigned long long)leaf->address, REC_MAX);
+        c->fpsr |= fpsr_saved | rec.raised;
         return;
     }
     memcpy(&trial, &pristine, sizeof trial);
@@ -231,7 +245,8 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     leaf->rust_regs(trial.x);
     tl_replay = 0;
     int unused = rec.next != rec.count;
-    if (unused || rec.bad || memcmp(&trial, c, sizeof trial)) {
+    int differs = unused || rec.bad || memcmp(&trial, c, sizeof trial);
+    if (differs) {
         atomic_fetch_add(&leaf->differences, 1);
         rt_log("decomp mismatch addr=%#llx replay: recorded=%u used=%u call_mismatch=%d", (unsigned long long)leaf->address,
                rec.count, rec.next, rec.bad);
@@ -244,6 +259,7 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
                 ++shown;
             }
     }
+    c->fpsr |= fpsr_saved | rec.raised;
 }
 
 static void compare(Leaf *leaf, Ctx *c) {
@@ -302,9 +318,15 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
                 RecCall *call = &r->calls[r->count];
                 call->target = leaf->address;
                 memcpy(&call->pre, c, sizeof *c);
+                /* The flags the callee raises are kept out of the context while the compared body runs, so that a
+                 * flag the port forgets after the call cannot hide behind one the callee already set (task-54).
+                 * They are ORed back once the comparison is done (compare_replay). */
+                uint32_t held = 0;
+                if (r->hide_callee_fpsr) { held = c->fpsr & FPSR_CUM; c->fpsr &= ~FPSR_CUM; }
                 ++tl_depth;
                 run_traced(leaf, c);
                 --tl_depth;
+                if (r->hide_callee_fpsr) { r->raised |= c->fpsr & FPSR_CUM; c->fpsr = (c->fpsr & ~FPSR_CUM) | held; }
                 memcpy(&call->post, c, sizeof *c);
                 ++r->count;
             }
@@ -595,6 +617,31 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->fpsr = (uint32_t)(pick >> 32) & 0x0800009fu;
         break;
     }
+    case 0x71021bc270ULL:   /* Battle.BattleCharacterParam get_calc_defence and get_calc_magic_defence (task-54), same fake graph: */
+    case 0x71021bc440ULL: { /* param +0xa0 -> buff manager, buff +0x18 -> int[] (length +0x18, elements +0x20), stats +0x40, +0x48, _is_player +0x6c */
+        fill_fake_region(fake, 64, state);
+        static const uint32_t edge_ints[] = {0, 1, 0xffffffffu, 100, 0xffffff9cu, 0x00ffffffu, 0x7fffffffu, 0x80000000u, 0x01234567u};
+        unsigned char *bytes = (unsigned char *)fake;
+        const unsigned buff_word = 24, array_word = 32;
+        fake[0xa0 / 8] = base + 8 * buff_word;
+        fake[buff_word + 3] = base + 8 * array_word;
+        static const uint32_t lengths[] = {0, 1, 2, 3, 4, 5, 9, 0xffffffffu};
+        uint32_t length = lengths[(pick >> 8) % RT_ARRAY_LEN(lengths)];
+        memcpy(bytes + 8 * array_word + 0x18, &length, 4);
+        for (unsigned i = 0; i < 6; ++i) {
+            uint64_t r = random_word(state);
+            uint32_t v = (r & 3) == 0 ? (uint32_t)(r >> 8) : edge_ints[(r >> 8) % RT_ARRAY_LEN(edge_ints)];
+            unsigned at = i < 4 ? 8 * array_word + 0x20 + 4 * i : i == 4 ? 0x40 : 0x48;
+            memcpy(bytes + at, &v, 4);
+        }
+        static const unsigned char flags[] = {0, 0, 1, 2, 0x80, 0xff};
+        bytes[0x6c] = flags[(pick >> 16) % RT_ARRAY_LEN(flags)];
+        c->x[0] = base;
+        static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
+        c->fpcr = fpcr_modes[(pick >> 24) % RT_ARRAY_LEN(fpcr_modes)];
+        c->fpsr = (uint32_t)(pick >> 32) & 0x0800009fu;
+        break;
+    }
     default:
         break;
     }
@@ -709,6 +756,7 @@ void decomp_start(void) {
         return;
     }
     const char *test = getenv("SMRPG_DECOMP_SELFTEST");
+    if (mode == AB) decomp_fp_shadow_enable();
     if (mode == AB && test && !strcmp(test, "1")) decomp_fp_selftest();
     for (int i = 0; i < leaf_count; ++i) {
         Leaf *leaf = &leaves[i];
@@ -721,6 +769,7 @@ void decomp_start(void) {
 
 void decomp_summary(void) {
     if (mode != AB) return;
+    decomp_fp_shadow_summary();
     for (int i = 0; i < leaf_count; ++i) {
         Leaf *leaf = &leaves[i];
         rt_log("decomp live addr=%#llx calls=%llu differences=%llu", (unsigned long long)leaf->address,

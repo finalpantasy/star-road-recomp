@@ -247,6 +247,53 @@ operation IXC is set for good, so a port that forgets IXC is invisible to the li
 first follow-step call. Live, the camera runs the follow step without a shake (every mismatch of the mutation runs had 6
 recorded calls); the shake branches are covered by the selftest and the Rust tests, not by the game route.
 
+## Stricter float flag check (task-54)
+
+FPSR cumulative flags are sticky and the game sets IXC early, so a flag a port forgets can hide behind a flag that is
+already set, or behind one a callee or another operation of the same call raises. Three layers now close that, all in
+`ab` mode only (game behavior is unchanged: the original bits are ORed back).
+
+1. Row level, `compare_replay` in `swap.c`. A replay row (`ELEAF`, `clear_fpsr`) starts both sides with the cumulative
+   bits (IOC DZC OFC UFC IXC IDC QC, mask 0x0800009f) cleared, compares what each side raised, and ORs the original
+   bits back into the live context at the end.
+2. Callee flags are hidden while the compared body runs. A traced callee (`PLEAF`) runs with the cumulative bits cleared;
+   what it raised is held aside (`Recording.raised`), the body's own bits are put back, and the recorded post-call
+   context carries only the body's bits. The pre-call FPSR compare at every callee (`replay_call`) therefore sees only the
+   flags the body itself raised before that call, and the final compare sees only the flags of its own operations after
+   the last call. The held bits are ORed into the live context after the compare. Without this, the first lifted callee
+   that raised IXC masked every later omission (measured: the IXC mutation of task-53 stayed invisible with the
+   start-cleared compare alone).
+3. Operation level, `Regs::fp_op` in `bridge.rs` and `smrpg_fp_shadow` in `fp_selftest.c`. Each float operation a shim
+   runs (fadd, fsub, fmul, scvtf, fcvtzs, fcmp, single precision) also runs on the lifted C helper with the same FPCR,
+   the same FPSR going in and the same operands, and the result and FPSR coming out must be equal. This sees a flag
+   dropped for one sign of result even when another operation of the same call raises the same bit. A difference logs
+   `decomp mismatch fp shadow ...` (so the usual "decomp mismatch" count catches it); the exit summary prints
+   `decomp fp shadow checked=N differences=N`.
+
+What the stricter check sees on the hard route: the camera's own operations raise IXC for positive inexact results (the
+Deg2Rad multiplies) and, with a mutation that drops IXC for negative results, nothing is seen live because no
+negative result is inexact on that route (44,890 shadow-checked operations, 0 differences); the startup selftest, which
+feeds random operands and a random FPSR, still covers that sign.
+
+## Defence stat ports (task-54)
+
+`Battle.BattleCharacterParam.get_calc_defence` (0x71021bc270) and `get_calc_magic_defence` (0x71021bc440), 28 lifted
+instructions each, in `battle.rs` (`calc_defence`, `calc_magic_defence`, one body `calc_defence_stat`). Readable
+form: `_defence` (0x40, or `_magic_defence` 0x48) plus `_buff_mng._add_status[1]` (or `[3]`, an `int[]` read through
+`Int32Array` in `object.rs`); for a player character (`_is_player`, byte at 0x6c) the sum is multiplied by the buff manager's
+`defense_up_ratio` (0x71021c4240, or `magic_defense_up_ratio` 0x71021c4560) and cut back to an int the way the compiled
+cast does it (`scale_by_ratio`: scvtf, fmul, fcvtzs toward zero, and a product of exactly +infinity gives `int.MinValue`).
+A too-short array throws through 0x71000c4510. Float steps go through `Float32Convert` (`fp.rs`: scvtf, fcvtzs, fcmp on
+top of `Float32Ops`). Shim `LiftedStat` stages exactly the registers the lifted body flushes (before the ratio call x0,
+x8, x9, x10, x19, x29, x30 and sp; before the throw x0, x8, x9, x10, x29, x30 and sp; at the return x0, x19, x29, sp, v0
+and v1). Rows: `ELEAF(main_0376, ...)` for both, traced callees `PLEAF` for the two ratio methods and the thrower.
+
+Why these and not the damage formula. `SkillExecter.damage_calc` (0x71021ff580) is 613 instructions. `CharaSkillResultLogger.calc_damage_normal`
+(303) builds the damage number display (stack structs, vector math, UI calls). `BattleCharacterParam.apply_damage_and_status_eff`
+(277) is mostly logging and lazy static initialization. `get_calc_attack` (96 instructions, 18 live calls) is the same shape as
+the defence methods but has the non-player branch with class-initialization checks and two garbage-collection polls, which the
+shim would have to reproduce site by site. The defence methods have none of that and are the stat the damage code reads.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

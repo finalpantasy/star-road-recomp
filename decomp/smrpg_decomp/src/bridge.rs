@@ -35,12 +35,31 @@ unsafe extern "C" {
     fn smrpg_guest_safepoint(x: *mut u64, pc: u64, reg: u32, value: u64);
 }
 
+#[cfg(not(test))]
+unsafe extern "C" {
+    /// `runtime/decomp/fp_selftest.c`: in `ab` mode, runs the same float operation on the lifted C helper and logs a
+    /// mismatch of result or FPSR (task-54); otherwise returns at once.
+    fn smrpg_fp_shadow(
+        op: u32,
+        fpcr: u32,
+        fpsr_before: u32,
+        a: u64,
+        b: u64,
+        extra: u32,
+        result: u64,
+        fpsr_after: u32,
+    );
+}
+
+#[cfg(test)]
+unsafe fn smrpg_fp_shadow(_: u32, _: u32, _: u32, _: u64, _: u64, _: u32, _: u64, _: u32) {}
+
 #[cfg(test)]
 pub(crate) use tests::fake_guest_bl as smrpg_guest_bl;
 #[cfg(test)]
 pub(crate) use tests::fake_safepoint as smrpg_guest_safepoint;
 
-use crate::fp::FpEnv;
+use crate::fp::{Float32Convert, FpEnv};
 
 const SP: usize = 31;
 const V0: usize = 32;
@@ -108,6 +127,68 @@ impl Regs {
                 bytes.add(FPSR_BYTE).cast::<u32>().read(),
             )
         }
+    }
+
+    /// One single-precision float operation on the guest's FPCR and FPSR: `run` computes it with the Rust float
+    /// layer, the flags go back to the context, and in `ab` mode the lifted C helper runs the same operation
+    /// (`op`, see `smrpg_fp_shadow`) and must agree on result and flags (task-54). Returns `result`.
+    pub fn fp_op(
+        &mut self,
+        op: u32,
+        a: u64,
+        b: u64,
+        extra: u32,
+        run: impl FnOnce(&mut FpEnv) -> u64,
+    ) -> u64 {
+        let mut env = self.fp_env();
+        let before = env.fpsr;
+        let result = run(&mut env);
+        self.set_fpsr(env.fpsr);
+        unsafe { smrpg_fp_shadow(op, env.fpcr, before, a, b, extra, result, env.fpsr) };
+        result
+    }
+
+    /// `fmul` (op 0), `fadd` (2) or `fsub` (3) on single-precision values, through `fp_op`.
+    pub fn f32_arith(&mut self, op: u32, a: f32, b: f32) -> f32 {
+        let (x, y) = (u64::from(a.to_bits()), u64::from(b.to_bits()));
+        f32::from_bits(self.fp_op(op, x, y, 0, |env| {
+            u64::from(
+                match op {
+                    0 => env.fmul32(a, b),
+                    2 => env.fadd32(a, b),
+                    _ => env.fsub32(a, b),
+                }
+                .to_bits(),
+            )
+        }) as u32)
+    }
+
+    /// `scvtf s, w`.
+    pub fn f32_from_i32(&mut self, value: i32) -> f32 {
+        let bits = u64::from(value as u32);
+        f32::from_bits(self.fp_op(64, bits, 0, 0, |env| {
+            u64::from(env.float_from_i32(value).to_bits())
+        }) as u32)
+    }
+
+    /// `fcvtzs w, s`: toward zero, 32-bit signed (the `extra` of the shadow check: rounding mode 3 in bits 2 to 4).
+    pub fn i32_from_f32_trunc(&mut self, value: f32) -> i32 {
+        let bits = u64::from(value.to_bits());
+        self.fp_op(48, bits, 0, 3 << 2, |env| {
+            u64::from(env.trunc_to_i32(value) as u32)
+        }) as u32 as i32
+    }
+
+    /// `fcmp s, s`: the NZCV flags.
+    pub fn f32_compare(&mut self, a: f32, b: f32) -> crate::fp::Nzcv {
+        let (x, y) = (u64::from(a.to_bits()), u64::from(b.to_bits()));
+        let mut flags = None;
+        self.fp_op(32, x, y, 0, |env| {
+            let f = env.compare(a, b);
+            flags = Some(f);
+            u64::from(f.n) << 3 | u64::from(f.z) << 2 | u64::from(f.c) << 1 | u64::from(f.v)
+        });
+        flags.expect("fcmp ran")
     }
 
     pub fn set_fpsr(&mut self, fpsr: u32) {
