@@ -28,11 +28,25 @@ unsafe extern "C" {
     fn smrpg_guest_bl(x: *mut u64, target: u64) -> i32;
 }
 
+#[cfg(not(test))]
+unsafe extern "C" {
+    /// `runtime/decomp/swap.c`: the loop back-edge safepoint of the lifted code (task-53): with a collection
+    /// pending it records `pc` in the context and polls; otherwise nothing.
+    fn smrpg_guest_safepoint(x: *mut u64, pc: u64, reg: u32, value: u64);
+}
+
 #[cfg(test)]
 pub(crate) use tests::fake_guest_bl as smrpg_guest_bl;
+#[cfg(test)]
+pub(crate) use tests::fake_safepoint as smrpg_guest_safepoint;
+
+use crate::fp::FpEnv;
 
 const SP: usize = 31;
 const V0: usize = 32;
+/// Byte offsets of `Ctx.fpcr` and `Ctx.fpsr` from the start of `Ctx.x` (`swap.c` asserts them).
+const FPCR_BYTE: usize = 780;
+const FPSR_BYTE: usize = 784;
 
 impl Regs {
     /// # Safety
@@ -68,6 +82,43 @@ impl Regs {
             self.x.add(V0 + 2 * n).write(u64::from(value.to_bits()));
             self.x.add(V0 + 2 * n + 1).write(0);
         }
+    }
+
+    /// Writes the two halves of vector register `n` (a `ldr d` load is `{value, 0}`).
+    pub fn set_v(&mut self, n: usize, low: u64, high: u64) {
+        assert!(n < 32);
+        unsafe {
+            self.x.add(V0 + 2 * n).write(low);
+            self.x.add(V0 + 2 * n + 1).write(high);
+        }
+    }
+
+    /// The float in the low 32 bits of vector register `n`.
+    pub fn v_f32(&self, n: usize) -> f32 {
+        f32::from_bits(self.v_low(n) as u32)
+    }
+
+    /// FPCR and FPSR of the context. Float arithmetic reads them when it runs, because a callee can change the
+    /// cumulative flags; it writes the flags back with `set_fpsr`. The register file must be a whole `Ctx`.
+    pub fn fp_env(&self) -> FpEnv {
+        let bytes = self.x as *const u8;
+        unsafe {
+            FpEnv::new(
+                bytes.add(FPCR_BYTE).cast::<u32>().read(),
+                bytes.add(FPSR_BYTE).cast::<u32>().read(),
+            )
+        }
+    }
+
+    pub fn set_fpsr(&mut self, fpsr: u32) {
+        unsafe { (self.x as *mut u8).add(FPSR_BYTE).cast::<u32>().write(fpsr) }
+    }
+
+    /// The lifted loop back-edge poll at `pc`. The lifted code flushes one register only when the poll fires
+    /// (`x<reg> = value`), so the register is passed along and written only then; the port keeps every other
+    /// register in the file already.
+    pub fn safepoint(&mut self, pc: u64, reg: u32, value: u64) {
+        unsafe { smrpg_guest_safepoint(self.x, pc, reg, value) }
     }
 
     pub fn f32_result(&self) -> f32 {
@@ -124,6 +175,11 @@ pub(crate) mod tests {
     std::thread_local! {
         static CALLEES: RefCell<Vec<(u64, Fake)>> = const { RefCell::new(Vec::new()) };
         pub static CALLS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        pub static SAFEPOINTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub unsafe fn fake_safepoint(_x: *mut u64, pc: u64, _reg: u32, _value: u64) {
+        SAFEPOINTS.with(|s| s.borrow_mut().push(pc));
     }
 
     pub fn install(target: u64, body: Fake) {
@@ -133,6 +189,7 @@ pub(crate) mod tests {
     pub fn clear() {
         CALLEES.with(|c| c.borrow_mut().clear());
         CALLS.with(|c| c.borrow_mut().clear());
+        SAFEPOINTS.with(|c| c.borrow_mut().clear());
     }
 
     /// Stands in for `smrpg_guest_bl` in unit tests: runs the installed fake on the register words.

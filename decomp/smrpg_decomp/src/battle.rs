@@ -6,7 +6,9 @@
 //! and reproduce the register residue the lifted code leaves behind (see docs/DECOMP.md, "Readable ports").
 
 use crate::bridge::{GuestException, Regs};
+use crate::fp::Float32Ops;
 use crate::object::{GuestObject, guest_class};
+use crate::unity::{Camera, DEG2RAD, Quaternion, Transform, Vector3};
 
 /// `Battle.BadStatusManager.BadStatusKind`, the raw 32-bit value (the game stores any int, so no Rust enum).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,6 +634,410 @@ pub unsafe extern "C" fn smrpg_hit_exec_hit(x: *mut u64) {
     }
 }
 
+// ---- BattleCamera.adjust_camera_transform (task-53): float code, the first port that goes through `fp.rs` ----
+
+guest_class!(
+    /// `Battle.BattleCamera`
+    BattleCamera
+);
+guest_class!(
+    /// `Battle.BattleCamera.CameraShake` (a private nested class)
+    CameraShake
+);
+
+impl CameraShake {
+    const OFFSET: u64 = 0x34;
+
+    /// `offset`: the shake displacement added to the camera position.
+    pub fn offset(self) -> Vector3 {
+        Vector3::new(
+            self.f32_field(Self::OFFSET),
+            self.f32_field(Self::OFFSET + 4),
+            self.f32_field(Self::OFFSET + 8),
+        )
+    }
+}
+
+/// Which of the method's three `get_transform` calls this is. They are the same call in C#; the compiled code
+/// has different registers live at each, and the shim must reproduce them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransformSite {
+    /// First statement: `_camera.transform.eulerAngles = _euler_angle`.
+    Entry,
+    /// Following the look-at point (position not locked).
+    Follow,
+    /// Adding the shake offset; carries the shake object that was just null-tested.
+    Shake(CameraShake),
+}
+
+/// The game functions `adjust_camera_transform` calls, by their Unity names, and the float arithmetic it does
+/// (through `Float32Ops`, so each operation sets the FPSR flags the compiled code sets). The real implementation
+/// calls the lifted functions through the bridge; the unit tests use a recorder.
+pub trait CameraCalls: Float32Ops {
+    /// `UnityEngine.Component.get_transform` (0x7101799d40).
+    fn camera_transform(
+        &mut self,
+        camera: Camera,
+        site: TransformSite,
+    ) -> Result<Transform, GuestException>;
+    /// `UnityEngine.Transform.set_eulerAngles` (0x71017a7da0).
+    fn set_euler_angles(
+        &mut self,
+        transform: Transform,
+        angles: Vector3,
+    ) -> Result<(), GuestException>;
+    /// `UnityEngine.Quaternion.Internal_FromEulerRad` (0x7102057610).
+    fn quaternion_from_euler_rad(
+        &mut self,
+        euler_rad: Vector3,
+    ) -> Result<Quaternion, GuestException>;
+    /// `UnityEngine.Quaternion.op_Multiply(Quaternion, Vector3)` (0x7102057ae0).
+    fn rotate(&mut self, rotation: Quaternion, vector: Vector3) -> Result<Vector3, GuestException>;
+    /// `UnityEngine.Transform.set_position` (0x71017a7910).
+    fn set_position(
+        &mut self,
+        transform: Transform,
+        position: Vector3,
+    ) -> Result<(), GuestException>;
+    /// `UnityEngine.Transform.get_position` (0x71017a7860).
+    fn get_position(&mut self, transform: Transform) -> Result<Vector3, GuestException>;
+    /// The last statement: `set_position` as a jump. `shake` is the object whose offset was just added.
+    fn set_position_tail(
+        &mut self,
+        transform: Transform,
+        position: Vector3,
+        shake: CameraShake,
+    ) -> Result<(), GuestException>;
+    /// The garbage-collection safepoint the compiled code polls after the follow step. `shake` is the field
+    /// value it had just loaded.
+    fn safepoint(&mut self, shake: Option<CameraShake>);
+    /// Return without a tail call.
+    fn leave(&mut self) -> Result<(), GuestException>;
+}
+
+impl BattleCamera {
+    const CAMERA: u64 = 0x10;
+    const LOOK_AT_POSITION: u64 = 0x3c;
+    const EULER_ANGLE: u64 = 0x48;
+    const DISTANCE: u64 = 0x54;
+    const IS_POSITION_CHANGE_LOCKED: u64 = 0x74;
+    const CAMERA_SHAKE: u64 = 0x90;
+
+    /// The Unity camera, passed to `get_transform` without a null test (the callee throws on null).
+    pub fn camera(self) -> Camera {
+        self.object_field(Self::CAMERA)
+    }
+
+    fn vector_field(self, offset: u64) -> Vector3 {
+        Vector3::new(
+            self.f32_field(offset),
+            self.f32_field(offset + 4),
+            self.f32_field(offset + 8),
+        )
+    }
+
+    pub fn look_at_position(self) -> Vector3 {
+        self.vector_field(Self::LOOK_AT_POSITION)
+    }
+
+    pub fn euler_angle(self) -> Vector3 {
+        self.vector_field(Self::EULER_ANGLE)
+    }
+
+    pub fn distance(self) -> f32 {
+        self.f32_field(Self::DISTANCE)
+    }
+
+    pub fn is_position_change_locked(self) -> bool {
+        self.bool_field(Self::IS_POSITION_CHANGE_LOCKED)
+    }
+
+    pub fn camera_shake(self) -> Option<CameraShake> {
+        self.optional_field(Self::CAMERA_SHAKE)
+    }
+
+    /// `adjust_camera_transform`: put the camera transform where the camera state says. It always sets the
+    /// Euler angles. Unless the position is locked it also places the camera behind the look-at point:
+    /// `position = look_at - rotation * (0, 0, distance)`, with `rotation` from the Euler angles in radians.
+    /// A camera shake, when there is one, then moves the position by its offset. The game re-reads the shake
+    /// field for the offset, as `exec_hit` re-reads its fields.
+    pub fn adjust_camera_transform<C: CameraCalls>(
+        self,
+        calls: &mut C,
+    ) -> Result<(), GuestException> {
+        let transform = calls.camera_transform(self.camera(), TransformSite::Entry)?;
+        calls.set_euler_angles(transform, self.euler_angle())?;
+        let shake = if self.is_position_change_locked() {
+            self.camera_shake()
+        } else {
+            let transform = calls.camera_transform(self.camera(), TransformSite::Follow)?;
+            let angles = self.euler_angle().scaled(DEG2RAD, calls);
+            let rotation = calls.quaternion_from_euler_rad(angles)?;
+            let behind = calls.rotate(rotation, Vector3::new(0.0, 0.0, self.distance()))?;
+            let position = self.look_at_position().sub(behind, calls);
+            calls.set_position(transform, position)?;
+            let shake = self.camera_shake();
+            calls.safepoint(shake);
+            shake
+        };
+        let Some(shake) = shake else {
+            return calls.leave();
+        };
+        let transform = calls.camera_transform(self.camera(), TransformSite::Shake(shake))?;
+        let position = calls.get_position(transform)?;
+        let shake: CameraShake = self.object_field(Self::CAMERA_SHAKE);
+        let moved = position.add(shake.offset(), calls);
+        calls.set_position_tail(transform, moved, shake)
+    }
+}
+
+mod camera_site {
+    //! Callee addresses and the address after each `bl` in `adjust_camera_transform`.
+    pub const GET_TRANSFORM: u64 = 0x7101799d40;
+    pub const SET_EULER_ANGLES: u64 = 0x71017a7da0;
+    pub const GET_POSITION: u64 = 0x71017a7860;
+    pub const SET_POSITION: u64 = 0x71017a7910;
+    pub const FROM_EULER_RAD: u64 = 0x7102057610;
+    pub const MULTIPLY: u64 = 0x7102057ae0;
+    pub const RET_ENTRY_TRANSFORM: u64 = 0x7101e2cff4;
+    pub const RET_SET_EULER_ANGLES: u64 = 0x7101e2d004;
+    pub const RET_SHAKE_TRANSFORM: u64 = 0x7101e2d020;
+    pub const RET_GET_POSITION: u64 = 0x7101e2d02c;
+    pub const RET_FOLLOW_TRANSFORM: u64 = 0x7101e2d06c;
+    pub const RET_FROM_EULER_RAD: u64 = 0x7101e2d09c;
+    pub const RET_MULTIPLY: u64 = 0x7101e2d0b0;
+    pub const RET_SET_POSITION: u64 = 0x7101e2d0c8;
+    /// The poll after the follow step (the load of the shake field is the instruction before it).
+    pub const SAFEPOINT: u64 = 0x7101e2d0cc;
+    /// `Mathf.Deg2Rad` is built into x8 with mov and movk, then moved to s2.
+    pub const DEG2RAD_BITS: u64 = 0x3c8e_fa35;
+}
+
+/// The frame is 64 bytes (d10, x29, x30, d9, d8, x20, x19) and x29 points at sp + 0x20. As in `LiftedHit`, the
+/// lifted code writes a register to the context only at the first call after it changes, so each method writes
+/// just the registers the lifted code flushes at that site (floats as `ldr s` leaves them: `{bits, 0}`), and the
+/// entry values come back at the epilogue. The registers that are not flushed keep what the last callee left.
+struct LiftedCamera {
+    regs: Regs,
+    camera: BattleCamera,
+    /// x20 of the lifted body: the transform of the follow or shake step.
+    transform: u64,
+    entry_x19: u64,
+    entry_x20: u64,
+    entry_x29: u64,
+    entry_x30: u64,
+    entry_sp: u64,
+    /// d8, d9 and d10 are saved with `stp d` and restored with `ldp d`: the low 64 bits, upper half zero.
+    entry_d: [u64; 3],
+}
+
+impl LiftedCamera {
+    fn new(regs: Regs) -> Self {
+        Self {
+            camera: unsafe { BattleCamera::at(regs.x(0)) },
+            transform: 0,
+            entry_x19: regs.x(19),
+            entry_x20: regs.x(20),
+            entry_x29: regs.x(29),
+            entry_x30: regs.x(30),
+            entry_sp: regs.sp(),
+            entry_d: [regs.v_low(8), regs.v_low(9), regs.v_low(10)],
+            regs,
+        }
+    }
+
+    /// The epilogue: saved registers back, frame popped.
+    fn pop_frame(&mut self) {
+        self.regs.set_x(19, self.entry_x19);
+        self.regs.set_x(20, self.entry_x20);
+        self.regs.set_x(29, self.entry_x29);
+        self.regs.set_x(31, self.entry_sp);
+        for (n, low) in [
+            (8, self.entry_d[0]),
+            (9, self.entry_d[1]),
+            (10, self.entry_d[2]),
+        ] {
+            self.regs.set_v(n, low, 0);
+        }
+    }
+
+    fn set_vector(&mut self, first: usize, v: Vector3) {
+        self.regs.set_f32(first, v.x);
+        self.regs.set_f32(first + 1, v.y);
+        self.regs.set_f32(first + 2, v.z);
+    }
+
+    fn vector_result(&self) -> Vector3 {
+        Vector3::new(self.regs.v_f32(0), self.regs.v_f32(1), self.regs.v_f32(2))
+    }
+
+    /// The lifted `bl`: x30 is the address after it, then the callee runs on the register file.
+    fn call(&mut self, target: u64, return_address: u64) -> Result<(), GuestException> {
+        self.regs.set_x(30, return_address);
+        self.regs.invoke(target).map(|_| ())
+    }
+}
+
+impl Float32Ops for LiftedCamera {
+    fn fadd(&mut self, a: f32, b: f32) -> f32 {
+        let mut env = self.regs.fp_env();
+        let r = env.fadd32(a, b);
+        self.regs.set_fpsr(env.fpsr);
+        r
+    }
+    fn fsub(&mut self, a: f32, b: f32) -> f32 {
+        let mut env = self.regs.fp_env();
+        let r = env.fsub32(a, b);
+        self.regs.set_fpsr(env.fpsr);
+        r
+    }
+    fn fmul(&mut self, a: f32, b: f32) -> f32 {
+        let mut env = self.regs.fp_env();
+        let r = env.fmul32(a, b);
+        self.regs.set_fpsr(env.fpsr);
+        r
+    }
+}
+
+impl CameraCalls for LiftedCamera {
+    fn camera_transform(
+        &mut self,
+        camera: Camera,
+        site: TransformSite,
+    ) -> Result<Transform, GuestException> {
+        self.regs.set_x(0, camera.address());
+        self.regs.set_x(1, 0);
+        let return_address = match site {
+            TransformSite::Entry => {
+                // The first call: frame pushed, x19 = this.
+                let new_sp = self.entry_sp.wrapping_sub(64);
+                self.regs.set_x(19, self.camera.address());
+                self.regs.set_x(29, new_sp.wrapping_add(0x20));
+                self.regs.set_x(31, new_sp);
+                camera_site::RET_ENTRY_TRANSFORM
+            }
+            // x8 is the byte just tested (zero).
+            TransformSite::Follow => {
+                self.regs.set_x(8, 0);
+                camera_site::RET_FOLLOW_TRANSFORM
+            }
+            TransformSite::Shake(shake) => {
+                self.regs.set_x(8, shake.address());
+                camera_site::RET_SHAKE_TRANSFORM
+            }
+        };
+        self.call(camera_site::GET_TRANSFORM, return_address)?;
+        let transform = self.regs.x(0);
+        self.transform = transform;
+        Ok(unsafe { Transform::at(transform) })
+    }
+
+    fn set_euler_angles(
+        &mut self,
+        transform: Transform,
+        angles: Vector3,
+    ) -> Result<(), GuestException> {
+        // x0 is still the transform `get_transform` returned.
+        debug_assert_eq!(self.regs.x(0), transform.address());
+        self.regs.set_x(1, 0);
+        self.set_vector(0, angles);
+        self.call(
+            camera_site::SET_EULER_ANGLES,
+            camera_site::RET_SET_EULER_ANGLES,
+        )
+    }
+
+    fn quaternion_from_euler_rad(
+        &mut self,
+        euler_rad: Vector3,
+    ) -> Result<Quaternion, GuestException> {
+        // x8 = the Deg2Rad bits, x20 = transform, x0 = 0 (the method pointer); v0 to v2 the scaled angles, v3 the
+        // unscaled z (loaded for the multiply), v8 to v10 the look-at point (kept across the calls).
+        self.regs.set_x(0, 0);
+        self.regs.set_x(8, camera_site::DEG2RAD_BITS);
+        self.regs.set_x(20, self.transform);
+        self.set_vector(0, euler_rad);
+        self.regs.set_f32(3, self.camera.euler_angle().z);
+        let look_at = self.camera.look_at_position();
+        self.set_vector(8, look_at);
+        self.call(camera_site::FROM_EULER_RAD, camera_site::RET_FROM_EULER_RAD)?;
+        Ok(Quaternion {
+            x: self.regs.v_f32(0),
+            y: self.regs.v_f32(1),
+            z: self.regs.v_f32(2),
+            w: self.regs.v_f32(3),
+        })
+    }
+
+    fn rotate(
+        &mut self,
+        _rotation: Quaternion,
+        vector: Vector3,
+    ) -> Result<Vector3, GuestException> {
+        // The quaternion is still in v0 to v3 where `Internal_FromEulerRad` left it; the vector goes to v4 to v6.
+        self.regs.set_x(0, 0);
+        self.set_vector(4, vector);
+        self.call(camera_site::MULTIPLY, camera_site::RET_MULTIPLY)?;
+        Ok(self.vector_result())
+    }
+
+    fn set_position(
+        &mut self,
+        _transform: Transform,
+        position: Vector3,
+    ) -> Result<(), GuestException> {
+        self.regs.set_x(0, self.transform);
+        self.regs.set_x(1, 0);
+        self.set_vector(0, position);
+        self.call(camera_site::SET_POSITION, camera_site::RET_SET_POSITION)
+    }
+
+    fn get_position(&mut self, transform: Transform) -> Result<Vector3, GuestException> {
+        self.regs.set_x(1, 0);
+        self.regs.set_x(20, transform.address());
+        self.call(camera_site::GET_POSITION, camera_site::RET_GET_POSITION)?;
+        Ok(self.vector_result())
+    }
+
+    fn set_position_tail(
+        &mut self,
+        transform: Transform,
+        position: Vector3,
+        shake: CameraShake,
+    ) -> Result<(), GuestException> {
+        self.regs.set_x(0, transform.address());
+        self.regs.set_x(1, 0);
+        self.regs.set_x(8, shake.address());
+        self.regs.set_x(30, self.entry_x30);
+        self.pop_frame();
+        self.set_vector(0, position);
+        self.set_vector(3, shake.offset());
+        self.regs.invoke(camera_site::SET_POSITION).map(|_| ())
+    }
+
+    fn safepoint(&mut self, shake: Option<CameraShake>) {
+        let x8 = shake.map_or(0, GuestObject::address);
+        self.regs.safepoint(camera_site::SAFEPOINT, 8, x8);
+    }
+
+    fn leave(&mut self) -> Result<(), GuestException> {
+        // The lifted return flushes x19, x20, x29, d8 to d10 and sp (not x0, x8 or x30).
+        self.pop_frame();
+        Ok(())
+    }
+}
+
+/// 0x7101e2cfd0 `BattleCamera.adjust_camera_transform`. A pending exception from a callee stays in the register
+/// file, which is all the lifted body leaves too.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_camera_adjust_camera_transform(x: *mut u64) {
+    unsafe {
+        let regs = Regs::from_raw(x);
+        let camera = BattleCamera::at(regs.x(0));
+        let _ = camera.adjust_camera_transform(&mut LiftedCamera::new(regs));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,5 +1392,565 @@ mod tests {
             (file[19], file[29], file[30], file[31]),
             (0x1919, 0x2929, 0x3030, 0x8000)
         );
+    }
+}
+
+#[cfg(test)]
+mod camera_tests {
+    extern crate std;
+    use super::*;
+    use crate::bridge::tests::{CALLS, SAFEPOINTS, clear, fake_guest_bl, fake_safepoint, install};
+    use crate::fp::FpEnv;
+    use crate::{guest_ld8, guest_ld32, guest_ld64};
+    use std::vec;
+    use std::vec::Vec;
+
+    /// Fake object graph: the camera at word 0 (0xa0 bytes), a shake object at word 24.
+    struct Graph(std::boxed::Box<[u64; 40]>);
+
+    const SHAKE_WORD: usize = 24;
+
+    impl Graph {
+        fn new(
+            locked: u8,
+            shake: bool,
+            look: [u32; 3],
+            euler: [u32; 3],
+            distance: u32,
+            offset: [u32; 3],
+        ) -> Self {
+            let mut g = Self(std::boxed::Box::new([0; 40])); // boxed: the pointers inside must not move
+            let base = g.0.as_ptr() as u64;
+            g.0[2] = 0xca4e_0000_0000_c0de; // _camera, never dereferenced
+            for i in 0..3 {
+                g.set32(0x3c + 4 * i, look[i]);
+                g.set32(0x48 + 4 * i, euler[i]);
+                g.set32(8 * SHAKE_WORD + 0x34 + 4 * i, offset[i]);
+            }
+            g.set32(0x54, distance);
+            g.0[0x74 / 8] = u64::from(locked) << 32;
+            g.0[0x90 / 8] = if shake {
+                base + 8 * SHAKE_WORD as u64
+            } else {
+                0
+            };
+            g
+        }
+
+        fn set32(&mut self, byte: usize, value: u32) {
+            let bytes = self.0.as_mut_ptr() as *mut u8;
+            unsafe { bytes.add(byte).cast::<u32>().write_unaligned(value) };
+        }
+
+        fn address(&self) -> u64 {
+            self.0.as_ptr() as u64
+        }
+    }
+
+    // ---- the readable body, against a recorder ----
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Transform(&'static str),
+        SetEuler([u32; 3]),
+        FromEulerRad([u32; 3]),
+        Rotate([u32; 3]),
+        SetPosition([u32; 3]),
+        GetPosition,
+        SetPositionTail([u32; 3]),
+        Safepoint(bool),
+        Leave,
+    }
+
+    struct Recorder {
+        env: FpEnv,
+        events: Vec<Event>,
+    }
+
+    impl Float32Ops for Recorder {
+        fn fadd(&mut self, a: f32, b: f32) -> f32 {
+            self.env.fadd32(a, b)
+        }
+        fn fsub(&mut self, a: f32, b: f32) -> f32 {
+            self.env.fsub32(a, b)
+        }
+        fn fmul(&mut self, a: f32, b: f32) -> f32 {
+            self.env.fmul32(a, b)
+        }
+    }
+
+    impl CameraCalls for Recorder {
+        fn camera_transform(
+            &mut self,
+            _camera: Camera,
+            site: TransformSite,
+        ) -> Result<Transform, GuestException> {
+            self.events.push(Event::Transform(match site {
+                TransformSite::Entry => "entry",
+                TransformSite::Follow => "follow",
+                TransformSite::Shake(_) => "shake",
+            }));
+            Ok(unsafe { Transform::at(0x7777) })
+        }
+        fn set_euler_angles(&mut self, _t: Transform, a: Vector3) -> Result<(), GuestException> {
+            self.events.push(Event::SetEuler(a.bits()));
+            Ok(())
+        }
+        fn quaternion_from_euler_rad(&mut self, e: Vector3) -> Result<Quaternion, GuestException> {
+            self.events.push(Event::FromEulerRad(e.bits()));
+            Ok(Quaternion {
+                x: e.x,
+                y: e.y,
+                z: e.z,
+                w: 1.0,
+            })
+        }
+        fn rotate(&mut self, q: Quaternion, v: Vector3) -> Result<Vector3, GuestException> {
+            self.events.push(Event::Rotate(v.bits()));
+            Ok(Vector3::new(v.z * 0.5, q.x, q.y + v.z))
+        }
+        fn set_position(&mut self, _t: Transform, p: Vector3) -> Result<(), GuestException> {
+            self.events.push(Event::SetPosition(p.bits()));
+            Ok(())
+        }
+        fn get_position(&mut self, _t: Transform) -> Result<Vector3, GuestException> {
+            self.events.push(Event::GetPosition);
+            Ok(Vector3::new(10.0, 20.0, 30.0))
+        }
+        fn set_position_tail(
+            &mut self,
+            _t: Transform,
+            p: Vector3,
+            _s: CameraShake,
+        ) -> Result<(), GuestException> {
+            self.events.push(Event::SetPositionTail(p.bits()));
+            Ok(())
+        }
+        fn safepoint(&mut self, shake: Option<CameraShake>) {
+            self.events.push(Event::Safepoint(shake.is_some()));
+        }
+        fn leave(&mut self) -> Result<(), GuestException> {
+            self.events.push(Event::Leave);
+            Ok(())
+        }
+    }
+
+    fn bits(a: [f32; 3]) -> [u32; 3] {
+        [a[0].to_bits(), a[1].to_bits(), a[2].to_bits()]
+    }
+
+    fn run_recorder(g: &Graph) -> Vec<Event> {
+        let mut r = Recorder {
+            env: FpEnv::new(0, 0),
+            events: Vec::new(),
+        };
+        let camera = unsafe { BattleCamera::at(g.address()) };
+        camera.adjust_camera_transform(&mut r).unwrap();
+        r.events
+    }
+
+    #[test]
+    fn call_order_and_values_for_every_branch() {
+        let look = bits([1.5, -2.25, 100.0]);
+        let euler = bits([30.0, -45.0, 10.0]);
+        let offset = bits([0.5, 0.25, -0.125]);
+        let distance = 12.5f32.to_bits();
+        let rad = [30.0 * DEG2RAD, -45.0 * DEG2RAD, 10.0 * DEG2RAD];
+        // The recorder's rotate(q, v) is (v.z * 0.5, q.x, q.y + v.z) with q the angles in radians, v = (0, 0, d).
+        let behind = [12.5f32 * 0.5, rad[0], rad[1] + 12.5];
+        let position = bits([
+            1.5f32 - behind[0],
+            -2.25f32 - behind[1],
+            100.0f32 - behind[2],
+        ]);
+        let shaken = bits([10.5, 20.25, 29.875]);
+        // unlocked, no shake
+        let g = Graph::new(0, false, look, euler, distance, offset);
+        assert_eq!(
+            run_recorder(&g),
+            vec![
+                Event::Transform("entry"),
+                Event::SetEuler(euler),
+                Event::Transform("follow"),
+                Event::FromEulerRad(bits(rad)),
+                Event::Rotate(bits([0.0, 0.0, 12.5])),
+                Event::SetPosition(position),
+                Event::Safepoint(false),
+                Event::Leave,
+            ]
+        );
+        // unlocked, shake
+        let g = Graph::new(0, true, look, euler, distance, offset);
+        let events = run_recorder(&g);
+        assert_eq!(events[6], Event::Safepoint(true));
+        assert_eq!(
+            events[7..],
+            [
+                Event::Transform("shake"),
+                Event::GetPosition,
+                Event::SetPositionTail(shaken)
+            ]
+        );
+        // locked (any non-zero byte), no shake: only the angles
+        for flag in [1u8, 2, 0x80, 0xff] {
+            let g = Graph::new(flag, false, look, euler, distance, offset);
+            assert_eq!(
+                run_recorder(&g),
+                vec![
+                    Event::Transform("entry"),
+                    Event::SetEuler(euler),
+                    Event::Leave
+                ]
+            );
+        }
+        // locked, shake: angles, then the shake step, no follow step and no safepoint
+        let g = Graph::new(1, true, look, euler, distance, offset);
+        assert_eq!(
+            run_recorder(&g),
+            vec![
+                Event::Transform("entry"),
+                Event::SetEuler(euler),
+                Event::Transform("shake"),
+                Event::GetPosition,
+                Event::SetPositionTail(shaken),
+            ]
+        );
+    }
+
+    // ---- the shim, against a transcription of the lifted C (main_0343.c, f_7101e2cfd0) ----
+
+    const WORDS: usize = 100;
+    const FPCR_WORD: usize = 97; // fpcr is the high half of word 97, fpsr the low half of word 98
+
+    fn fop(file: &mut [u64; WORDS], op: u8, a: u64, b: u64) -> [u64; 2] {
+        let mut env = FpEnv::new((file[FPCR_WORD] >> 32) as u32, file[98] as u32);
+        let (a, b) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+        let r = match op {
+            0 => env.fmul32(a, b),
+            2 => env.fadd32(a, b),
+            _ => env.fsub32(a, b),
+        };
+        file[98] = (file[98] & !0xffff_ffff) | u64::from(env.fpsr);
+        [u64::from(r.to_bits()), 0]
+    }
+
+    fn call(file: &mut [u64; WORDS], target: u64) -> bool {
+        unsafe { fake_guest_bl(file.as_mut_ptr(), target) != 0 }
+    }
+
+    /// The lifted body, line by line: locals for the registers it keeps in C variables, a flush list at every
+    /// call site as the C writes it, and the reload of x0, x1 and v0 to v3 after each call.
+    #[allow(unused_assignments)]
+    fn lifted_reference(file: &mut [u64; WORDS]) {
+        let (mut x0, mut x1, mut x8);
+        let mut x19;
+        let mut x20;
+        let mut x29;
+        let mut x30;
+        let mut sp;
+        x0 = file[0];
+        x1 = file[1];
+        x19 = file[19];
+        x20 = file[20];
+        x29 = file[29];
+        sp = file[31];
+        let mut v: [[u64; 2]; 11] = [[0; 2]; 11];
+        for (n, slot) in v.iter_mut().enumerate() {
+            *slot = [file[32 + 2 * n], file[33 + 2 * n]];
+        }
+        let s = |bits: u32| [u64::from(bits), 0];
+        let (entry_x19, entry_x20, entry_x29, entry_sp) = (x19, x20, x29, sp);
+        let entry_x30 = file[30];
+        let entry_d = [v[8][0], v[9][0], v[10][0]];
+        let ld32 = |base: u64, off: u64| unsafe { guest_ld32(base + off) };
+
+        macro_rules! reload {
+            () => {
+                x0 = file[0];
+                x1 = file[1];
+                for n in 0..4 {
+                    v[n] = [file[32 + 2 * n], file[33 + 2 * n]];
+                }
+            };
+        }
+        macro_rules! put_x {
+            ($($n:expr => $val:expr),*) => { $( file[$n] = $val; )* };
+        }
+        macro_rules! put_v {
+            ($($n:expr),*) => { $( file[32 + 2 * $n] = v[$n][0]; file[33 + 2 * $n] = v[$n][1]; )* };
+        }
+
+        // prologue: frame, x29, x19 = this, then the first call
+        sp = sp.wrapping_sub(64);
+        x29 = sp + 0x20;
+        x19 = x0;
+        x0 = unsafe { guest_ld64(x0 + 0x10) };
+        x1 = 0;
+        x30 = 0x7101e2cff4;
+        put_x!(0 => x0, 1 => x1, 19 => x19, 29 => x29, 30 => x30, 31 => sp);
+        if call(file, 0x7101799d40) {
+            return;
+        }
+        reload!();
+        v[0] = s(ld32(x19, 0x48));
+        v[1] = s(ld32(x19, 0x4c));
+        x1 = 0;
+        v[2] = s(ld32(x19, 0x50));
+        x30 = 0x7101e2d004;
+        put_x!(1 => x1, 30 => x30);
+        put_v!(0, 1, 2);
+        if call(file, 0x71017a7da0) {
+            return;
+        }
+        reload!();
+        x8 = u64::from(unsafe { guest_ld8(x19 + 0x74) });
+        let to_shake;
+        if x8 as u32 == 0 {
+            // d060: follow the look-at point
+            x0 = unsafe { guest_ld64(x19 + 0x10) };
+            x1 = 0;
+            x30 = 0x7101e2d06c;
+            put_x!(0 => x0, 1 => x1, 8 => x8, 30 => x30);
+            if call(file, 0x7101799d40) {
+                return;
+            }
+            reload!();
+            x8 = 0xfa35;
+            x8 |= 0x3c8e << 16;
+            v[2] = s(x8 as u32);
+            v[1] = s(ld32(x19, 0x4c));
+            v[3] = s(ld32(x19, 0x50));
+            v[1] = fop(file, 0, v[1][0], v[2][0]);
+            v[10] = s(ld32(x19, 0x44));
+            v[0] = s(ld32(x19, 0x48));
+            v[0] = fop(file, 0, v[0][0], v[2][0]);
+            v[2] = fop(file, 0, v[3][0], v[2][0]);
+            v[8] = s(ld32(x19, 0x3c));
+            v[9] = s(ld32(x19, 0x40));
+            x20 = x0;
+            x0 = 0;
+            x30 = 0x7101e2d09c;
+            put_x!(0 => x0, 8 => x8, 20 => x20, 30 => x30);
+            put_v!(0, 1, 2, 3, 8, 9, 10);
+            if call(file, 0x7102057610) {
+                return;
+            }
+            reload!();
+            v[4] = [0, 0];
+            v[6] = s(ld32(x19, 0x54));
+            x0 = 0;
+            v[5] = v[4];
+            x30 = 0x7101e2d0b0;
+            put_x!(0 => x0, 30 => x30);
+            put_v!(4, 5, 6);
+            if call(file, 0x7102057ae0) {
+                return;
+            }
+            reload!();
+            v[0] = fop(file, 1, v[8][0], v[0][0]);
+            v[1] = fop(file, 1, v[9][0], v[1][0]);
+            x0 = x20;
+            v[2] = fop(file, 1, v[10][0], v[2][0]);
+            x1 = 0;
+            x30 = 0x7101e2d0c8;
+            put_x!(0 => x0, 1 => x1, 30 => x30);
+            put_v!(0, 1, 2);
+            if call(file, 0x71017a7910) {
+                return;
+            }
+            reload!();
+            x8 = unsafe { guest_ld64(x19 + 0x90) };
+            unsafe { fake_safepoint(file.as_mut_ptr(), 0x7101e2d0cc, 8, x8) };
+            to_shake = x8 != 0;
+        } else {
+            x8 = unsafe { guest_ld64(x19 + 0x90) };
+            to_shake = x8 != 0;
+        }
+        if to_shake {
+            // d014: add the shake offset, then jump to set_position
+            x0 = unsafe { guest_ld64(x19 + 0x10) };
+            x1 = 0;
+            x30 = 0x7101e2d020;
+            put_x!(0 => x0, 1 => x1, 8 => x8, 30 => x30);
+            if call(file, 0x7101799d40) {
+                return;
+            }
+            reload!();
+            x1 = 0;
+            x20 = x0;
+            x30 = 0x7101e2d02c;
+            put_x!(1 => x1, 20 => x20, 30 => x30);
+            if call(file, 0x71017a7860) {
+                return;
+            }
+            reload!();
+            x8 = unsafe { guest_ld64(x19 + 0x90) };
+            x0 = x20;
+            x1 = 0;
+            v[9] = [entry_d[1], 0];
+            v[8] = [entry_d[0], 0];
+            v[5] = s(ld32(x8, 0x3c));
+            v[3] = s(ld32(x8, 0x34));
+            v[4] = s(ld32(x8, 0x38));
+            v[1] = fop(file, 2, v[1][0], v[4][0]);
+            x20 = entry_x20;
+            x19 = entry_x19;
+            v[0] = fop(file, 2, v[0][0], v[3][0]);
+            x29 = entry_x29;
+            x30 = entry_x30;
+            v[2] = fop(file, 2, v[2][0], v[5][0]);
+            v[10] = [entry_d[2], 0];
+            sp = entry_sp;
+            put_x!(0 => x0, 1 => x1, 8 => x8, 19 => x19, 20 => x20, 29 => x29, 30 => x30, 31 => sp);
+            put_v!(0, 1, 2, 3, 4, 5, 8, 9, 10);
+            call(file, 0x71017a7910);
+            return;
+        }
+        // d0d0: return (x0, x1, x8 and x30 are not flushed)
+        v[9] = [entry_d[1], 0];
+        v[8] = [entry_d[0], 0];
+        x20 = entry_x20;
+        x19 = entry_x19;
+        x29 = entry_x29;
+        v[10] = [entry_d[2], 0];
+        sp = entry_sp;
+        put_x!(19 => x19, 20 => x20, 29 => x29, 31 => sp);
+        put_v!(8, 9, 10);
+        let _ = (x0, x1, x30);
+    }
+
+    /// A fake callee that leaves a result in every register a real callee may clobber, derived from every
+    /// register it is given, so a wrong staged register at any call changes the final file.
+    fn scramble(r: &mut [u64]) {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (i, w) in r.iter().enumerate() {
+            h = (h ^ *w ^ ((i as u64) << 56)).wrapping_mul(0x0000_0100_0000_01b3);
+            h ^= h >> 29;
+        }
+        r[0] = h & 0xffff_ffff_ffff_fff0;
+        r[1] = h.rotate_left(7);
+        r[8] = h.rotate_left(13);
+        for n in 0..4usize {
+            r[32 + 2 * n] = 0x3f00_0000 + ((h.rotate_left(n as u32 * 11) >> 40) & 0x00ff_ffff);
+            r[33 + 2 * n] = 0;
+        }
+        for n in 4..8usize {
+            r[32 + 2 * n] = h.rotate_left(n as u32) & 0xffff_ffff;
+            r[33 + 2 * n] = 0;
+        }
+    }
+
+    const CALLEES: [u64; 6] = [
+        camera_site::GET_TRANSFORM,
+        camera_site::SET_EULER_ANGLES,
+        camera_site::GET_POSITION,
+        camera_site::SET_POSITION,
+        camera_site::FROM_EULER_RAD,
+        camera_site::MULTIPLY,
+    ];
+
+    fn random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn edge_float(state: &mut u64) -> u32 {
+        const EDGES: [u32; 14] = [
+            0,
+            0x8000_0000,
+            1,
+            0x8000_0001,
+            0x0080_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x7f7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0001,
+            0x7f80_0001,
+            0xffc0_1234,
+            0x4348_0000,
+        ];
+        let r = random(state);
+        if r & 3 == 0 {
+            (r >> 8) as u32
+        } else {
+            EDGES[((r >> 8) as usize) % EDGES.len()]
+        }
+    }
+
+    fn install_all() {
+        clear();
+        for target in CALLEES {
+            install(target, scramble);
+        }
+    }
+
+    #[test]
+    fn shim_matches_the_lifted_transcription_in_every_branch_and_fp_mode() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let modes = [
+            0u32,
+            1 << 24,
+            1 << 25,
+            (1 << 24) | (1 << 25),
+            1 << 22,
+            2 << 22,
+            3 << 22,
+        ];
+        let mut cases = 0;
+        for locked in [0u8, 1, 0xff] {
+            for shake in [false, true] {
+                for fpcr in modes {
+                    for _ in 0..40 {
+                        let mut f = || edge_float(&mut seed);
+                        let g = Graph::new(
+                            locked,
+                            shake,
+                            [f(), f(), f()],
+                            [f(), f(), f()],
+                            f(),
+                            [f(), f(), f()],
+                        );
+                        let mut file = [0u64; WORDS];
+                        for w in file.iter_mut().take(96) {
+                            *w = random(&mut seed);
+                        }
+                        file[0] = g.address();
+                        file[31] = 0x7000_0000;
+                        file[FPCR_WORD] =
+                            (u64::from(fpcr) << 32) | (random(&mut seed) & 0xffff_ffff);
+                        file[98] = random(&mut seed) & 0x0000_0000_0800_009f;
+                        let mut expected = file;
+                        install_all();
+                        lifted_reference(&mut expected);
+                        let expected_calls: Vec<u64> = CALLS.with(|c| c.borrow().clone());
+                        let expected_safepoints: Vec<u64> = SAFEPOINTS.with(|c| c.borrow().clone());
+                        install_all();
+                        unsafe { smrpg_camera_adjust_camera_transform(file.as_mut_ptr()) };
+                        let calls: Vec<u64> = CALLS.with(|c| c.borrow().clone());
+                        let safepoints: Vec<u64> = SAFEPOINTS.with(|c| c.borrow().clone());
+                        assert_eq!(calls, expected_calls, "call order");
+                        assert_eq!(safepoints, expected_safepoints, "safepoints");
+                        let diff: Vec<usize> =
+                            (0..WORDS).filter(|&i| file[i] != expected[i]).collect();
+                        assert!(
+                            diff.is_empty(),
+                            "words {diff:?} differ (locked {locked} shake {shake} fpcr {fpcr:#x}) calls {calls:x?}"
+                        );
+                        for i in 0..WORDS {
+                            assert_eq!(
+                                file[i], expected[i],
+                                "word {i} (locked {locked} shake {shake} fpcr {fpcr:#x})"
+                            );
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 3 * 2 * 7 * 40);
     }
 }

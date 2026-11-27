@@ -130,12 +130,12 @@ game's own class, field and method names. Conventions, so later ports match:
   read (bool bytes 0, 1, 2, 0x80, 0xff; statuses 0 to 12 and the 32-bit edges; counts at the signed edges; a null
   parent one time in eight). A new class needs a graph builder like it. `cargo test` repeats the logic against
   an independent reference written from the disassembly (the status bit mask 0x248, for one).
-- Floating point is not in these ports. A float port must keep the lifted operation order and fusing, and the
-  selftest must include NaN, infinities, signed zeros and subnormals.
+- Floating point goes through `fp.rs` (task-53, next section). A float port keeps the lifted operation order and
+  operand order, and its selftest graph carries NaN, infinities, signed zeros and subnormals and every FPCR mode.
 
 First readable ports: `Battle.BadStatusManager.can_command`, `Battle.BattleCharacterParam` (`is_dead`,
 `is_gone`, `is_invincible`, `can_battle`, `can_targetting`, `can_act`, `can_use_any_command`) and
-`MotionSpecial_Mario.can_bunnage_globe` (nine rows, task-51). Task-52 adds `Battle.BattleHit.exec_hit` (`ELEAF`, compared by replay; see the next section).
+`MotionSpecial_Mario.can_bunnage_globe` (nine rows, task-51). Task-52 adds `Battle.BattleHit.exec_hit` (`ELEAF`, compared by replay; see the next section). Task-53 adds the float layer and `Battle.BattleCamera.adjust_camera_transform` (see "Float layer").
 
 ## Guest-call bridge (task-52)
 
@@ -187,6 +187,65 @@ implements the callee trait, and the register staging with a fake bridge.
 
 Traced rows (`PLEAF(chunk, address)`, no Rust symbol) also count live calls of any lifted function in `ab` mode and run
 the lifted body unchanged, which is how the candidate table in `backlog/tasks/task-52.md` got its live evidence.
+
+## Float layer (task-53)
+
+`decomp/smrpg_decomp/src/fp.rs` is the Rust version of the scalar float helpers in `runtime/ir_simd_a.h`, so a port can do
+float arithmetic and leave the context exactly as the lifted body does. The lifted instructions call `sa_fp2`, `sa_fp3`,
+`sa_fcmp`, `sa_fcvt`, `sa_fcvti` and `sa_cvtf`; each has a fast path (host SSE/FMA with error-free transformations, only when
+FPCR is 0 and the operands are ordinary finite numbers) and a soft path (`sa_s_*`, the ARM pseudocode in integer arithmetic).
+`fp.rs` ports the soft path line by line (`unpack`, `round`, `sum`, the NaN rules), in single and double precision, and uses
+no host float operation (so MXCSR and the compiler cannot change a result or a NaN payload). `FpEnv { fpcr, fpsr }` carries the
+state: FPCR is read (FZ bit 24, DN bit 25, RMode bits 23:22), cumulative FPSR flags (IOC, DZC, OFC, UFC, IXC, IDC) are OR-ed in
+and never cleared. Operations: `addsub_bits`, `mul_bits`, `div_bits`, `fma_bits` and `fp3_bits` (fmadd, fmsub, fnmadd,
+fnmsub), `fcmp_bits` (fcmp and fcmpe, returns NZCV), `minmax_bits` (fmax, fmin, fmaxnm, fminnm), `cvt_bits` (single and
+double), `tofix_bits` (fcvtz*, fcvtn*, fcvtp*, fcvtm*, fcvta*, with fixed-point bits) and `fromfix_bits` (scvtf, ucvtf), plus
+typed `f32` and `f64` wrappers (`fadd32`, `fmul32`, `fmadd32`, `fcmp32`, `fadd64`, and so on). Ports use the `Float32Ops` trait
+(`fadd`, `fsub`, `fmul`); `Regs::fp_env()` and `Regs::set_fpsr()` read and write the context's FPCR and FPSR, which the shim does
+around every operation because a callee may have changed the flags. Not covered, as in the C: half precision, AHP, FEAT_AFP
+(AH, FIZ, NEP), trapped exceptions, `fsqrt`, `frint*`, the estimate and step instructions, and vector forms. Where the C and the ARM
+pseudocode would differ, `fp.rs` follows the C; the selftest below found no such case.
+
+Evidence that it matches the lifted helpers: `runtime/decomp/fp_selftest.c` (run at startup under `SMRPG_DECOMP=ab
+SMRPG_DECOMP_SELFTEST=1`, before the row selftests) calls the C helpers and `smrpg_fp_selftest_op` on the same operands and
+compares result and FPSR. It covers 14 arithmetic and compare ops, the two format conversions, float to integer in all five
+rounding modes with fixed-point bits, and integer to float, in both precisions, for every pair of 37 to 45 edge operands (zeros,
+denormals, rounding boundaries, extremes, infinities, quiet and signaling NaNs with payloads) in ten FPCR modes (0, FZ, DN,
+FZ+DN, RMode 1, 2, 3 and three mixes), plus 60,000 random pairs per op (windowed exponents for cancellation), with a random
+FPSR going in: 2,732,380 cases, 0 differences. `cargo test` holds 14 hand-computed cases (tie to even, the four rounding modes,
+overflow to infinity or the largest finite number, divide by zero, NaN propagation and default NaN, denormal inputs and
+results under FZ with IDC and UFC, signed zero in every mode, fused versus split multiply-add, compare flags, min and max with
+zeros and NaNs, conversions, double precision).
+
+`unity.rs` holds `Vector3`, `Quaternion`, `Camera` and `Transform`; `Vector3` arithmetic goes through `Float32Ops` in the compiled
+operand order.
+
+### BattleCamera.adjust_camera_transform
+
+Row `ELEAF(main_0343, 7101e2cfd0, smrpg_camera_adjust_camera_transform)`, replay-compared (the six callees are `PLEAF` rows:
+`Component.get_transform` main_0273, `Transform.set_eulerAngles`, `get_position`, `set_position` main_0274,
+`Quaternion.Internal_FromEulerRad` and `op_Multiply` main_0364). The readable body (`BattleCamera::adjust_camera_transform`
+in `battle.rs`): set the camera transform's Euler angles from `_euler_angle`; unless `_is_position_change_locked`, place the
+camera at `_look_at_position - Quaternion.Euler(_euler_angle * Deg2Rad) * (0, 0, _distance)`; if there is a `_camera_shake`,
+add its `offset` to the position (jump to `set_position`). The compiled code reads `_camera_shake` before the safepoint and
+again for the offset; the port does the same. The shim (`LiftedCamera`) writes at each call the registers the lifted body
+flushes (including `v3`, `v8` to `v10`, x8 as the Deg2Rad bits, x20 as the transform), restores x19, x20, x29, d8 to d10 and sp
+at the epilogue, and lets the Quaternion and Vector3 results stay in v0 to v3 where the callees left them. `cargo test` checks the
+shim against a transcription of the lifted C (`lifted_reference`, with scrambling fake callees that hash every register they are
+handed) over 1,680 graphs (3 flag values, shake or none, 7 FPCR modes, edge floats): the whole register file, call order and
+safepoints must be equal.
+
+The loop back-edge safepoint (`g_gc_pending`, `gc_poll`) is `Regs::safepoint` and `smrpg_guest_safepoint` in `swap.c`: with a
+collection pending it writes the one register the lifted code flushes there and `c->pc`, and polls (not in a replay trial). A
+race where the lifted body saw `g_gc_pending` set and the trial did not (or the reverse) would show as a mismatch; none seen.
+
+Build note: the first float code in the Rust archive references the MSVC marker `_fltused`; `swap.c` defines it.
+
+What the live A/B can and cannot see (found by mutation, task-53). FPSR flags are sticky: after the game's first inexact
+operation IXC is set for good, so a port that forgets IXC is invisible to the live compare. The startup selftest catches it
+(the flag mutation of the card: 185,516 differences at 0.4 s). Wrong results (operand order, rounding) are caught live at the
+first follow-step call. Live, the camera runs the follow step without a shake (every mismatch of the mutation runs had 6
+recorded calls); the shake branches are covered by the selftest and the Rust tests, not by the game route.
 
 ## Reproduce the comparison
 

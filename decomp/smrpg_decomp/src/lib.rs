@@ -2,7 +2,9 @@
 
 pub mod battle;
 pub mod bridge;
+pub mod fp;
 pub mod object;
+pub mod unity;
 
 #[cfg(not(test))]
 #[panic_handler]

@@ -74,5 +74,5 @@ foreach(chunk IN LISTS chunks)
   set_source_files_properties("${wrapped}" PROPERTIES COMPILE_OPTIONS "-w;-fno-exceptions;-g0")   # task-47: unwrapped lifted objects carry no DWARF; -g added 550 KB of 605 KB per chunk
   target_sources(smrpg_boot PRIVATE "${wrapped}")
 endforeach()
-target_sources(smrpg_boot PRIVATE "${glue}/swap.c")
+target_sources(smrpg_boot PRIVATE "${glue}/swap.c" "${glue}/fp_selftest.c")
 target_compile_definitions(smrpg_boot PRIVATE SMRPG_DECOMP_BUILT=1)

@@ -359,6 +359,7 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
  * load rows (LEAF, GLEAF, NLEAF, DLEAF, VLEAF loads and constants). Any other target in `ab` mode stops the run
  * (exit 10) instead of running a side effect twice. `on` mode runs the port once, so it has no such limit. */
 _Static_assert(offsetof(Ctx, v) == 256, "decomp bridge: Rust reads v0..v31 at x + 32 words");
+_Static_assert(offsetof(Ctx, fpcr) == 780 && offsetof(Ctx, fpsr) == 784, "decomp bridge: Rust reads FPCR and FPSR at byte 780 and 784 (task-53)");
 
 static const uint64_t pure_callees[] = {
 #define PURE_FN(addr) 0x##addr##ULL,
@@ -424,6 +425,23 @@ int smrpg_guest_bl(uint64_t *x, uint64_t target) {
     if (f) f(c);
     else rt_icall(c, target);   /* no lifted entry: interpreter fallback, which also sets c->pc like a miss */
     return c->exc != 0;
+}
+
+/* The Rust archive is built for a Windows msvc target, where any float use references the CRT marker `_fltused`
+ * (first float code in the archive: fp.rs and the camera port, task-53). This build links no msvc CRT, so define it. */
+int _fltused = 0;
+
+/* The lifted loop back-edge safepoint (task-53, bridge.rs Regs::safepoint): with a collection pending it flushes the
+ * register the lifted code flushes at that point, records the pc and polls; otherwise it does nothing, exactly as
+ * `if (g_gc_pending != 0) { c->x[reg] = ...; c->pc = pc; gc_poll(c); }` does. A replay trial (the lifted body already
+ * ran and polled) only imitates the context change. */
+void smrpg_guest_safepoint(uint64_t *x, uint64_t pc, uint32_t reg, uint64_t value) {
+    Ctx *c = (Ctx *)(void *)x;
+    if (__builtin_expect(g_gc_pending != 0, 0)) {
+        c->x[reg] = value;
+        c->pc = pc;
+        if (!tl_replay) gc_poll(c);
+    }
 }
 
 static uint64_t random_word(uint64_t *state) {
@@ -553,6 +571,30 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->x[0] = base;
         break;
     }
+    case 0x7101e2cfd0ULL: { /* Battle.BattleCamera.adjust_camera_transform (task-53): floats at +0x3c, +0x48, +0x54; flag +0x74;
+                             * shake object at +0x90 with its offset at +0x34. Float edges and every FPCR mode. */
+        fill_fake_region(fake, 64, state);
+        static const uint32_t edge_floats[] = {
+            0, 0x80000000u, 1, 0x80000001u, 0x007fffffu, 0x00800000u, 0x3f800000u, 0xbf800000u, 0x3f800001u, 0x33800000u,
+            0x4b000000u, 0x42b40000u, 0xc2b40000u, 0x43b40000u, 0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+            0x7fc00000u, 0xffc01234u, 0x7f800001u, 0x7fbfffffu, 0x3c8efa35u, 0x3eaaaaabu};
+        unsigned char *bytes = (unsigned char *)fake;
+        static const unsigned float_fields[] = {0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 8 * 32 + 0x34, 8 * 32 + 0x38, 8 * 32 + 0x3c};
+        for (unsigned i = 0; i < RT_ARRAY_LEN(float_fields); ++i) {
+            uint64_t r = random_word(state);
+            uint32_t value = (r & 3) == 0 ? (uint32_t)(r >> 8) : edge_floats[(r >> 8) % RT_ARRAY_LEN(edge_floats)];
+            memcpy(bytes + float_fields[i], &value, 4);
+        }
+        static const unsigned char flags[] = {0, 0, 1, 2, 0x80, 0xff};
+        bytes[0x74] = flags[(pick >> 8) % RT_ARRAY_LEN(flags)];
+        fake[0x90 / 8] = ((pick >> 16) & 3) == 0 ? 0 : base + 8 * 32;   /* _camera_shake, null one time in four */
+        fake[2] = random_word(state);                                   /* _camera: passed on, never read */
+        c->x[0] = base;
+        static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
+        c->fpcr = fpcr_modes[(pick >> 24) % RT_ARRAY_LEN(fpcr_modes)];
+        c->fpsr = (uint32_t)(pick >> 32) & 0x0800009fu;
+        break;
+    }
     default:
         break;
     }
@@ -667,6 +709,7 @@ void decomp_start(void) {
         return;
     }
     const char *test = getenv("SMRPG_DECOMP_SELFTEST");
+    if (mode == AB && test && !strcmp(test, "1")) decomp_fp_selftest();
     for (int i = 0; i < leaf_count; ++i) {
         Leaf *leaf = &leaves[i];
         GuestFn entry = rt_lookup(leaf->address);

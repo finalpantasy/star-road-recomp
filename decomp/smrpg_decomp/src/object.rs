@@ -35,6 +35,11 @@ pub trait GuestObject: Copy {
         self.u32_field(offset) as i32
     }
 
+    /// `float` field: the 32 bits as they are, a NaN payload included.
+    fn f32_field(self, offset: u64) -> f32 {
+        f32::from_bits(self.u32_field(offset))
+    }
+
     fn u32_field(self, offset: u64) -> u32 {
         unsafe { guest_ld32(self.address().wrapping_add(offset)) }
     }
