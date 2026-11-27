@@ -259,6 +259,11 @@ static int check_store_journal(Leaf *leaf) {
     int bad = tl_st_overflow;
     if (bad) rt_log("decomp store journal addr=%#llx: more than %d stores", (unsigned long long)leaf->address, PRE_MAX);
     for (unsigned i = 0; i < tl_st_n; ++i) {
+        /* a cell stored twice (a default, then the real value) must match memory only at its last store (task-56) */
+        int superseded = 0;
+        for (unsigned k = i + 1; k < tl_st_n; ++k)
+            if (tl_st[k].addr == tl_st[i].addr && tl_st[k].size == tl_st[i].size) superseded = 1;
+        if (superseded) continue;
         uint64_t now = raw_load(tl_st[i].addr, tl_st[i].size);
         if (now != tl_st[i].value) {
             bad = 1;
@@ -615,7 +620,7 @@ static void fill_fake_region(uint64_t *words, unsigned count, uint64_t *state) {
  * memory). Returns which object x0 is: 1 param, 2 status manager, 3 Mario motion special, 0 not a battle port. */
 static int battle_object_kind(uint64_t address) {
     switch (address) {
-    case 0x71021bdec0ULL: case 0x71021bcb30ULL: case 0x71021c3540ULL: case 0x71021c3600ULL:
+    case 0x71021c3bb0ULL: case 0x71021bdec0ULL: case 0x71021bcb30ULL: case 0x71021c3540ULL: case 0x71021c3600ULL:
     case 0x71021c3580ULL: case 0x71021c3640ULL: case 0x71021c35a0ULL: return 1;
     case 0x7101e2fa80ULL: return 2;
     case 0x7101e73c40ULL: return 3;
@@ -647,6 +652,8 @@ static void prepare_battle(int kind, Ctx *c, uint64_t *fake, uint64_t *state) {
     uint32_t act = battle_edge_word(state), turn = battle_edge_word(state), kind_word = battle_edge_word(state);
     memcpy(param + 0x5c, &act, 4);
     memcpy(buff + 0x28, &turn, 4);
+    uint32_t barriers = battle_edge_word(state);                  /* is_barriered (task-56): _barrier_num at +0x2c */
+    memcpy(buff + 0x2c, &barriers, 4);
     memcpy(status + 0x10, &kind_word, 4);
     memcpy(param + 0x98, &(uint64_t){base + 8 * 24}, 8);
     memcpy(param + 0xa0, &(uint64_t){base + 8 * 32}, 8);
@@ -800,6 +807,30 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
         c->fpcr = fpcr_modes[(pick >> 56) % RT_ARRAY_LEN(fpcr_modes)];
         c->fpsr = (uint32_t)(pick >> 32) & 0x0800009fu;
+        break;
+    }
+    case 0x71021f7ea0ULL: { /* Battle.SkillExecter.set_acction_command_ratio (task-56): +0x18 result record, +0x20 acter param (+0x6c _is_player),
+                             * +0x30 skill object (+0x14 _skill_id). Every skill id of the 129 entry table and its neighbors, enemy and player. */
+        fill_fake_region(fake, 64, state);
+        unsigned char *bytes = (unsigned char *)fake;
+        fake[3] = base + 8 * 24;
+        fake[4] = base + 8 * 8;
+        fake[6] = base + 8 * 40;
+        static const unsigned char flags[] = {0, 0, 1, 1, 1, 2, 0x80, 0xff};
+        bytes[8 * 8 + 0x6c] = flags[(pick >> 8) % RT_ARRAY_LEN(flags)];
+        static const uint32_t edge_ids[] = {0x2d6, 0x2d7, 0x2d8, 0, 1, 2, 0xffffffffu, 0x80000000u, 0x7fffffffu, 0x80, 0x81, 0x82, 0x83, 0x100};
+        uint32_t id = ((pick >> 20) & 7) == 0 ? edge_ids[(pick >> 24) % RT_ARRAY_LEN(edge_ids)] : (uint32_t)((pick >> 24) % 0x90);
+        memcpy(bytes + 8 * 40 + 0x14, &id, 4);
+        c->x[0] = base;
+        break;
+    }
+    case 0x71021be280ULL: { /* Battle.BattleCharacterParam.use_damage_guard (task-56): param +0xb8 -> logger, flag byte at +0x49 */
+        fill_fake_region(fake, 64, state);
+        unsigned char *bytes = (unsigned char *)fake;
+        fake[0xb8 / 8] = base + 8 * 32;
+        static const unsigned char flag_values[] = {0, 0, 1, 2, 0xff};
+        bytes[8 * 32 + 0x49] = flag_values[(pick >> 8) % RT_ARRAY_LEN(flag_values)];
+        c->x[0] = base;
         break;
     }
     case 0x71021be3c0ULL: { /* Battle.BattleCharacterParam.calc_element (task-55): param +0xa8 -> ElementManager, +0x10 -> int[] (length +0x18, elements +0x20) */

@@ -378,6 +378,55 @@ Done instead: the two attack stat methods, `calc_element`, the machinery above, 
 live counts) for the callees listed. Next in order: `set_acction_command_ratio` (102 instructions, stores only, jump
 table), `calc_belome_barrior_ratio`, `calc_renkei_ratio`, `group_a_b`, then the driver.
 
+## damage_calc (task-56): three callees ported, the driver not
+
+Done means for this task was the driver; it is not finished. What is built and compared:
+
+- `Battle.SkillExecter.set_acction_command_ratio` (0x71021f7ea0, 102 lifted instructions, `QLEAF`), `Battle.BattleCharacterParam.use_damage_guard`
+  (0x71021be280, `QLEAF`) and `is_barriered` (0x71021c3bb0, `LEAF`) in `decomp/smrpg_decomp/src/battle/damage.rs`, with IL2CPP names and field
+  offsets (`SkillExecter` +0x18 `_cur_skill_result`, +0x20 `_acter`, +0x30 `_skill_obj`; `SkillResultOneSkill` +0x22 `_is_geno_hoarding_skill`,
+  +0x50 `_action_command_succeed_ratio`, +0x54 `_action_command_sweetspot_ratio`, +0x58 `_hosei_ratio`, +0x5c `_is_renzoku_cmd_skill`;
+  `BuffManager` +0x2c `_barrier_num`; `CharaSkillResultLogger` +0x49 `_is_use_barrior`). The compiled `set_acction_command_ratio` jumps through a
+  129 byte table (read from the image, `id - 1` as an unsigned index; 23 entries differ from the default, the others and every index above 0x80 take it). The port spells the table as
+  `CommandRule::of(skill_id)`: eight rules, every other id zeroes both ratios, an enemy (`_is_player == 0`) gets -0.5 and -1.0 (and -0.0 for id 727).
+  The three methods flush no register, so the port leaves the register file alone.
+- Out-parameter and store-through-pointer callees, the mechanism built. A callee that writes memory is never run twice in `ab` mode because a
+  row is a replay row: the lifted body runs once on live memory and the port runs on a copy of the entry context with its stores journaled
+  (`GuestStore`, `prestate::store_u8`, new `prestate::store_u32`). The pre hook snapshots every cell the port may write (`watch`), so a store the
+  lifted body made and the port did not (or the other way round, or with another value) is a mismatch. This is also how an out parameter of a
+  ported callee is compared: the callee's store to the caller's slot is a journaled store. Fix in `check_store_journal`: a cell the port stores
+  twice (a default, then the real value; `_is_renzoku_cmd_skill` is cleared first and set later) now has to match memory at its last store only.
+  Before, the earlier entry compared against the final memory and reported a false difference.
+- Selftest graphs (`prepare_caller`, `prepare_battle` in `swap.c`): executer, acter, result record and skill object for `set_acction_command_ratio`
+  (skill ids 0 to 0x8f in every run and the table edges 0x80 to 0x83, 0x2d6 to 0x2d8, 0, 1, 2 and the 32-bit extremes; `_is_player` 0, 1, 2, 0x80,
+  0xff), a logger for `use_damage_guard`, and `_barrier_num` edge values for `is_barriered`: 25,625 calls each, 0 differences.
+- Mutation results and live counts are in `backlog/tasks/task-56.md`.
+
+Why the driver is not ported (measured from the lifted C of 0x71021ff580, 1,750 lines, 613 instructions). Its call sites, by callee: 29
+`initialize_runtime_metadata` (the first-call lazy initialization behind the flag byte 0x7103cba000 + 0xd71), 19 `DebugMonitor.write`-shaped calls
+(0x71018bebc0: x0 is `_monitor`, x1 a string literal from the metadata page) plus 4 string concatenations (0x71020147d0), 3 number-to-string
+calls (0x710213a840) and 0x71018bebf0, 8 class-initializer checks (0x71000c4330) each followed by a safepoint, the small tests
+(`calc_element`, `is_barriered`, `use_damage_guard`, `is_invincible` 0x71021bcb30, `Math.Max`), the four formula callees (`calc_renkei_ratio`, `set_acction_command_ratio`,
+`calc_belome_barrior_ratio`, `group_a_b`) and the event-queue tail (0x71000c5060, 0x7101d7c0c0, 0x710015b4c0, 0x7101886a00,
+0x7101d6a050: `System.Action` and `List<int>` calls with stores into the result logger). 21 distinct callees. Three things block a faithful
+port in this task:
+
+1. `REC_MAX` is 12 recorded callee calls per run; the first call alone makes 29 metadata calls before the formula, and the log lines add about 25 more. It would need to grow to about 48 and
+   `Recording` (two `Ctx` per call) move off the stack.
+2. The callees `calc_belome_barrior_ratio` (x2 = a float on the caller's stack, 341 lifted lines, a five way jump table, lazy initialization,
+   a delegate loop), `group_a_b` (x1 = an int on the stack, 1,165 lines) and `calc_renkei_ratio` (757 lines, float math, a loop) are untraced
+   by a port and write results to the caller's stack frame. The driver reads those slots after the call. A replay port runs second, so it
+   would read the slot after later lifted code reused it. Design for a driver port, not built: a traced row may declare an out footprint
+   (register holding the pointer, byte count); the recorder saves those bytes right after the call; `Regs::invoke_out` returns them in a trial
+   (the callee never runs) and runs the callee and reads the slot in `on` mode. The port keeps its own stack locals in a shadow that the
+   row compares with the recorded bytes at each call (the pre-call footprint) so a wrong value passed by reference is a mismatch.
+3. Its selftest graph needs about ten classes (executer, two params with buff and element managers, skill object, result record, logger, three
+   static-field pages) and a lazy-initialization model for 29 metadata calls, as large again as the port.
+
+Still to do, in order: the three big callees as rows (each lazy-initialization plus event-queue code, like `get_calc_attack`), the out
+footprint and `REC_MAX` change above, then the driver. `is_invincible` and `calc_element` are ported already; the debug and string calls are
+Unity natives that stay lifted (traced `PLEAF` rows, to be added when the driver is ported).
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

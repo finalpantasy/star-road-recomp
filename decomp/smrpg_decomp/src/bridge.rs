@@ -109,6 +109,11 @@ pub mod prestate {
     pub fn store_u8(addr: u64, value: u8) {
         unsafe { smrpg_guest_store(addr, 1, u64::from(value)) }
     }
+
+    /// A four-byte store (a float or int field), journaled the same way.
+    pub fn store_u32(addr: u64, value: u32) {
+        unsafe { smrpg_guest_store(addr, 4, u64::from(value)) }
+    }
 }
 
 use crate::fp::{Float32Convert, FpEnv};
