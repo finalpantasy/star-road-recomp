@@ -41,7 +41,7 @@ Mark unresolved choices OPEN. Defaults are provisional unless explicitly approve
 - Revisit if: a leaf is found to differ from the original in a new scene; run `ab` first.
 
 ## D-014: Hand-written decomp may name game classes, fields and offsets
-- Date: 2026-11-27. Decided by: the Claude lead, as a reading of the AGENTS.md rule "Nothing from the game ever enters Git"; owner confirmation pending.
+- Date: 2026-11-27. Decided by: the Claude lead, as a reading of the AGENTS.md rule "Nothing from the game ever enters Git"; confirmed by the owner 2026-11-27 ("go on recos", accepting the recommended yes).
 - Decision: hand-written Rust ports (leaves.def rows, `decomp/smrpg_decomp/src/*.rs`) may use IL2CPP class, method and field names, field offsets and guest addresses, as facts about the binary. Bulk generated output (decompgen `gen.rs`, `gen.def`, `gen.index.tsv`) stays on A:. The metadata file itself, dumps, extracted text and lifted code never enter Git.
 - Why: the owner accepted task-29 with named leaves in Git; decomp projects publish names and offsets as a matter of course.
 - Revisit if: the owner says names or offsets must stay off GitHub; then the readable modules move to A: beside `gen.rs`.
