@@ -282,6 +282,13 @@ def _cs_apply(st, a, nm, f):
     prev, st.cmp = st.cmp, None
     if nm in ("b", "bcond", "cbz", "tbz"):
         return prev
+    if nm in ("bl", "blr"):
+        # AAPCS64: a returning callee preserves x19-x28 and x29; everything else it may have changed. Bounds keep
+        # their meaning (their keys are values of earlier instructions, and every caller-saved register becomes new).
+        for n in range(31):
+            if not 19 <= n <= 29:
+                st.regs[n] = ("w", a, n)
+        return prev
     if nm is None or nm in lw.CONTROL:
         st.regs.clear()
         st.m32.clear()
@@ -330,6 +337,9 @@ def _cs_apply(st, a, nm, f):
         if basev[0] == "c" and off[0] == "tab" and (nm == "addsub_ext" and f["option"] in (2, 3) or
                                                    nm == "addsub_reg" and f["shift"] == 0):
             result = ("target", basev[1], off, f["amt"])
+    if result == ("w", a) and nm in ("ld", "ld_x", "ld_wb", "ld_x_wb") and not f["sgn"] and f["sz"] in (1, 2, 4):
+        # an unsigned narrow load zero-extends: x and w hold the same value, so a w-register compare bounds both
+        result = ("z", ("lo", ("w", a)))
     if _cs_depth(result) > 6:
         result = ("w", a)
     _, written = op_regs(nm, f)
@@ -433,7 +443,7 @@ def match_compact_dataflow(insns, pos, preds, idx, rd_mem, func_range, entries, 
     """Bounded forward dataflow over the instructions that can reach the br (their predecessor closure, at most
     DF_MAX_NODES). Entry points, jump-table targets and blocks without known predecessors start from "nothing
     known". Values merge only when every path agrees, and a bound counts only when it holds on every path.
-    Returns (result, visited addresses) or None. The caller must still reject the result when a visited address
+    Returns (result, visited addresses, orphan blocks) or None. The caller must still reject the result when a visited address
     is also an indirect jump target discovered later."""
     br_addr, _, br = insns[idx]
     if br_addr in entries:
@@ -451,48 +461,86 @@ def match_compact_dataflow(insns, pos, preds, idx, rd_mem, func_range, entries, 
                     return None
                 stack.append(p)
     tops = {a for a in nodes if a in entries or not preds.get(a)}
-    state = {a: _CS() for a in tops}
-    work = list(tops)
-    queued = set(work)
-    budget = 30 * len(nodes) + 200
-    while work:
-        a = work.pop()
-        queued.discard(a)
-        budget -= 1
-        if budget < 0:
-            return None
-        if a == br_addr:
-            continue
-        _, nm, f = insns[pos[a]]
-        st = state[a].copy()
-        prev = _cs_apply(st, a, nm, f)
-        if nm is None or nm in ("ret", "brk", "br"):
-            continue
-        if nm == "b":
-            succ = [(f["target"], True)]
-        elif nm in ("bcond", "cbz", "tbz"):
-            succ = [(f["target"], True), (a + 4, f["target"] == a + 4)]
-        else:
-            succ = [(a + 4, True)]
-        for t, plain in succ:
-            if t not in nodes or t in tops:
+    # Orphans: blocks nothing in this function branches to and that are not entry points. Their only way in can be
+    # this very br (they are its table targets), so they start from the state at the br; that is checked below.
+    orphans = {a for a in tops if a not in entries}
+    fixed = tops - orphans
+
+    def run(seed, extra):
+        state = {a: _CS() for a in fixed}
+        if seed is not None:
+            for a in orphans:
+                state[a] = seed.copy()
+        work = list(state)
+        queued = set(work)
+        budget = 30 * len(nodes) + 200
+        while work:
+            a = work.pop()
+            queued.discard(a)
+            budget -= 1
+            if budget < 0:
+                return None
+            _, nm, f = insns[pos[a]]
+            st = state[a].copy()
+            if a == br_addr:
+                # the br itself reaches its table targets, so a target inside the closure sees this state too
+                st.cmp = None
+                for t in extra:
+                    if t in nodes and t not in tops:
+                        new = st.copy() if t not in state else _cs_join(state[t], st, t)
+                        if t not in state or new != state[t]:
+                            state[t] = new
+                            if t not in queued:
+                                queued.add(t)
+                                work.append(t)
                 continue
-            out = st
-            if nm == "bcond" and not plain:
-                out = st.copy()
-                _cs_refine(out, f, prev)
-            new = out.copy() if t not in state else _cs_join(state[t], out, t)
-            if t not in state or new != state[t]:
-                state[t] = new
-                if t not in queued:
-                    queued.add(t)
-                    work.append(t)
-    if br_addr not in state:
+            prev = _cs_apply(st, a, nm, f)
+            if nm is None or nm in ("ret", "brk", "br"):
+                continue
+            if nm == "b":
+                succ = [(f["target"], True)]
+            elif nm in ("bcond", "cbz", "tbz"):
+                succ = [(f["target"], True), (a + 4, f["target"] == a + 4)]
+            else:
+                succ = [(a + 4, True)]
+            for t, plain in succ:
+                if t not in nodes or t in tops:
+                    continue
+                out = st
+                if nm == "bcond" and not plain:
+                    out = st.copy()
+                    _cs_refine(out, f, prev)
+                new = out.copy() if t not in state else _cs_join(state[t], out, t)
+                if t not in state or new != state[t]:
+                    state[t] = new
+                    if t not in queued:
+                        queued.add(t)
+                        work.append(t)
+        got = state.get(br_addr)
+        if got is not None:
+            got = got.copy()
+            got.cmp = None
+        return got
+
+    seed = None
+    extra = frozenset()
+    r = None
+    for _ in range(6):
+        got = run(seed, extra)
+        if got is None:
+            return None
+        merged = got if seed is None else _cs_join(seed, got, br_addr)
+        r = _compact_finish(merged, br, rd_mem, func_range, valid_target)
+        if r is None:
+            return None
+        if seed is not None and merged == seed and frozenset(r[2]) == extra:
+            break
+        seed, extra = merged, frozenset(r[2])
+    else:
         return None
-    r = _compact_finish(state[br_addr], br, rd_mem, func_range, valid_target)
-    if r is None:
+    if not orphans <= extra:
         return None
-    return r, nodes - tops - {br_addr}
+    return r, nodes - tops - {br_addr}, orphans
 
 
 def match_jump_table(insns, idx, base_addr, rd_mem, func_range, text_end=None):
@@ -797,6 +845,7 @@ class Lifter:
             info["jt_unresolved"] = 0
             info.pop("br_tail_ptr", None)
             df_vis = {}
+            df_orph = {}
             pad_roots = set()
             jt = {}
             bad = None
@@ -841,6 +890,7 @@ class Lifter:
                                 if d:
                                     r = d[0]
                                     df_vis[a] = d[1]
+                                    df_orph[a] = d[2]
                             if r:
                                 jt[a] = r
                                 for t in r[2]:
@@ -875,8 +925,8 @@ class Lifter:
                 leaders.update(new)
                 work.extend(new)
             # a path through an address that another table can jump to is incomplete: drop that table and redo
-            targets_all = {t for r in jt.values() for t in r[2]}
-            bad_df = {a for a, vis in df_vis.items() if a in jt and vis & targets_all}
+            bad_df = {a for a, vis in df_vis.items() if a in jt and any(
+                (vis | df_orph[a]) & set(r[2]) for a2, r in jt.items() if a2 != a)}
             if not bad_df:
                 break
             df_banned |= bad_df

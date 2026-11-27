@@ -261,6 +261,49 @@ class CompactDataflowTests(unittest.TestCase):
         w, n = self.build(pre)
         self.assertIsNone(self.run_df(w)[1])
 
+    # ---- rules added for task-49: calls keep callee-saved registers, narrow loads zero-extend, table targets are orphans
+    def test_callee_saved_base_survives_a_call(self):
+        # adr x19; bl; cmp w1; b.hi; mov w9,w1; dispatch through x19. A caller-saved base (x10) must not survive.
+        def words(base_reg):
+            pre = [adr(base_reg, BASE, CTAB), 0x94000001, cmp_w(1, 3), 0, MOV_W9_W1]
+            n = len(pre)
+            pre[3] = bhi(BASE + 12, self.exit_of(n))
+            disp = [adr(11, BASE + 4 * n, BASE + 4 * (n + 4)), LDRB | 9 << 16 | base_reg << 5 | 12,
+                    ADD_LSL2 | 12 << 16 | 11 << 5 | 11, BR_X11]
+            return pre + disp + [RET] * 5
+        w = words(19)
+        self.assertEqual(self.run_df(w)[1], self.expect(w))
+        self.assertIsNone(self.run_df(words(10))[1])
+
+    def test_narrow_load_index_is_zero_extended(self):
+        # ldrh w8 then ldrb w12,[x10,x8] (64-bit index register) is bounded by cmp w8,#3
+        LDRH_IMM_W8 = 0x79400028  # ldrh w8, [x1]
+        pre = [adr(10, BASE, CTAB), LDRH_IMM_W8, 0x71000D1F, 0]  # cmp w8,#3
+        n = len(pre)
+        pre[3] = bhi(BASE + 12, self.exit_of(n))
+        disp = [adr(11, BASE + 4 * n, BASE + 4 * (n + 4)), LDRB | 8 << 16 | 10 << 5 | 12,
+                ADD_LSL2 | 12 << 16 | 11 << 5 | 11, BR_X11]
+        w = pre + disp + [RET] * 5
+        self.assertEqual(self.run_df(w)[1], self.expect(w))
+
+    def orphan_words(self, extra):
+        # target 0 is a block `b <mov w9,w1>` that nothing else reaches: the dispatch feeds its own loop
+        pre = [adr(10, BASE, CTAB), cmp_w(1, 3), 0, MOV_W9_W1]
+        n = len(pre)
+        pre[2] = bhi(BASE + 8, self.exit_of(n))
+        w, n = self.build(pre)
+        w[n + 4] = b_(BASE + 4 * (n + 4), BASE + 12)
+        return w + extra
+
+    def test_table_target_loop_back_is_resolved(self):
+        w = self.orphan_words([])
+        self.assertEqual(self.run_df(w)[1], self.expect(w))
+
+    def test_rejects_orphan_block_that_is_not_a_target(self):
+        w = self.orphan_words([])
+        w.append(b_(BASE + 4 * len(w), BASE + 12))
+        self.assertIsNone(self.run_df(w)[1])
+
 
 if __name__ == "__main__":
     unittest.main()
