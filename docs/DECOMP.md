@@ -1,6 +1,6 @@
 # Rust function swaps
 
-The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports twenty-eight functions through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4, task-43 batch 5, task-44 batch 6). The first twenty-three are leaves: each takes guest x0 to x2 as u64 and returns the new x0. The last five call other leaves (see "Functions that call ported leaves") and edit the guest register file in place. The crate has no dependencies.
+The Windows game build links the `smrpg_decomp` static library from the `decomp` Cargo workspace. Rust 1.96.0 exports twenty-eight functions through the x64 C ABI (task-29 batch 1, task-40 batch 2, task-41 batch 3, task-42 batch 4, task-43 batch 5, task-44 batch 6). The first twenty-three are leaves: each takes guest x0 to x2 as u64 and returns the new x0. The last five call other leaves (see "Functions that call ported leaves") and edit the guest register file in place. The crate has no dependencies. Task-45 adds up to 300 more, generated in bulk (see "Bulk generator").
 
 | Guest address | IL2CPP method |
 |---|---|
@@ -58,6 +58,35 @@ A function whose every callee is already a Rust leaf can be ported whole (task-4
 What `ab` compares (`compare` in `runtime/decomp/swap.c`): Rust runs on a copy of the whole `Ctx`, lifted C on the live one, then `memcmp` over the entire `Ctx` (x0 to x30, sp, v0 to v31, flags, pc, exception fields, scratch). Guest stack: the lifted prologue pushes x29 and x30 below sp and the epilogue pops them, so sp, x29 and the callee-saved registers end unchanged and the Rust version leaves them alone. The pushed bytes sit below the final sp and are dead after the return, so they are not compared; the comparison does cover sp and every register. One lifter artifact is copied on purpose: before each `bl` the lifted body stores the return address in the context x30 and never restores it, so the Rust version writes the same stale x30 (a wrong value there is caught: a mutation test that changed one return address failed the selftest). In `ab` mode the lifted caller still goes through the callee wrappers, which are compared as usual, so the callee live counters in the summary include calls made by the callers.
 
 Selftest: each caller gets a private fake region and a private 16-byte aligned fake stack (`prepare_caller` in `swap.c`), with a pending exception cleared (`c.exc = 0`, lifted callers return early otherwise). The shape per function: array index and element address inside the region, a null or valid object-to-field chain, w1 at and around 0x81d and 0x7f8 to 0x7fb, an object whose +0x10 word equals x1 half the time. Callee counters are restored after each caller selftest, and a difference found in a callee fails the run, so selftest calls never count as live calls.
+
+## Bulk generator (task-45)
+
+`tools/decompgen/` ports exact trivial-function shapes in bulk. `python -I tools/decompgen/generate.py` reads every main-module function of at most five instructions (the lifter's inventory and decoder, `tools/lifter/dec.py`), matches a closed pattern set (`patterns.py`) and ranks the matches by direct call sites (`bl` and `b` to the entry). Anything that is not the exact shape is skipped. Patterns, each with one Rust template:
+
+| Pattern | Shape | Row |
+|---|---|---|
+| empty | `ret` | LEAF |
+| const | `movz`, `movn`, `movk` sequence into x0 or w0, or `orr` from the zero register, then `ret` | LEAF |
+| get | `ldr`, `ldrb`, `ldrh`, `ldrsb`, `ldrsh`, `ldrsw` into x0 or w0 from `[x0..x2, #imm]`, then `ret` | GLEAF |
+| get_nullsafe | `cbz x0, +8; ldr x0 or w0, [x0, #imm]; ret` | NLEAF |
+| set | `str`, `strb`, `strh` of x0..x2 or the zero register to `[x0..x2, #imm]`, then `ret` (no barrier, no call) | SLEAF |
+| add_imm | `add` or `sub` x0 or w0, `x0..x2`, `#imm` without flags, then `ret` | LEAF |
+| mov_reg | `orr x0 or w0, xzr, x1 or x2`, then `ret` | LEAF |
+
+Not matched on purpose: write-back or register-offset addressing, vector registers (float getters and setters), flag-setting instructions, a second written register (`and w8, w1, #1; strb w8, ...` also writes x8 and needs a register-file row with a store shadow), anything with a call or branch other than the null check. The semantic proof of each template is the A/B selftest against the lifted C for every generated function: sign and zero extension, w against x writes clearing the upper half, and the byte, halfword, word and doubleword store widths are all compared byte for byte over the whole register context. `python -I tools/decompgen/test_decompgen.py` pins which instruction words are accepted and which near misses are refused.
+
+New row kinds in the manifest: `GLEAF(chunk, address, symbol, base_reg, offset, bytes)` and `NLEAF(...)` (null-safe) declare loads. They call like `LEAF`; the selftest points `x[base_reg] + offset` into a private fake region (NLEAF also passes null one time in eight). Generated stores reuse `SLEAF` with its shadow comparison. `swap.c`, `game.cmake`, `wrap_chunk.py` and `check_log.py` read the hand-written rows from `leaves.def` followed by the generated rows (`game.cmake` concatenates them into `manifest.def` in the build directory and rewrites it only when the text changes).
+
+Where the output lives: `A:\AI\Recomps\smrpg-work\decompgen\` (`gen.rs`, `gen.def`, `gen.index.tsv`, `gen.report.txt`), not in Git. The files are derived from the game binary (addresses, field offsets, IL2CPP method names), the same reason lifted chunks are not committed, and the set grows with the flags. The generator, the templates, the tests and the hooks (`decomp/smrpg_decomp/build.rs`, `game.cmake`) are in Git. `build.rs` includes `gen.rs` through `SMRPG_DECOMPGEN_DIR` (default the A: directory above); without the file the crate still builds with the hand-written functions only. `game.cmake` runs the generator once when `gen.def` or `gen.rs` is missing. Regenerate by hand after changing a flag.
+
+```powershell
+python -I tools/decompgen/generate.py --stats-only            # counts only
+python -I tools/decompgen/generate.py                          # default: top 300 by call sites, at most 12 lifted chunks
+python -I tools/decompgen/generate.py --limit 1000 --max-chunks 40
+python -I runtime/decomp/check_log.py --summary A:/AI/Recomps/smrpg-work/build/logs/task45_ab.log
+```
+
+The cap on lifted chunks exists because the build recompiles every chunk that holds a swapped function (about 3 MB of C each); 300 functions spread over all chunks would rebuild most of the 393. `--max-chunks 0` removes the cap. Functions already in `leaves.def` are excluded. `check_log.py --summary` keeps the selftest and mismatch checks for every row but reports live against selftest-only counts instead of failing on a function the run never called.
 
 ## Reproduce the comparison
 

@@ -14,7 +14,8 @@ typedef struct {
     IntLeaf rust;
     StoreLeaf rust_store;           /* set instead of rust for a leaf that writes guest memory */
     RegsLeaf rust_regs;             /* set instead of rust for a function that calls ported leaves */
-    unsigned base_reg, offset, bytes; /* store footprint: bytes at x[base_reg] + offset */
+    unsigned base_reg, offset, bytes; /* store footprint (or generated load): bytes at x[base_reg] + offset */
+    unsigned load_kind;             /* generated loads (task-45): 1 = getter (GLEAF), 2 = null-safe getter (NLEAF) */
     atomic_ullong calls, differences;
 } Leaf;
 
@@ -30,31 +31,46 @@ typedef struct {
     void f_##addr(Ctx *); \
     extern void f_##addr##_lifted(Ctx *); \
     extern void rust(uint64_t *);
-#include "leaves.def"
+/* Generated rows (tools/decompgen): GLEAF and NLEAF are loads at x[base] + off, len bytes wide, called like LEAF */
+#define GLEAF(chunk, addr, rust, base, off, len) LEAF(chunk, addr, rust)
+#define NLEAF(chunk, addr, rust, base, off, len) LEAF(chunk, addr, rust)
+#include "manifest.def"
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
+#undef GLEAF
+#undef NLEAF
 
 enum {
 #define LEAF(chunk, addr, rust) index_##addr,
 #define SLEAF(chunk, addr, rust, base, off, len) index_##addr,
 #define CLEAF(chunk, addr, rust) index_##addr,
-#include "leaves.def"
+#define GLEAF(chunk, addr, rust, base, off, len) index_##addr,
+#define NLEAF(chunk, addr, rust, base, off, len) index_##addr,
+#include "manifest.def"
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
+#undef GLEAF
+#undef NLEAF
     leaf_count
 };
 
 static Leaf leaves[leaf_count] = {
-#define LEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0, 0, 0, 0, 0, 0},
+#define LEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0, 0, 0, 0, 0, 0, 0},
 #define SLEAF(chunk, addr, rust, base, off, len) \
-    {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, rust, 0, base, off, len, 0, 0},
-#define CLEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, 0, rust, 0, 0, 0, 0, 0},
-#include "leaves.def"
+    {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, rust, 0, base, off, len, 0, 0, 0},
+#define CLEAF(chunk, addr, rust) {0x##addr##ULL, f_##addr, f_##addr##_lifted, 0, 0, rust, 0, 0, 0, 0, 0, 0},
+#define GLEAF(chunk, addr, rust, base, off, len) \
+    {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0, base, off, len, 1, 0, 0},
+#define NLEAF(chunk, addr, rust, base, off, len) \
+    {0x##addr##ULL, f_##addr, f_##addr##_lifted, rust, 0, 0, base, off, len, 2, 0, 0},
+#include "manifest.def"
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
+#undef GLEAF
+#undef NLEAF
 };
 
 static enum { OFF, ON, AB } mode;
@@ -123,10 +139,14 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
 #define LEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define SLEAF(chunk, addr, rust, base, off, len) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define CLEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
-#include "leaves.def"
+#define GLEAF(chunk, addr, rust, base, off, len) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#define NLEAF(chunk, addr, rust, base, off, len) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#include "manifest.def"
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
+#undef GLEAF
+#undef NLEAF
 
 static uint64_t random_word(uint64_t *state) {
     *state ^= *state << 13;
@@ -230,11 +250,19 @@ static void selftest(Leaf *leaf, GuestFn entry) {
             uint64_t pick = random_word(&seed);
             c.x[0] = (pick & 7) == 0 ? 0 : (uint64_t)(uintptr_t)&fake[(pick >> 8) % (RT_ARRAY_LEN(fake) - 3)];
         }
-        if (leaf->rust_store) {
-            /* store leaves write only into the private fake region, never game memory; the base register
-             * is an 8-byte aligned slot with the whole footprint inside the region */
+        if (leaf->load_kind) {
+            /* generated getters (task-45): x[base] + offset is an 8-byte aligned slot inside the private fake
+             * region; the null-safe form also gets a null base one time in eight */
             fill_fake_region(fake, RT_ARRAY_LEN(fake), &seed);
-            c.x[leaf->base_reg] = (uint64_t)(uintptr_t)&fake[(random_word(&seed) >> 8) % 40];
+            uint64_t pick = random_word(&seed);
+            uint64_t at = (uint64_t)(uintptr_t)&fake[(pick >> 8) % 56];
+            c.x[leaf->base_reg] = (leaf->load_kind == 2 && (pick & 7) == 0) ? 0 : at - leaf->offset;
+        }
+        if (leaf->rust_store) {
+            /* store leaves write only into the private fake region, never game memory; x[base] + offset is
+             * an 8-byte aligned slot with the whole footprint inside the region */
+            fill_fake_region(fake, RT_ARRAY_LEN(fake), &seed);
+            c.x[leaf->base_reg] = (uint64_t)(uintptr_t)&fake[(random_word(&seed) >> 8) % 40] - leaf->offset;
             unsigned char before[MAX_FOOTPRINT];
             const unsigned char *at = (const unsigned char *)(uintptr_t)(c.x[leaf->base_reg] + leaf->offset);
             memcpy(before, at, leaf->bytes);

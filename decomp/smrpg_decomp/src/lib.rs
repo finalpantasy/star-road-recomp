@@ -233,6 +233,57 @@ pub unsafe extern "C" fn smrpg_flag_off(obj: u64, _: u64, _: u64, delta: u64) ->
     obj
 }
 
+// ---- Helpers for the generated functions (task-45) ----
+// The 8 and 32 bit loads and stores above are shared; these are the 16 bit and 8 bit load forms and the 16 bit
+// store that the generated module (tools/decompgen) needs. All are relaxed atomics like ir_ld and ir_st.
+
+/// Relaxed 16-bit guest load, the same access as ir_ld(2, ...).
+///
+/// # Safety
+/// `addr` must be a mapped, 2-byte aligned guest address.
+#[inline(always)]
+#[allow(dead_code)]
+unsafe fn guest_ld16(addr: u64) -> u16 {
+    unsafe {
+        core::sync::atomic::AtomicU16::from_ptr(addr as *mut u16)
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Relaxed 8-bit guest load, the same access as ir_ld(1, ...).
+///
+/// # Safety
+/// `addr` must be a mapped guest address.
+#[inline(always)]
+#[allow(dead_code)]
+unsafe fn guest_ld8(addr: u64) -> u8 {
+    unsafe {
+        core::sync::atomic::AtomicU8::from_ptr(addr as *mut u8)
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Relaxed 16-bit guest store, the same access as ir_st(2, ...).
+///
+/// # Safety
+/// `addr` must be a mapped, 2-byte aligned guest address.
+#[inline(always)]
+#[allow(dead_code)]
+unsafe fn guest_st16(addr: u64, value: u16) {
+    unsafe {
+        core::sync::atomic::AtomicU16::from_ptr(addr as *mut u16)
+            .store(value, core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+// The bulk-generated functions (python -I tools/decompgen/generate.py). They derive from the game binary, so
+// the file lives on A: and build.rs finds it (SMRPG_DECOMPGEN_DIR). Without it the crate builds without them.
+#[cfg(smrpg_gen)]
+#[allow(dead_code, clippy::all)]
+mod generated {
+    include!(env!("SMRPG_GEN_RS"));
+}
+
 // ---- Functions that call ported leaves (task-44) ----
 // These take a pointer to the guest register file (Ctx.x, 32 u64 with x[31] = sp) and edit it in place, so
 // every register the lifted body changes is reproduced, not only x0. Callees are the Rust leaves above,
