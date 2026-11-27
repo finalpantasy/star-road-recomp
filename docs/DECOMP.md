@@ -555,6 +555,12 @@ Replay changes in `swap.c`: pre-state reads look in the store journal first, an 
 
 Evidence: selftest 25,625 calls, 0 differences; route 15 live calls, 0 differences, 5 deferred; `on` mode reached the battle (`calls=15`); two mutations caught. The task42 save never reached a battle. Details in `backlog/tasks/task-60.md`.
 
+## damage_calc (task-61): the four enemy rules
+
+The `switch` on the target's `_character_id` in `damage_calc` (0x71021ff580) is fully ported (`decomp/smrpg_decomp/src/battle/damage.rs`; the `UNPORTED_CHARACTERS` list and the lifted entry of task-60 are gone). 0x5dd: after the `BattleManager` class and flag checks, if `_instance` int +0xd0 is at least 7: debug line, `_result_logger` byte +0x4a = 1, `damage = 0`. 0x5ec and 0x653: the same flag and damage, then the inlined `_multi_number.Clear()` and one `Add(0)` per entry it held. 0x615: the checks, `_instance` +0x60 byte +0x20, and when set the flag and damage, `GlobalWork.get_inst()` byte +0xd8 for skill 0x75, then the Clear and Add loop. The class and flag checks (two copies, with their own return addresses and safepoints), the Clear and Add loop (two copies) and the literal lines are read off the lifted C. Callees go through the bridge (`IsReferenceOrContainsReferences`, `Array.Clear`, `List<int>.Add` with the 16 byte header footprint, `get_inst`). The hook snapshots the logger byte, the list header, the `GlobalWork` class word and instance byte, and defers skill 0x2c3 on 0x5ec, 0x653 and 0x615 (the renkei step replaces the list). `swap.c` prints `decomp damage_calc by target` with live counts per id.
+
+Evidence: selftest 25,625 calls, 0 differences (the four ids about one case in eight); route 15 live calls, 0 differences, 5 on 0x5dd, none on the other three; `on` mode reached the battle (10 calls); two mutations caught. Details in `backlog/tasks/task-61.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

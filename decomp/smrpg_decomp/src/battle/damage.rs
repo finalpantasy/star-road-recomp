@@ -30,7 +30,7 @@
 //! guest stores, made through [`GuestStore`] (a real store, or a journal entry inside a replay trial).
 
 use super::belome::{
-    smrpg_skill_calc_belome_barrior_ratio, smrpg_skill_calc_belome_barrior_ratio_pre,
+    ListInt, smrpg_skill_calc_belome_barrior_ratio, smrpg_skill_calc_belome_barrior_ratio_pre,
 };
 use super::element::smrpg_param_calc_element;
 use super::frame::Frame;
@@ -1072,10 +1072,31 @@ const PC_LIST_ITEMS: u64 = 0x10;
 // }
 // ```
 //
-// Not ported: the four character ids 0x5dd, 0x5ec, 0x615 and 0x653 (enemy rules that clear the result logger's
-// `_multi_number` list and read more `BattleManager` statics). In `on` mode the port runs the lifted body for them
-// (`Regs::run_lifted`, decided at entry before the port makes any call or store); in `ab` mode the pre-state hook defers
-// the call (counted as `deferred`, not compared), as it does for a clear lazy-initialization flag.
+// The four enemy rules (task-61): the cases `0x5dd`, `0x5ec`, `0x615` and `0x653` of the `switch` above, written out here.
+//
+// ```text
+//     case 0x5dd:
+//         if (BattleManager._instance._unnamed_d0 >= 7) {          // after the class and static flag checks
+//             write(..); _target._result_logger._flag_4a = true; damage = 0;
+//         }
+//         break;
+//     case 0x5ec: case 0x653:
+//         write(..); _target._result_logger._flag_4a = true; damage = 0;
+//         _target._result_logger._multi_number.Clear(); then Add(0) as often as it held entries;   // inlined List<int>.Clear
+//         break;
+//     case 0x615:
+//         if (BattleManager._instance._unnamed_60._flag_20) {      // after the class and static flag checks
+//             write(..); _target._result_logger._flag_4a = true; damage = 0;
+//             if (_skill_obj._skill_id == 0x75) GlobalWork.get_inst()._flag_d8 = true;   // after GlobalWork's class check
+//             <the same Clear and Add(0) loop as 0x5ec>
+//         }
+//         break;
+// ```
+//
+// In `on` mode the whole function is the port; in `ab` mode the pre-state hook names the list header, the logger flag, the
+// GlobalWork instance flag and the GlobalWork class word besides the cells of the earlier steps. The hook still defers skill
+// 0x2c3 on the three characters that read the list (`calc_renkei_ratio` replaces the list for that skill, so its header at the
+// clear is not the pre-state one).
 //
 // The five nested rows (`group_a_b`, `calc_renkei_ratio`, `set_acction_command_ratio`, `calc_element`,
 // `calc_belome_barrior_ratio`, `use_damage_guard`) are called through their own shims (`Frame::call_port`). In a replay trial
@@ -1084,8 +1105,21 @@ const PC_LIST_ITEMS: u64 = 0x10;
 // each nested hook with the registers the lifted code would give it, so the nested ports read the same snapshots; the two
 // stack cells (`damage`, `ratio`) are read back from the journal (`smrpg_guest_pre_read` returns a cell's own earlier store).
 
-/// `BattleCharacterParam._character_id` values whose rules the port leaves to the lifted body.
-const UNPORTED_CHARACTERS: [u32; 4] = [0x5dd, 0x5ec, 0x615, 0x653];
+/// The four characters with an enemy rule that sets the result logger flag at +0x4a (task-61).
+const CHARACTER_THRESHOLD: u32 = 0x5dd;
+const CHARACTER_CLEAR_A: u32 = 0x5ec;
+const CHARACTER_CLEAR_B: u32 = 0x653;
+const CHARACTER_FLAGGED_CLEAR: u32 = 0x615;
+/// `BattleManager` +0xd0 (an int the 0x5dd rule compares with 7), +0x60 (an object whose byte +0x20 the 0x615 rule tests).
+const MANAGER_COUNT: u64 = 0xd0;
+const MANAGER_COUNT_LIMIT: i32 = 7;
+const MANAGER_FLAG_OBJECT: u64 = 0x60;
+const FLAG_OBJECT_BYTE: u64 = 0x20;
+/// `CharaSkillResultLogger` byte +0x4a, set by the three rules.
+const LOGGER_RULE_FLAG: u64 = 0x4a;
+/// Skill id that sets `GlobalWork` byte +0xd8 under the 0x615 rule.
+const SKILL_GLOBAL_WORK_FLAG: i32 = 0x75;
+const GLOBAL_WORK_FLAG: u64 = 0xd8;
 /// `BattleCharacterParam._character_id` of the one character with a fixed damage rule.
 const CHARACTER_WITH_FIXED_DAMAGE: u32 = 0x64f;
 const SKILL_FIXED_DAMAGE: i32 = 0x2e7;
@@ -1361,11 +1395,6 @@ impl SkillExecter {
     /// `damage_calc()`. `f` is the register file at entry.
     pub fn damage_calc(self, f: &mut Frame) -> Result<(), GuestException> {
         let character = self.target().character_id();
-        if UNPORTED_CHARACTERS.contains(&character) {
-            // decided before any call or store: the lifted body does the whole call
-            f.regs.run_lifted(0x71021ff580);
-            return Ok(());
-        }
         let flag = prestate::read_u8(driver_slots::INIT_FLAG);
         // prologue: `sub sp, sp, #0x40`, `add x29, sp, #0x10`; x20 = the flag page, x21 = the string page, x8 = the flag byte,
         // x21 = the first text cell, x19 = this
@@ -1598,7 +1627,7 @@ impl SkillExecter {
                 run.store(f.x[8]);
             }
         }
-        // the target's character id: one rule here, four left to the lifted body (`UNPORTED_CHARACTERS`)
+        // the target's character id: the five rules of the `switch`
         f.x[8] = self.target().address();
         f.x[8] = u64::from(character);
         if character == CHARACTER_WITH_FIXED_DAMAGE {
@@ -1615,6 +1644,12 @@ impl SkillExecter {
                     run.store(0);
                 }
             }
+        }
+        match character {
+            CHARACTER_THRESHOLD => self.rule_threshold(f, &mut run)?,
+            CHARACTER_CLEAR_A | CHARACTER_CLEAR_B => self.rule_clear(f, &mut run)?,
+            CHARACTER_FLAGGED_CLEAR => self.rule_flagged_clear(f, &mut run)?,
+            _ => {}
         }
         self.finish(f, &mut run, monitor)
     }
@@ -1899,6 +1934,321 @@ impl SkillExecter {
     }
 }
 
+// ---- The enemy rules (task-61) ----
+
+/// Return addresses and safepoints of one copy of the `BattleManager` class and flag checks that precede a rule's reads.
+struct ManagerTestSite {
+    first_init_return: u64,
+    first_init_poll: u64,
+    metadata_return: u64,
+    metadata_poll: u64,
+    /// The poll on the edge that falls through when the class word is still clear after the metadata call.
+    metadata_clear_poll: Option<u64>,
+    last_init_return: u64,
+    last_init_poll: Option<u64>,
+}
+
+/// The 0x5dd rule's copy of the checks.
+const MANAGER_TEST_THRESHOLD: ManagerTestSite = ManagerTestSite {
+    first_init_return: 0x71021ffd2c,
+    first_init_poll: 0x71021ffd30,
+    metadata_return: 0x71021ffd40,
+    metadata_poll: 0x71021ffd50,
+    metadata_clear_poll: Some(0x71021ffd54),
+    last_init_return: 0x71021ffb80,
+    last_init_poll: None,
+};
+
+/// The 0x615 rule's copy of the checks.
+const MANAGER_TEST_FLAGGED: ManagerTestSite = ManagerTestSite {
+    first_init_return: 0x71021ffd70,
+    first_init_poll: 0x71021ffd74,
+    metadata_return: 0x71021ffd84,
+    metadata_poll: 0x71021ffd94,
+    metadata_clear_poll: None,
+    last_init_return: 0x71021ffd9c,
+    last_init_poll: Some(0x71021ffda0),
+};
+
+/// The inlined `List<int>.Clear` and the `Add(0)` loop: two copies in the compiled code.
+struct ClearSite {
+    references_return: u64,
+    clear_return: u64,
+    add_return: u64,
+    loop_poll: u64,
+}
+
+const CLEAR_SITE_A: ClearSite = ClearSite {
+    references_return: 0x71021ffac0,
+    clear_return: 0x71021ffae4,
+    add_return: 0x71021ffd1c,
+    loop_poll: 0x71021ffd20,
+};
+
+const CLEAR_SITE_B: ClearSite = ClearSite {
+    references_return: 0x71021ffc94,
+    clear_return: 0x71021ffcb8,
+    add_return: 0x71021ffdd0,
+    loop_poll: 0x71021ffdd4,
+};
+
+const LINE_RULE_THRESHOLD: LiteralLine = literal(
+    driver_slots::text(0xbb0),
+    0x71021ffbb0,
+    WRITE_8_9_20,
+    driver_site::VECTORS_012,
+);
+const LINE_RULE_CLEAR: LiteralLine = literal(
+    driver_slots::text(0xb98),
+    0x71021ffa74,
+    WRITE_8_9_20,
+    driver_site::VECTORS_012,
+);
+const LINE_RULE_FLAGGED: LiteralLine = literal(
+    driver_slots::text(0xb50),
+    0x71021ffc10,
+    WRITE_8_9_20,
+    driver_site::VECTORS_012,
+);
+
+/// Callees of the rules.
+mod rule_callee {
+    pub const IS_REFERENCE_OR_CONTAINS_REFERENCES: u64 = 0x71000c5060;
+    pub const ARRAY_CLEAR: u64 = 0x7101d7c0c0;
+    pub const LIST_INT_ADD: u64 = 0x710015b4c0;
+    pub const GLOBAL_WORK_GET_INST: u64 = 0x7101886a00;
+}
+
+impl SkillExecter {
+    /// The class initialized word, the flag byte and the class word again, as the 0x5dd and 0x615 rules test them (x21 = the
+    /// class cell, x20 = the flag byte's address, both left by the encounter step); leaves x0 = the `BattleManager` class.
+    fn manager_test(self, f: &mut Frame, site: &ManagerTestSite) -> Result<(), GuestException> {
+        let lazy = driver_site::VECTORS_012;
+        f.x[0] = unsafe { guest_ld64(f.x[21]) };
+        let word = unsafe { guest_ld32(f.x[0].wrapping_add(CLASS_INITIALIZED)) };
+        f.x[8] = u64::from(word);
+        if word == 0 {
+            f.call_v(
+                group_callee::CLASS_INITIALIZER,
+                site.first_init_return,
+                &[0, 8, 9, 20],
+                lazy,
+                false,
+            )?;
+            f.x[8] = u64::from(unsafe { guest_ld8(f.x[20]) });
+            f.regs.safepoint_n(site.first_init_poll, &[(8, f.x[8])]);
+        } else {
+            f.x[8] = u64::from(unsafe { guest_ld8(f.x[20]) });
+        }
+        if f.x[8] as u8 != 0 {
+            f.x[0] = unsafe { guest_ld64(f.x[21]) };
+            let again = unsafe { guest_ld32(f.x[0].wrapping_add(CLASS_INITIALIZED)) };
+            f.x[8] = u64::from(again);
+            if again != 0 {
+                return Ok(());
+            }
+        } else {
+            // the static-field metadata of this method is not resolved yet
+            f.x[0] = unsafe { guest_ld64(driver_slots::BATTLE_MANAGER_CLASS) };
+            f.call_v(
+                group_callee::INITIALIZE_METADATA,
+                site.metadata_return,
+                &[0, 8, 9, 20],
+                lazy,
+                false,
+            )?;
+            f.x[8] = 1;
+            prestate::store_u8(f.x[20], 1);
+            f.x[0] = unsafe { guest_ld64(f.x[21]) };
+            let again = unsafe { guest_ld32(f.x[0].wrapping_add(CLASS_INITIALIZED)) };
+            f.x[8] = u64::from(again);
+            f.regs
+                .safepoint_n(site.metadata_poll, &[(0, f.x[0]), (8, f.x[8])]);
+            if again != 0 {
+                return Ok(());
+            }
+            if let Some(pc) = site.metadata_clear_poll {
+                f.regs.safepoint_n(pc, &[(0, f.x[0]), (8, f.x[8])]);
+            }
+        }
+        f.call_v(
+            group_callee::CLASS_INITIALIZER,
+            site.last_init_return,
+            &[0, 8, 9, 20],
+            lazy,
+            false,
+        )?;
+        f.x[0] = unsafe { guest_ld64(f.x[21]) };
+        if let Some(pc) = site.last_init_poll {
+            f.regs.safepoint_n(pc, &[(0, f.x[0])]);
+        }
+        Ok(())
+    }
+
+    /// `BattleManager._instance` from the class in x0 (`x8 = statics`, `x8 = instance`).
+    fn manager_instance(f: &mut Frame) -> u64 {
+        f.x[8] = unsafe { guest_ld64(f.x[0].wrapping_add(CLASS_STATIC_FIELDS)) };
+        f.x[8] = unsafe { guest_ld64(f.x[8].wrapping_add(STATICS_INSTANCE)) };
+        f.x[8]
+    }
+
+    /// `_target._result_logger._flag_4a = true`, then `damage = 0`.
+    fn set_rule_flag(self, f: &mut Frame, run: &mut DriverRun) {
+        let target = self.target();
+        f.x[8] = target.address();
+        f.x[9] = 1;
+        f.x[8] = target.result_logger().address();
+        prestate::store_u8(f.x[8].wrapping_add(LOGGER_RULE_FLAG), 1);
+        run.store(0);
+    }
+
+    /// Character 0x5dd.
+    fn rule_threshold(self, f: &mut Frame, run: &mut DriverRun) -> Result<(), GuestException> {
+        self.manager_test(f, &MANAGER_TEST_THRESHOLD)?;
+        let instance = Self::manager_instance(f);
+        let count = unsafe { guest_ld32(instance.wrapping_add(MANAGER_COUNT)) } as i32;
+        f.x[8] = w(count);
+        if count < MANAGER_COUNT_LIMIT {
+            return Ok(());
+        }
+        self.write_literal(f, &LINE_RULE_THRESHOLD)?;
+        self.set_rule_flag(f, run);
+        Ok(())
+    }
+
+    /// Characters 0x5ec and 0x653.
+    fn rule_clear(self, f: &mut Frame, run: &mut DriverRun) -> Result<(), GuestException> {
+        self.write_literal(f, &LINE_RULE_CLEAR)?;
+        self.set_rule_flag(f, run);
+        self.clear_hit_numbers(f, &CLEAR_SITE_A)
+    }
+
+    /// Character 0x615.
+    fn rule_flagged_clear(self, f: &mut Frame, run: &mut DriverRun) -> Result<(), GuestException> {
+        self.manager_test(f, &MANAGER_TEST_FLAGGED)?;
+        let instance = Self::manager_instance(f);
+        f.x[8] = unsafe { guest_ld64(instance.wrapping_add(MANAGER_FLAG_OBJECT)) };
+        let flag = unsafe { guest_ld8(f.x[8].wrapping_add(FLAG_OBJECT_BYTE)) };
+        f.x[8] = u64::from(flag);
+        if flag == 0 {
+            return Ok(());
+        }
+        self.write_literal(f, &LINE_RULE_FLAGGED)?;
+        self.set_rule_flag(f, run);
+        let skill_obj = self.skill_obj();
+        f.x[8] = skill_obj.address();
+        let id = skill_obj.skill_id();
+        f.x[8] = w(id);
+        if id == SKILL_GLOBAL_WORK_FLAG {
+            // `GlobalWork.get_inst()._flag_d8 = true`, after the class initialized test of `GlobalWork`
+            f.x[8] = unsafe { guest_ld64(super::belome::slots::GLOBAL_WORK_CLASS) };
+            f.x[0] = unsafe { guest_ld64(f.x[8]) };
+            let word = prestate::read_u32(f.x[0].wrapping_add(CLASS_INITIALIZED));
+            f.x[8] = u64::from(word);
+            if word == 0 {
+                f.call(
+                    group_callee::CLASS_INITIALIZER,
+                    0x71021ffc4c,
+                    &[0, 8, 9],
+                    false,
+                )?;
+            }
+            f.x[0] = 0;
+            f.call(
+                rule_callee::GLOBAL_WORK_GET_INST,
+                0x71021ffc54,
+                &[0, 8, 9],
+                false,
+            )?;
+            f.x[8] = 1;
+            prestate::store_u8(f.x[0].wrapping_add(GLOBAL_WORK_FLAG), 1);
+        }
+        self.clear_hit_numbers(f, &CLEAR_SITE_B)
+    }
+
+    /// `_target._result_logger._multi_number.Clear()` (inlined) and `Add(0)` once per entry it held. Ends at the join of the
+    /// rules (x21 = 0 when the logger has no list).
+    fn clear_hit_numbers(self, f: &mut Frame, site: &ClearSite) -> Result<(), GuestException> {
+        let target = self.target();
+        f.x[8] = target.address();
+        let logger = target.result_logger();
+        f.x[8] = logger.address();
+        let Some(numbers) = logger.multi_number() else {
+            f.x[21] = 0;
+            return Ok(());
+        };
+        f.x[21] = numbers.address();
+        // the generic context of `IsReferenceOrContainsReferences<int>`
+        let context = unsafe { guest_ld64(guest_ld64(super::belome::slots::LIST_CONTEXT)) };
+        f.x[8] = context;
+        let count = prestate::read_u32(numbers.size_address());
+        let version = prestate::read_u32(numbers.version_address());
+        f.x[20] = u64::from(count);
+        f.x[9] = u64::from(version.wrapping_add(1));
+        prestate::store_u32(numbers.version_address(), version.wrapping_add(1));
+        let level2 = unsafe { guest_ld64(context.wrapping_add(0x20)) };
+        f.x[8] = level2;
+        let level3 = unsafe { guest_ld64(level2.wrapping_add(0xc0)) };
+        f.x[8] = level3;
+        f.x[0] = unsafe { guest_ld64(level3.wrapping_add(0xc8)) };
+        f.call(
+            rule_callee::IS_REFERENCE_OR_CONTAINS_REFERENCES,
+            site.references_return,
+            &[0, 8, 9, 20, 21],
+            false,
+        )?;
+        if f.x[0] & 1 == 0 {
+            prestate::store_u32(numbers.size_address(), 0);
+        } else {
+            f.x[2] = u64::from(count);
+            prestate::store_u32(numbers.size_address(), 0);
+            if (count as i32) >= 1 {
+                f.x[0] = prestate::read_u64(numbers.items_address());
+                f.x[1] = 0;
+                f.x[3] = 0;
+                f.call(
+                    rule_callee::ARRAY_CLEAR,
+                    site.clear_return,
+                    &[0, 1, 2, 3],
+                    false,
+                )?;
+            }
+        }
+        if (count as i32) < 1 {
+            return Ok(());
+        }
+        f.x[21] = unsafe { guest_ld64(super::belome::slots::LIST_ADD_METHOD) };
+        // The list header as it stands after the stores above: the `Add` callee edits it (and the comparison gives back what
+        // it left), so the port carries it from call to call.
+        let mut header = [0u8; ListInt::HEADER_BYTES];
+        header[..8].copy_from_slice(&prestate::read_u64(numbers.items_address()).to_le_bytes());
+        header[8..12].copy_from_slice(&0u32.to_le_bytes());
+        header[12..].copy_from_slice(&version.wrapping_add(1).to_le_bytes());
+        let mut remaining = count;
+        loop {
+            f.x[8] = target.address();
+            f.x[1] = 0;
+            f.x[2] = unsafe { guest_ld64(f.x[21]) };
+            f.x[8] = logger.address();
+            f.x[0] = numbers.address();
+            f.call_out(
+                rule_callee::LIST_INT_ADD,
+                site.add_return,
+                &[0, 1, 2, 8, 20, 21],
+                false,
+                &mut header,
+            )?;
+            remaining = remaining.wrapping_sub(1);
+            f.x[20] = u64::from(remaining);
+            f.regs.safepoint(site.loop_poll, 20, f.x[20]);
+            if remaining == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ---- Shim ----
 
 /// 0x71021c3bb0 `BattleCharacterParam.is_barriered`.
@@ -2012,9 +2362,6 @@ pub unsafe extern "C" fn smrpg_skill_damage_calc_pre(x: *mut u64) -> i32 {
         let this = SkillExecter::at(regs.x(0));
         let target = this.target();
         let skill = this.skill_obj();
-        if UNPORTED_CHARACTERS.contains(&target.character_id()) {
-            return 1;
-        }
         // the stack cells: `damage` at `x29 - 4` = entry sp - 0x34, `ratio` at `sp + 8` = entry sp - 0x38
         let damage_cell = regs.sp().wrapping_sub(0x34);
         let ratio_cell = regs.sp().wrapping_sub(0x38);
@@ -2044,6 +2391,46 @@ pub unsafe extern "C" fn smrpg_skill_damage_calc_pre(x: *mut u64) -> i32 {
         ] {
             prestate::snapshot(logger.wrapping_add(offset), 4, true);
         }
+        let character = target.character_id();
+        if matches!(
+            character,
+            CHARACTER_CLEAR_A | CHARACTER_CLEAR_B | CHARACTER_FLAGGED_CLEAR
+        ) {
+            // the list header at the clear, and the logger flag the three rules set
+            let logger_cell = target.result_logger();
+            prestate::snapshot(
+                logger_cell.address().wrapping_add(LOGGER_RULE_FLAG),
+                1,
+                true,
+            );
+            if let Some(numbers) = logger_cell.multi_number() {
+                prestate::snapshot(numbers.items_address(), 8, false);
+                prestate::snapshot(numbers.size_address(), 4, true);
+                prestate::snapshot(numbers.version_address(), 4, true);
+            }
+        }
+        if character == CHARACTER_THRESHOLD {
+            prestate::snapshot(
+                target
+                    .result_logger()
+                    .address()
+                    .wrapping_add(LOGGER_RULE_FLAG),
+                1,
+                true,
+            );
+        }
+        if character == CHARACTER_FLAGGED_CLEAR {
+            // `GlobalWork`: the class initialized word, and the flag of its instance (the static field that `get_inst` returns)
+            let class = guest_ld64(guest_ld64(super::belome::slots::GLOBAL_WORK_CLASS));
+            prestate::snapshot(class.wrapping_add(CLASS_INITIALIZED), 4, false);
+            let statics = guest_ld64(class.wrapping_add(CLASS_STATIC_FIELDS));
+            if statics != 0 {
+                let instance = guest_ld64(statics);
+                if instance != 0 {
+                    prestate::snapshot(instance.wrapping_add(GLOBAL_WORK_FLAG), 1, true);
+                }
+            }
+        }
         let math_word =
             guest_ld64(guest_ld64(driver_slots::MATH_CLASS)).wrapping_add(CLASS_INITIALIZED);
         let manager_word = guest_ld64(guest_ld64(driver_slots::BATTLE_MANAGER_CLASS))
@@ -2064,7 +2451,11 @@ pub unsafe extern "C" fn smrpg_skill_damage_calc_pre(x: *mut u64) -> i32 {
         // skill 0x2c3 makes `calc_renkei_ratio` replace the logger's hit list with a new one, and `calc_belome_barrior_ratio` (which
         // follows) then reads the fresh list's header, which the pre-state cannot hold: that call runs the lifted body only
         if skill.skill_id() == super::renkei::skill::RENKEI_RANDOM_HITS
-            && target.character_id() == super::belome::BELOME_CHARACTER_ID
+            && (character == super::belome::BELOME_CHARACTER_ID
+                || matches!(
+                    character,
+                    CHARACTER_CLEAR_A | CHARACTER_CLEAR_B | CHARACTER_FLAGGED_CLEAR
+                ))
         {
             return 1;
         }

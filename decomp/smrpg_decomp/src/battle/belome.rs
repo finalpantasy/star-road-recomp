@@ -164,17 +164,17 @@ impl ListInt {
     const SIZE: u64 = 0x18;
     const VERSION: u64 = 0x1c;
     /// Bytes of the header the `Add` callee edits (items pointer, size, version): its out footprint.
-    const HEADER_BYTES: usize = 16;
+    pub(crate) const HEADER_BYTES: usize = 16;
 
-    fn size_address(self) -> u64 {
+    pub(crate) fn size_address(self) -> u64 {
         self.address().wrapping_add(Self::SIZE)
     }
 
-    fn version_address(self) -> u64 {
+    pub(crate) fn version_address(self) -> u64 {
         self.address().wrapping_add(Self::VERSION)
     }
 
-    fn items_address(self) -> u64 {
+    pub(crate) fn items_address(self) -> u64 {
         self.address().wrapping_add(Self::ITEMS)
     }
 }
@@ -182,7 +182,7 @@ impl ListInt {
 impl CharaSkillResultLogger {
     pub(crate) const MULTI_NUMBER: u64 = 0x50;
 
-    fn multi_number(self) -> Option<ListInt> {
+    pub(crate) fn multi_number(self) -> Option<ListInt> {
         self.optional_field(Self::MULTI_NUMBER)
     }
 }

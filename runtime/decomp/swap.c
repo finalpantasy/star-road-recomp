@@ -452,7 +452,25 @@ static void compare(Leaf *leaf, Ctx *c) {
     atomic_fetch_add(&leaf->calls, 1);
 }
 
+/* task-61: live damage_calc calls by the target's character id (0x5dd, 0x5ec, 0x615, 0x653 run the four enemy rules; the fifth counter is every other id) */
+static _Atomic unsigned long long rule_calls[5];
+static int rule_count_live;   /* set once the startup selftest is over: its registers hold random words */
+
+static void note_damage_calc(const Ctx *c) {
+    const uint64_t executer = c->x[0];
+    if (!rule_count_live || !executer || tl_stub || tl_rec || tl_replay) return;
+    const uint64_t target = *(const uint64_t *)(uintptr_t)(executer + 0x28);
+    if (!target) return;
+    static const uint32_t ids[4] = {0x5dd, 0x5ec, 0x615, 0x653};
+    const uint32_t id = *(const uint32_t *)(uintptr_t)(target + 0x20);
+    unsigned slot = 4;
+    for (unsigned i = 0; i < 4; ++i)
+        if (ids[i] == id) slot = i;
+    atomic_fetch_add(&rule_calls[slot], 1);
+}
+
 static inline void dispatch(Leaf *leaf, Ctx *c) {
+    if (__builtin_expect(leaf->address == 0x71021ff580ULL, 0)) note_damage_calc(c);
     if (leaf->probe) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
         if (mode == AB) atomic_fetch_add(&leaf->calls, 1);
         Recording *r = tl_rec;
@@ -1108,9 +1126,9 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         PUT32(70, 0x20, skill_types[(pick >> 12) % RT_ARRAY_LEN(skill_types)]);
         PUT32(70, 0x38, elements[(pick >> 16) % RT_ARRAY_LEN(elements)]);
         static const uint32_t ids[] = {0x649, 0x649, 0x64f, 0x64f, 0x64f, 0x64f, 0, 1, 0x648, 0x650, 0xffffffffu, 0x2c3};
-        static const uint32_t unported[] = {0x5dd, 0x5ec, 0x615, 0x653};
+        static const uint32_t unported[] = {0x5dd, 0x5ec, 0x615, 0x653};   /* task-61: the four enemy rules, ported */
         r = random_word(state);
-        PUT32(24, 0x20, (r & 15) == 0 ? unported[(r >> 8) & 3] : ids[(r >> 12) % RT_ARRAY_LEN(ids)]);
+        PUT32(24, 0x20, (r & 7) == 0 ? unported[(r >> 8) & 3] : ids[(r >> 12) % RT_ARRAY_LEN(ids)]);
         static const unsigned char guards[] = {0, 0, 1, 2, 0x80, 0xff};
         bytes[8 * 24 + 0x76] = guards[(pick >> 20) % RT_ARRAY_LEN(guards)];
         static const uint32_t counters[] = {0, 1, 1, 2, 3, 4, 6, 0xffffffffu, 0x80000000u};
@@ -1161,12 +1179,20 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         region[345 + 2] = WORD(350);
         static const uint32_t encounters[] = {0x819, 0x819, 0, 1, 0x818, 0x81a, 0xffffffffu, 0x80000000u};
         PUT32(290, 0x168, encounters[(pick >> 52) % RT_ARRAY_LEN(encounters)]);
+        static const uint32_t manager_counts[] = {0, 1, 6, 7, 7, 8, 100, 0xffffffffu, 0x80000000u, 0x7fffffffu};
+        PUT32(290, 0xd0, manager_counts[(random_word(state) >> 8) % RT_ARRAY_LEN(manager_counts)]);   /* task-61: the 0x5dd rule's threshold (7) */
+        static const unsigned char object_flags[] = {0, 1, 1, 2, 0xff};
+        bytes[8 * 310 + 0x20] = object_flags[(random_word(state) >> 8) % RT_ARRAY_LEN(object_flags)];   /* task-61: the 0x615 rule's flag byte */
+        bytes[8 * 200 + 0x4a] = (random_word(state) & 3) == 0 ? 1 : 0;                                      /* task-61: the logger flag the rules set */
+        bytes[8 * 96 + 0xd8] = (random_word(state) & 3) == 0 ? 1 : 0;                                       /* task-61: the GlobalWork instance flag */
         r = random_word(state);
         PUT32(244, 0xe0, (r & 3) == 0 ? 0 : (uint32_t)(r >> 8) | 1);
         region[360] = WORD(364);
         r = random_word(state);
         PUT32(364, 0xe0, (r & 3) == 0 ? 0 : (uint32_t)(r >> 8) | 1);
         region[410] = WORD(414);
+        region[414 + 0xb8 / 8] = WORD(438);                      /* task-61: GlobalWork's static fields; the first one is the instance the stand-in get_inst returns */
+        region[438] = WORD(96);
         r = random_word(state);
         PUT32(414, 0xe0, (r & 7) == 0 ? 0 : (uint32_t)(r >> 8) | 1);
         bytes[8 * 400] = ((pick >> 56) & 3) == 0 ? 0 : (((pick >> 58) & 7) == 0 ? 0x80 : 1);
@@ -1499,9 +1525,13 @@ void decomp_start(void) {
         if (mode == AB && test && !strcmp(test, "1")) selftest(leaf, entry);
     }
     rt_log("decomp mode=%s registered=%d", value, leaf_count);
+    rule_count_live = 1;
 }
 
 void decomp_summary(void) {
+    if (mode != OFF)
+        rt_log("decomp damage_calc by target: 0x5dd=%llu 0x5ec=%llu 0x615=%llu 0x653=%llu other=%llu", atomic_load(&rule_calls[0]),
+               atomic_load(&rule_calls[1]), atomic_load(&rule_calls[2]), atomic_load(&rule_calls[3]), atomic_load(&rule_calls[4]));
     if (mode == ON) {
         for (int i = 0; i < leaf_count; ++i)
             if (leaves[i].rust_regs) rt_log("decomp on addr=%#llx calls=%llu", (unsigned long long)leaves[i].address, atomic_load(&leaves[i].calls));
