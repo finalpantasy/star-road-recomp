@@ -22,6 +22,8 @@ typedef struct {
     unsigned load_kind;             /* generated loads: 1 = getter (GLEAF), 2 = null-safe (NLEAF), 3 = through a field (DLEAF, VLEAF 4) */
     unsigned offset2;               /* second-level load offset of a load_kind 3 row */
     unsigned vkind, vreg;           /* VLEAF: 1 load, 2 store, 3 constant, 4 load through a field; the register */
+    unsigned replay;                /* ELEAF: a port whose callees have side effects, compared by replay (task-52) */
+    unsigned probe;                 /* PLEAF: a traced row, counts live calls and runs the lifted body (task-52) */
     atomic_ullong calls, differences;
     atomic_ullong raced;            /* load rows: first pair differed, the identical retry agreed (another thread wrote the field) */
 } Leaf;
@@ -46,7 +48,11 @@ typedef struct {
     void f_##addr(Ctx *); \
     extern void f_##addr##_lifted(Ctx *); \
     extern uint64_t rust(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+#define PLEAF(chunk, addr)     void f_##addr(Ctx *);     extern void f_##addr##_lifted(Ctx *);
+#define ELEAF(chunk, addr, rust) CLEAF(chunk, addr, rust)
 #include "manifest.def"
+#undef ELEAF
+#undef PLEAF
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
@@ -63,7 +69,11 @@ enum {
 #define NLEAF(chunk, addr, rust, base, off, len) index_##addr,
 #define DLEAF(chunk, addr, rust, base, off, len, off2) index_##addr,
 #define VLEAF(chunk, addr, rust, vkind, vreg, base, off, len, off2) index_##addr,
+#define PLEAF(chunk, addr) index_##addr,
+#define ELEAF(chunk, addr, rust) index_##addr,
 #include "manifest.def"
+#undef ELEAF
+#undef PLEAF
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
@@ -89,7 +99,11 @@ static Leaf leaves[leaf_count] = {
 #define VLEAF(chunk, addr, sym, vkind_, vreg_, base, off, len, off2) \
     {HEAD(addr), .rust_vec = sym, .base_reg = base, .offset = off, .bytes = len, \
      .load_kind = (vkind_) == 1 ? 1 : (vkind_) == 4 ? 3 : 0, .offset2 = off2, .vkind = vkind_, .vreg = vreg_},
+#define PLEAF(chunk, addr) {HEAD(addr), .probe = 1},
+#define ELEAF(chunk, addr, sym) {HEAD(addr), .rust_regs = sym, .replay = 1},
 #include "manifest.def"
+#undef ELEAF
+#undef PLEAF
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
@@ -153,7 +167,90 @@ static void compare_store(Leaf *leaf, Ctx *c) {
     atomic_fetch_add(&leaf->calls, 1);
 }
 
+/* ---- Replay rows (ELEAF, task-52) ----
+ * A readable port whose callees have side effects cannot run next to the lifted body in `ab` mode: every callee
+ * would run twice on live memory. Such a row is compared by replay instead. The lifted body runs once on live
+ * memory, exactly as without the swap, and every callee it calls through a traced row (PLEAF) is recorded: the
+ * callee's address, the whole register file at the call and the whole register file after it. Then the Rust port
+ * runs on a copy of the context from before the call. Its guest calls (bridge, smrpg_guest_bl) do not execute: each
+ * one is matched with the next recorded call, which must have the same callee and the same registers x0 to x30
+ * and v0 to v31 at the call, and then receives the recorded register file after it. At the end the whole register
+ * file of the port must equal the lifted one and every recorded call must have been used. What this does and does
+ * not cover is in docs/DECOMP.md. A traced row that is reached while another call is being recorded (nested) is not
+ * recorded; a callee reached through an untraced function is not seen, so the row's callees must all be traced. */
+#define REC_MAX 12
+typedef struct { uint64_t target; Ctx pre, post; } RecCall;
+typedef struct { RecCall calls[REC_MAX]; unsigned count, next; int overflow, bad; } Recording;
+static __thread Recording *tl_rec, *tl_replay;
+static __thread unsigned tl_depth;
+static __thread uint64_t tl_stub;   /* selftest: nonzero = traced callees do not run, they clobber registers pseudo-randomly */
+
+/* A stand-in callee for the selftest (the fake object graph cannot support the real one): an arbitrary result and
+ * clobbered caller-saved registers, like a real callee leaves. x19 to x29, x30, sp and the exception state stay. */
+static void stub_callee(Ctx *c) {
+    uint64_t r = tl_stub;
+    for (int i = 0; i < 5; ++i) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; }
+    uint64_t w = r;
+    for (int i = 0; i < 19; ++i) {
+        w ^= w << 13; w ^= w >> 7; w ^= w << 17;
+        if (i < 18 && i != 0 && i != 1 && i != 8) c->x[i] = w;       /* x2..x17 except the result registers set below */
+        if (i == 0) c->x[0] = (w & 4) ? (w >> 8) : (w & 1);          /* bool-like or arbitrary result */
+        if (i == 1) c->x[1] = w;
+        if (i == 8) c->x[8] = w;
+    }
+    for (int i = 0; i < 8; ++i) { w ^= w << 13; w ^= w >> 7; w ^= w << 17; c->v[i][0] = (long long)w; c->v[i][1] = 0; }
+    tl_stub = w | 1;
+}
+
+static void run_traced(Leaf *leaf, Ctx *c) {
+    if (tl_stub) stub_callee(c);
+    else leaf->lifted(c);
+}
+
+static void compare_replay(Leaf *leaf, Ctx *c) {
+    if (tl_rec || tl_replay) {   /* reached from inside another recorded call: no nested comparison */
+        leaf->lifted(c);
+        return;
+    }
+    Ctx pristine, trial;
+    memcpy(&pristine, c, sizeof pristine);
+    Recording rec;
+    rec.count = rec.next = 0;
+    rec.overflow = rec.bad = 0;
+    tl_rec = &rec;
+    tl_depth = 0;
+    leaf->lifted(c);   /* live memory sees only this run */
+    tl_rec = 0;
+    atomic_fetch_add(&leaf->calls, 1);
+    if (rec.overflow) {
+        rt_log("decomp replay skipped addr=%#llx (more than %d traced calls)", (unsigned long long)leaf->address, REC_MAX);
+        return;
+    }
+    memcpy(&trial, &pristine, sizeof trial);
+    tl_replay = &rec;
+    leaf->rust_regs(trial.x);
+    tl_replay = 0;
+    int unused = rec.next != rec.count;
+    if (unused || rec.bad || memcmp(&trial, c, sizeof trial)) {
+        atomic_fetch_add(&leaf->differences, 1);
+        rt_log("decomp mismatch addr=%#llx replay: recorded=%u used=%u call_mismatch=%d", (unsigned long long)leaf->address,
+               rec.count, rec.next, rec.bad);
+        const uint64_t *a = (const uint64_t *)(const void *)c, *b = (const uint64_t *)(const void *)&trial;
+        unsigned shown = 0;
+        for (unsigned i = 0; i < sizeof(Ctx) / 8 && shown < 6; ++i)
+            if (a[i] != b[i]) {
+                rt_log("  ctx word %u (%s): lifted=%#llx rust=%#llx", i, i < 32 ? "x" : i < 96 ? "v" : "other",
+                       (unsigned long long)a[i], (unsigned long long)b[i]);
+                ++shown;
+            }
+    }
+}
+
 static void compare(Leaf *leaf, Ctx *c) {
+    if (leaf->replay) {
+        compare_replay(leaf, c);
+        return;
+    }
     if (is_store(leaf)) {
         compare_store(leaf, c);
         return;
@@ -192,6 +289,34 @@ static void compare(Leaf *leaf, Ctx *c) {
 }
 
 static inline void dispatch(Leaf *leaf, Ctx *c) {
+    if (leaf->probe) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
+        if (mode == AB) atomic_fetch_add(&leaf->calls, 1);
+        Recording *r = tl_rec;
+        if (r && tl_depth == 0) {
+            if (r->count >= REC_MAX) {
+                r->overflow = 1;
+                ++tl_depth;
+                run_traced(leaf, c);
+                --tl_depth;
+            } else {
+                RecCall *call = &r->calls[r->count];
+                call->target = leaf->address;
+                memcpy(&call->pre, c, sizeof *c);
+                ++tl_depth;
+                run_traced(leaf, c);
+                --tl_depth;
+                memcpy(&call->post, c, sizeof *c);
+                ++r->count;
+            }
+        } else if (r) {   /* nested inside a recorded callee */
+            ++tl_depth;
+            run_traced(leaf, c);
+            --tl_depth;
+        } else {
+            run_traced(leaf, c);
+        }
+        return;
+    }
     if (mode == OFF) leaf->lifted(c);
     else if (mode == ON) run_rust(leaf, c);
     else compare(leaf, c);
@@ -205,7 +330,11 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
 #define DLEAF(chunk, addr, rust, base, off, len, off2) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define VLEAF(chunk, addr, rust, vkind, vreg, base, off, len, off2) \
     void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#define PLEAF(chunk, addr) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#define ELEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #include "manifest.def"
+#undef ELEAF
+#undef PLEAF
 #undef LEAF
 #undef SLEAF
 #undef CLEAF
@@ -213,6 +342,89 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
 #undef NLEAF
 #undef DLEAF
 #undef VLEAF
+
+/* ---- Guest-call bridge (task-52) ----
+ * A readable Rust port calls a function that is still lifted C through smrpg_guest_bl (decomp/smrpg_decomp/src/
+ * bridge.rs). It does what a lifted `bl` does: the callee runs on the caller's own register file (x0..x7 staged,
+ * x30 = the return address the lifted code would have written, sp unchanged, so the callee's stack frame sits
+ * where the lifted code's would, below the caller's sp), and the callee's registers stay in that file as residue.
+ * A direct call to the registered entry, like the generated `f_<addr>(c)`; an address with no lifted entry goes
+ * to the interpreter fallback (rt_icall). Returns 1 when the callee left a C++ exception pending (the lifted
+ * caller returns at once in that case, and so must the port).
+ *
+ * ab rule. A port compared in `ab` mode runs on a copy of the context while the lifted caller then runs on the
+ * live one, so every callee runs twice on the same live memory. That is only allowed for a callee that cannot
+ * change memory: the pure allowlist below (pure.def, each entry proven from the lifted chunk by check_pure.py:
+ * stores only inside its own stack frame, no indirect call, no atomic, every callee pure in turn) plus the ported
+ * load rows (LEAF, GLEAF, NLEAF, DLEAF, VLEAF loads and constants). Any other target in `ab` mode stops the run
+ * (exit 10) instead of running a side effect twice. `on` mode runs the port once, so it has no such limit. */
+_Static_assert(offsetof(Ctx, v) == 256, "decomp bridge: Rust reads v0..v31 at x + 32 words");
+
+static const uint64_t pure_callees[] = {
+#define PURE_FN(addr) 0x##addr##ULL,
+#include "pure.def"
+#undef PURE_FN
+};
+
+static int callee_is_pure(uint64_t target) {
+    for (int i = 0; i < RT_ARRAY_LEN(pure_callees); ++i)
+        if (pure_callees[i] == target) return 1;
+    for (int i = 0; i < leaf_count; ++i)
+        if (leaves[i].address == target) return leaves[i].rust || (leaves[i].rust_vec && leaves[i].vkind != 2);
+    return 0;
+}
+
+extern __thread int g_rt_pure;
+
+/* Replay (ELEAF rows): the call is not executed, it is matched with the next recorded one. */
+static int replay_call(Recording *r, Ctx *c, uint64_t target) {
+    if (r->next >= r->count) {
+        r->bad = 1;
+        rt_log("decomp replay: the port made an extra call to %#llx (recorded %u)", (unsigned long long)target, r->count);
+        return c->exc != 0;
+    }
+    RecCall *call = &r->calls[r->next++];
+    if (call->target != target) {
+        r->bad = 1;
+        rt_log("decomp replay: call %u went to %#llx in the port, %#llx in the lifted body", r->next, (unsigned long long)target,
+               (unsigned long long)call->target);
+    } else {
+        unsigned shown = 0;
+        for (unsigned i = 0; i < 32; ++i)
+            if (c->x[i] != call->pre.x[i] && shown++ < 8) {
+                r->bad = 1;
+                rt_log("decomp replay: call %u to %#llx, x%u: lifted=%#llx rust=%#llx", r->next, (unsigned long long)target, i,
+                       (unsigned long long)call->pre.x[i], (unsigned long long)c->x[i]);
+            }
+        for (unsigned i = 0; i < 32; ++i)
+            if (memcmp(&c->v[i], &call->pre.v[i], sizeof c->v[i]) && shown++ < 8) {
+                r->bad = 1;
+                rt_log("decomp replay: call %u to %#llx, v%u differs", r->next, (unsigned long long)target, i);
+            }
+        if ((c->fpcr != call->pre.fpcr || c->fpsr != call->pre.fpsr) && shown++ < 8) {
+            r->bad = 1;
+            rt_log("decomp replay: call %u to %#llx, fpcr/fpsr differ", r->next, (unsigned long long)target);
+        }
+    }
+    memcpy(c, &call->post, sizeof *c);
+    return c->exc != 0;
+}
+
+int smrpg_guest_bl(uint64_t *x, uint64_t target) {
+    Ctx *c = (Ctx *)(void *)x;   /* Ctx.x is the first member: the Rust side holds a pointer to the register file */
+    if (tl_replay) {
+        for (int i = 0; i < leaf_count; ++i)
+            if (leaves[i].probe && leaves[i].address == target) return replay_call(tl_replay, c, target);
+    }
+    if (mode == AB && !callee_is_pure(target)) {
+        rt_log("decomp bridge: ab mode, callee %#llx is not on the pure allowlist (it would run twice)", (unsigned long long)target);
+        rt_exit(10, "decomp bridge: callee not pure");
+    }
+    GuestFn f = g_rt_pure ? 0 : rt_lookup(target);
+    if (f) f(c);
+    else rt_icall(c, target);   /* no lifted entry: interpreter fallback, which also sets c->pc like a miss */
+    return c->exc != 0;
+}
 
 static uint64_t random_word(uint64_t *state) {
     *state ^= *state << 13;
@@ -322,12 +534,32 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->x[0] = base + 8 * ((pick >> 8) % 40);
         if (pick & 1) c->x[1] = *(uint64_t *)(uintptr_t)(c->x[0] + 0x10);
         break;
+    case 0x7101b8abd0ULL: {   /* bridge selftest row (task-52): x0 = A, A+0x10 -> B, B+0x53 flag bits, B+0x40 -> P, P+0x10 read */
+        fill_fake_region(fake, 64, state);
+        fake[2] = base + 8 * 8;                                    /* A+0x10 = B (B is word 8) */
+        ((unsigned char *)&fake[8])[0x53] = (unsigned char)((pick >> 8) & 3) | ((pick & 0x400) ? 0x80 : 0);   /* bit 0, bit 1, both, neither */
+        fake[16] = base + 8 * (20 + ((pick >> 16) & 7));           /* B+0x40 = P, never null (the callee adds 8 and reads +8) */
+        c->x[0] = base;
+        break;
+    }
+    case 0x7101cf7650ULL: { /* Battle.BattleHit.exec_hit (task-52): +0x20 target, +0x28 skill params, +0x81 flag; target +0x18 motion */
+        fill_fake_region(fake, 64, state);
+        const uint64_t target = base + 8 * 20, motion = base + 8 * 44;
+        fake[4] = (pick & 7) == 0 ? 0 : target;                      /* _target, null one time in eight */
+        fake[5] = ((pick >> 3) & 7) == 0 ? 0 : base + 8 * 40;       /* _skill_params */
+        static const unsigned char flags[] = {0, 0, 0, 1, 2, 0x80, 0xff};
+        ((unsigned char *)&fake[16])[1] = flags[(pick >> 8) % RT_ARRAY_LEN(flags)];   /* _is_only_se_hit at +0x81 */
+        fake[23] = ((pick >> 16) & 3) == 0 ? 0 : motion;            /* target._motion at +0x18 */
+        c->x[0] = base;
+        break;
+    }
     default:
         break;
     }
 }
 
 static void selftest(Leaf *leaf, GuestFn entry) {
+    if (leaf->probe) return;   /* traced rows have no Rust body to compare */
     /* A caller's lifted body goes through the other leaves' wrappers, which count calls and differences.
      * Keep those counters as they were so only real game calls reach the live summary; any difference a
      * callee finds during this selftest is a failure. */
@@ -340,6 +572,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
             saved_differences[i] = atomic_load(&leaves[i].differences);
         }
     uint64_t seed = leaf->address;
+    if (leaf->replay) tl_stub = (seed * 0x9e3779b97f4a7c15ULL) | 1;   /* traced callees are stand-ins during the selftest */
     uint64_t vseed = leaf->address ^ 0x9e3779b97f4a7c15ULL;   /* separate stream: vector registers, so the integer cases stay as before */
     uint64_t fake[64];
     unsigned long long stores_seen = 0;   /* runs where the footprint changed, so a no-op pair cannot pass */
@@ -414,6 +647,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
         atomic_store(&leaves[i].calls, saved_calls[i]);
     }
     if (stores && !stores_seen) rt_exit(10, "decomp selftest: store leaf never wrote");
+    tl_stub = 0;
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);
     if (atomic_load(&leaf->raced)) rt_exit(10, "decomp selftest: raced on a private region");

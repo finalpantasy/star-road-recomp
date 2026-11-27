@@ -1,0 +1,5 @@
+/* Lifted functions a readable port may call through the guest-call bridge in `ab` mode (task-52).
+ * Each is proven pure from its lifted chunk by `python -I runtime/decomp/check_pure.py`: no store outside its own
+ * stack frame, no indirect call, no atomic or system instruction, every callee pure in turn. */
+PURE_FN(7100049adc)   /* selftest chain: reads x0->0x10 flags, calls the next */
+PURE_FN(710006b41c)   /* selftest chain: reads a flag byte and one pointer field, no frame */

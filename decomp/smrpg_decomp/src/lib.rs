@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod battle;
+pub mod bridge;
 pub mod object;
 
 #[cfg(not(test))]

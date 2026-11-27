@@ -135,7 +135,58 @@ game's own class, field and method names. Conventions, so later ports match:
 
 First readable ports: `Battle.BadStatusManager.can_command`, `Battle.BattleCharacterParam` (`is_dead`,
 `is_gone`, `is_invincible`, `can_battle`, `can_targetting`, `can_act`, `can_use_any_command`) and
-`MotionSpecial_Mario.can_bunnage_globe` (nine rows, task-51).
+`MotionSpecial_Mario.can_bunnage_globe` (nine rows, task-51). Task-52 adds `Battle.BattleHit.exec_hit` (`ELEAF`, compared by replay; see the next section).
+
+## Guest-call bridge (task-52)
+
+A readable port that replaces a lifted function may still need to call lifted functions. `decomp/smrpg_decomp/src/bridge.rs`
+gives it `Regs` (the register file the port edits, `Ctx.x`, with v0 to v31 following it in memory) and `Regs::invoke(target)`,
+backed by `smrpg_guest_bl` in `runtime/decomp/swap.c`. `invoke` does what a lifted `bl` does: the callee runs on the
+caller's own register file, so sp is the caller's sp (the callee's frame sits below it, as the lifted code's does), x30
+and every other argument register are whatever the port staged, and the callee's residue stays in the file. The call is a
+direct call to the registered entry (`f_<addr>(c)`, so a callee that is itself a Rust row goes through its wrapper), or the
+interpreter fallback `rt_icall` when the address has no lifted entry. It returns 1 when the callee left an exception
+pending; the port returns at once, as the lifted caller does. `Regs::call` stages x0 to x7 and x30 for the common case;
+`Regs::set_f32` and `f32_result` move float arguments and results through v0 to v7. A port writes to the register file
+only what the lifted code flushes at that call site (the lifter writes a register to the context at the first call after
+it changed), because the A/B compares the whole context.
+
+Which callees may run in `ab` mode (the choice and why). `ab` runs the port on a copy of the context and then the lifted
+body on the live one, so a callee run by both runs twice on live memory. Two ways to compare, one per row kind:
+
+- Pure callees (`CLEAF` rows). The port may call only a function on the pure allowlist: `runtime/decomp/pure.def` plus the
+  ported load rows (`LEAF`, `GLEAF`, `NLEAF`, `DLEAF`, `VLEAF` that is not a store). Any other target in `ab` mode stops the run
+  (exit 10, a log line naming the address) before the callee executes, so a side effect can never run twice. Each
+  `pure.def` entry is proven by `python -I runtime/decomp/check_pure.py` from the lifted chunk: every store is inside the
+  function's own stack frame (a pre-index push, or a non-negative offset inside the frame it allocated), no `rt_icall`,
+  `rt_dispatch`, `rt_svc`, `rt_brk` or exception landing, no exclusive, acquire or release instruction, no operation outside
+  the load, arithmetic, float and SIMD-arithmetic set, and every direct callee is itself pure. The comparison is the usual
+  one: `memcmp` over the whole `Ctx` (x, v, flags, fpcr, fpsr, pc, exception fields, scratch). It does not compare stack
+  memory below sp (dead after return) and does not compare heap memory (the proof says no callee writes it; the port itself
+  must not write any).
+- Callees with side effects (`ELEAF` rows, replay). The lifted body runs once on live memory, exactly as without the swap,
+  and the calls it makes through traced rows (`PLEAF`) are recorded: callee address, the whole register file at the call, and
+  after it. The port then runs on a copy of the entry context; its `invoke` calls do not execute, each is matched with the
+  next recorded call (same callee, same x0 to x30 and v0 to v31 at the call, so wrong arguments, a wrong x30 or a wrong
+  frame are found at the call), and the port receives the recorded register file after it. At the end the port's whole
+  `Ctx` must equal the lifted one and every recorded call must have been used. This covers: the order and number of callee
+  calls, every register at every call, the control flow between calls (as it shows in later calls and in the final registers),
+  and the final register file including residue. It does not cover: what the callees do (they ran once, lifted, unchanged), the
+  port reading memory after the callees ran instead of before (the port runs second, so a field the callees change between
+  two reads can differ and shows as a mismatch to diagnose), a callee reached through an untraced function (the recorder
+  sees only calls from the row's own body, so every callee must be a `PLEAF` row), and more than 12 traced calls per run
+  (the comparison is skipped and logged). A port in a replay row writes no guest memory.
+- `on` mode runs the port once with real callees and has no such limit. `off` runs the lifted body.
+
+Selftest for both kinds runs at startup like the other rows (10,000 random plus 15,625 edge cases). A replay row's traced
+callees are stand-ins during the selftest (they clobber x0 to x17 and v0 to v7 pseudo-randomly and never run the game
+function, because the fake object graph cannot support the real one); the lifted body between the calls is real. The
+bridge row is `0x7101b8abd0`, a thunk (`b 0x7100049adc`) that is one tail call over the pure chain `0x7100049adc` and
+`0x710006b41c`; its fake graph is built in `prepare_caller`. `cargo test` repeats the port logic with a recorder that
+implements the callee trait, and the register staging with a fake bridge.
+
+Traced rows (`PLEAF(chunk, address)`, no Rust symbol) also count live calls of any lifted function in `ab` mode and run
+the lifted body unchanged, which is how the candidate table in `backlog/tasks/task-52.md` got its live evidence.
 
 ## Reproduce the comparison
 

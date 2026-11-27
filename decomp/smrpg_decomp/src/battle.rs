@@ -5,6 +5,7 @@
 //! The `smrpg_*` functions at the bottom are the shim: they map guest registers to those arguments and back,
 //! and reproduce the register residue the lifted code leaves behind (see docs/DECOMP.md, "Readable ports").
 
+use crate::bridge::{GuestException, Regs};
 use crate::object::{GuestObject, guest_class};
 
 /// `Battle.BadStatusManager.BadStatusKind`, the raw 32-bit value (the game stores any int, so no Rust enum).
@@ -156,7 +157,12 @@ guest_class!(
     BattleCharacter
 );
 impl BattleCharacter {
+    const MOTION: u64 = 0x18;
     const PARAM: u64 = 0x20;
+
+    pub fn motion(self) -> Option<BattleCharacterMotion> {
+        self.optional_field(Self::MOTION)
+    }
 
     pub fn param(self) -> BattleCharacterParam {
         self.object_field(Self::PARAM)
@@ -207,6 +213,143 @@ pub enum GlobeCheck {
     NotNormal,
     Invincible,
     Yes,
+}
+
+guest_class!(
+    /// `Battle.BattleCharacterMotion`
+    BattleCharacterMotion
+);
+
+guest_class!(
+    /// `Battle.BattleSkillParams`
+    BattleSkillParams
+);
+
+/// `Battle.BattleCharacterMotion.MotionSpecialTiming`, the values `exec_hit` passes to `calc_motion`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MotionSpecialTiming(pub u32);
+
+impl MotionSpecialTiming {
+    pub const HIT_BEFORE: Self = Self(4);
+    pub const HIT: Self = Self(5);
+}
+
+guest_class!(
+    /// `Battle.BattleHit`
+    BattleHit
+);
+impl BattleHit {
+    const TARGET: u64 = 0x20;
+    const SKILL_PARAMS: u64 = 0x28;
+    const IS_ONLY_SE_HIT: u64 = 0x81;
+
+    /// The character being hit. The callees test it for null themselves, so it is passed on as it is.
+    pub fn target(self) -> BattleCharacter {
+        self.object_field(Self::TARGET)
+    }
+
+    pub fn skill_params(self) -> Option<BattleSkillParams> {
+        self.optional_field(Self::SKILL_PARAMS)
+    }
+
+    pub fn is_only_se_hit(self) -> bool {
+        self.bool_field(Self::IS_ONLY_SE_HIT)
+    }
+
+    /// The target's motion, when there is a target and it has one.
+    fn target_motion(self) -> Option<BattleCharacterMotion> {
+        let target = self.target();
+        if target.is_null() {
+            None
+        } else {
+            target.motion()
+        }
+    }
+
+    /// `exec_hit`: run one hit of a skill. With no skill parameters there is nothing to do. A sound-effect-only
+    /// hit plays its sound and stops; so does the third reserve hit of a combo (it only lands its damage).
+    /// Otherwise the target's motion is told the hit is coming (`HIT_BEFORE`), the damage, weak or resist mark and
+    /// hit count are shown, the combo display is set, the hit lands, and the motion is told it landed (`HIT`).
+    /// The game re-reads the fields before each call, so this does too.
+    pub fn exec_hit<C: HitCalls>(self, calls: &mut C) -> Result<(), GuestException> {
+        if self.skill_params().is_none() {
+            return calls.leave(HitExit::NoSkillParams);
+        }
+        if self.is_only_se_hit() {
+            return calls.only_se_hit_tail(self, self.target());
+        }
+        if calls.is_renkei_3_reserve_hit(self)? {
+            return calls.hit_tail(self, self.target());
+        }
+        if let Some(motion) = self.target_motion() {
+            calls.calc_motion(motion, self, MotionSpecialTiming::HIT_BEFORE)?;
+        }
+        calls.disp_damage(self, self.target())?;
+        calls.disp_weak_resist(self, self.target())?;
+        calls.disp_hit_count(self, self.target())?;
+        calls.set_disp_combo(self)?;
+        calls.hit(self, self.target())?;
+        if self.target().is_null() {
+            return calls.leave(HitExit::TargetGone);
+        }
+        match self.target().motion() {
+            Some(motion) => calls.calc_motion_tail(motion, self, MotionSpecialTiming::HIT),
+            None => calls.leave(HitExit::NoMotion),
+        }
+    }
+}
+
+/// How `exec_hit` ends without a tail call; the shim needs it to leave x0 as the lifted code does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitExit {
+    NoSkillParams,
+    /// The target was null after the hit: x0 stays what `hit` returned.
+    TargetGone,
+    /// The target has no motion: x0 is that null motion.
+    NoMotion,
+}
+
+/// The game functions `exec_hit` calls, by their C# names. The `_tail` forms are the ones the game ends the
+/// method with (a jump, not a call). The real implementation calls the lifted functions through the guest-call
+/// bridge; the unit tests use a recorder.
+pub trait HitCalls {
+    fn only_se_hit_tail(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException>;
+    fn is_renkei_3_reserve_hit(&mut self, hit: BattleHit) -> Result<bool, GuestException>;
+    fn hit_tail(&mut self, hit: BattleHit, target: BattleCharacter) -> Result<(), GuestException>;
+    fn calc_motion(
+        &mut self,
+        motion: BattleCharacterMotion,
+        hit: BattleHit,
+        timing: MotionSpecialTiming,
+    ) -> Result<(), GuestException>;
+    fn disp_damage(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException>;
+    fn disp_weak_resist(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException>;
+    fn disp_hit_count(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException>;
+    fn set_disp_combo(&mut self, hit: BattleHit) -> Result<(), GuestException>;
+    fn hit(&mut self, hit: BattleHit, target: BattleCharacter) -> Result<(), GuestException>;
+    fn calc_motion_tail(
+        &mut self,
+        motion: BattleCharacterMotion,
+        hit: BattleHit,
+        timing: MotionSpecialTiming,
+    ) -> Result<(), GuestException>;
+    fn leave(&mut self, how: HitExit) -> Result<(), GuestException>;
 }
 
 // ---- Shim: guest registers to arguments (x0 is `this`, x1 the hidden method pointer the game passes) ----
@@ -272,6 +415,220 @@ pub unsafe extern "C" fn smrpg_mario_can_bunnage_globe(x: *mut u64) {
             GlobeCheck::Invincible | GlobeCheck::Yes => after_call(x, 0x7101e73ca4),
         }
         x.write(u64::from(check == GlobeCheck::Yes));
+    }
+}
+
+// ---- exec_hit shim: the lifted body's calls, with the registers it writes at each call site ----
+
+mod hit_site {
+    //! Callee addresses, and the address after each `bl` in `exec_hit` (the x30 the lifted code writes).
+    pub const ONLY_SE_HIT: u64 = 0x7101cf77f0;
+    pub const IS_RENKEI_3_RESERVE_HIT: u64 = 0x7101cf79a0;
+    pub const HIT: u64 = 0x7101cf7aa0;
+    pub const DISP_DAMAGE: u64 = 0x7101cf7f90;
+    pub const DISP_WEAK_RESIST: u64 = 0x7101cf8310;
+    pub const DISP_HIT_COUNT: u64 = 0x7101cf8570;
+    pub const SET_DISP_COMBO: u64 = 0x7101cf87a0;
+    pub const CALC_MOTION: u64 = 0x7101e67090;
+    pub const RET_IS_RENKEI: u64 = 0x7101cf768c;
+    pub const RET_CALC_MOTION: u64 = 0x7101cf76c4;
+    pub const RET_DISP_DAMAGE: u64 = 0x7101cf76d0;
+    pub const RET_DISP_WEAK_RESIST: u64 = 0x7101cf76dc;
+    pub const RET_DISP_HIT_COUNT: u64 = 0x7101cf76e8;
+    pub const RET_SET_DISP_COMBO: u64 = 0x7101cf76f0;
+    pub const RET_HIT: u64 = 0x7101cf76fc;
+}
+
+/// `exec_hit` pushes a 32-byte frame (x29, x30, x19), so its callees see sp and x29 32 bytes lower, and x19 =
+/// this. The lifted code writes a register to the context only at the first call after it changes (a "flush"),
+/// so each method here writes just the registers the lifted code flushes at that site; every other register
+/// keeps what the previous callee left. The entry values are what the epilogue restores before a tail call or
+/// a return.
+struct LiftedHit {
+    regs: Regs,
+    entry_x19: u64,
+    entry_x29: u64,
+    entry_x30: u64,
+    entry_sp: u64,
+}
+
+impl LiftedHit {
+    fn new(regs: Regs) -> Self {
+        Self {
+            entry_x19: regs.x(19),
+            entry_x29: regs.x(29),
+            entry_x30: regs.x(30),
+            entry_sp: regs.sp(),
+            regs,
+        }
+    }
+
+    /// The epilogue before a tail call: the frame is popped and the saved registers are back.
+    fn pop_frame(&mut self) {
+        self.regs.set_x(19, self.entry_x19);
+        self.regs.set_x(29, self.entry_x29);
+        self.regs.set_x(30, self.entry_x30);
+        self.regs.set_x(31, self.entry_sp);
+    }
+
+    /// The lifted `bl`: x30 is the address after it, then the callee runs on the register file.
+    fn call(&mut self, target: u64, return_address: u64) -> Result<(), GuestException> {
+        self.regs.set_x(30, return_address);
+        self.regs.invoke(target).map(|_| ())
+    }
+
+    /// `callee(this, target)` for the methods that take the hit and a character.
+    fn call_with_target(
+        &mut self,
+        target: u64,
+        return_address: u64,
+        hit: BattleHit,
+        character: BattleCharacter,
+    ) -> Result<(), GuestException> {
+        self.regs.set_x(0, hit.address());
+        self.regs.set_x(1, character.address());
+        self.call(target, return_address)
+    }
+
+    /// `motion.calc_motion(skill_params, timing, hit)` with the zero method pointer in x4.
+    fn stage_calc_motion(
+        &mut self,
+        motion: BattleCharacterMotion,
+        hit: BattleHit,
+        timing: MotionSpecialTiming,
+    ) {
+        let skill_params = hit.object_field::<BattleSkillParams>(BattleHit::SKILL_PARAMS);
+        self.regs.set_x(0, motion.address());
+        self.regs.set_x(1, skill_params.address());
+        self.regs.set_x(2, u64::from(timing.0));
+        self.regs.set_x(3, hit.address());
+        self.regs.set_x(4, 0);
+    }
+}
+
+impl HitCalls for LiftedHit {
+    fn only_se_hit_tail(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException> {
+        self.regs.set_x(0, hit.address());
+        self.regs.set_x(1, target.address());
+        self.regs
+            .set_x(8, u64::from(hit.u8_field(BattleHit::IS_ONLY_SE_HIT)));
+        self.pop_frame();
+        self.regs.invoke(hit_site::ONLY_SE_HIT).map(|_| ())
+    }
+
+    fn is_renkei_3_reserve_hit(&mut self, hit: BattleHit) -> Result<bool, GuestException> {
+        // The first call: the frame is pushed, x19 = this, x8 = the flag byte that was just tested (zero).
+        let new_sp = self.entry_sp.wrapping_sub(32);
+        self.regs.set_x(0, hit.address());
+        self.regs.set_x(8, 0);
+        self.regs.set_x(19, hit.address());
+        self.regs.set_x(29, new_sp);
+        self.regs.set_x(31, new_sp);
+        self.call(hit_site::IS_RENKEI_3_RESERVE_HIT, hit_site::RET_IS_RENKEI)?;
+        Ok(self.regs.x(0) & 1 != 0)
+    }
+
+    fn hit_tail(&mut self, hit: BattleHit, target: BattleCharacter) -> Result<(), GuestException> {
+        self.regs.set_x(0, hit.address());
+        self.regs.set_x(1, target.address());
+        self.pop_frame();
+        self.regs.invoke(hit_site::HIT).map(|_| ())
+    }
+
+    fn calc_motion(
+        &mut self,
+        motion: BattleCharacterMotion,
+        hit: BattleHit,
+        timing: MotionSpecialTiming,
+    ) -> Result<(), GuestException> {
+        self.stage_calc_motion(motion, hit, timing);
+        self.call(hit_site::CALC_MOTION, hit_site::RET_CALC_MOTION)
+    }
+
+    fn disp_damage(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException> {
+        self.call_with_target(
+            hit_site::DISP_DAMAGE,
+            hit_site::RET_DISP_DAMAGE,
+            hit,
+            target,
+        )
+    }
+
+    fn disp_weak_resist(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException> {
+        self.call_with_target(
+            hit_site::DISP_WEAK_RESIST,
+            hit_site::RET_DISP_WEAK_RESIST,
+            hit,
+            target,
+        )
+    }
+
+    fn disp_hit_count(
+        &mut self,
+        hit: BattleHit,
+        target: BattleCharacter,
+    ) -> Result<(), GuestException> {
+        self.call_with_target(
+            hit_site::DISP_HIT_COUNT,
+            hit_site::RET_DISP_HIT_COUNT,
+            hit,
+            target,
+        )
+    }
+
+    fn set_disp_combo(&mut self, hit: BattleHit) -> Result<(), GuestException> {
+        self.regs.set_x(0, hit.address());
+        self.call(hit_site::SET_DISP_COMBO, hit_site::RET_SET_DISP_COMBO)
+    }
+
+    fn hit(&mut self, hit: BattleHit, target: BattleCharacter) -> Result<(), GuestException> {
+        self.call_with_target(hit_site::HIT, hit_site::RET_HIT, hit, target)
+    }
+
+    fn calc_motion_tail(
+        &mut self,
+        motion: BattleCharacterMotion,
+        hit: BattleHit,
+        timing: MotionSpecialTiming,
+    ) -> Result<(), GuestException> {
+        self.stage_calc_motion(motion, hit, timing);
+        self.regs.set_x(8, hit.target().address());
+        self.pop_frame();
+        self.regs.invoke(hit_site::CALC_MOTION).map(|_| ())
+    }
+
+    fn leave(&mut self, how: HitExit) -> Result<(), GuestException> {
+        // The lifted return flushes x0, x19, x29 and sp (not x30): the frame is popped, nothing else changes.
+        if how == HitExit::NoMotion {
+            self.regs.set_x(0, 0);
+        }
+        self.regs.set_x(19, self.entry_x19);
+        self.regs.set_x(29, self.entry_x29);
+        self.regs.set_x(31, self.entry_sp);
+        Ok(())
+    }
+}
+
+/// 0x7101cf7650 `BattleHit.exec_hit`. A pending exception from a callee stays in the register file, which is
+/// all the lifted body leaves too.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_hit_exec_hit(x: *mut u64) {
+    unsafe {
+        let regs = Regs::from_raw(x);
+        let hit = BattleHit::at(regs.x(0));
+        let _ = hit.exec_hit(&mut LiftedHit::new(regs));
     }
 }
 
@@ -418,5 +775,216 @@ mod tests {
         x[0] = off.address(0);
         unsafe { smrpg_param_can_use_any_command(x.as_mut_ptr()) };
         assert_eq!((x[0], x[1], x[8], x[30]), (0, 0xaa, 0xaa, 0xaa));
+    }
+
+    extern crate std;
+    use std::vec;
+    use std::vec::Vec;
+
+    /// A fake `BattleHit` graph: hit at word 0 (+0x20 target, +0x28 skill params, +0x81 flag byte), target at
+    /// word 20 (+0x18 motion).
+    struct HitGraph(std::boxed::Box<[u64; 64]>);
+
+    impl HitGraph {
+        fn new(skill: bool, only_se: u8, target: bool, motion: bool) -> Self {
+            let mut graph = Self(std::boxed::Box::new([0u64; 64])); // on the heap: its address is stable
+            let base = graph.0.as_ptr() as u64;
+            let words = &mut graph.0;
+            if skill {
+                words[5] = base + 8 * 40;
+            }
+            if target {
+                words[4] = base + 8 * 20;
+                if motion {
+                    words[23] = base + 8 * 44;
+                }
+            }
+            words[16] = u64::from(only_se) << 8;
+            graph
+        }
+
+        fn hit(&self) -> BattleHit {
+            unsafe { BattleHit::at(self.0.as_ptr() as u64) }
+        }
+    }
+
+    /// Records the calls `exec_hit` makes, by the game's method names.
+    struct Recorder {
+        calls: Vec<&'static str>,
+        renkei: bool,
+    }
+
+    impl Recorder {
+        fn new(renkei: bool) -> Self {
+            Self {
+                calls: Vec::new(),
+                renkei,
+            }
+        }
+
+        fn note(&mut self, name: &'static str) -> Result<(), GuestException> {
+            self.calls.push(name);
+            Ok(())
+        }
+    }
+
+    impl HitCalls for Recorder {
+        fn only_se_hit_tail(
+            &mut self,
+            _: BattleHit,
+            _: BattleCharacter,
+        ) -> Result<(), GuestException> {
+            self.note("only_se_hit")
+        }
+        fn is_renkei_3_reserve_hit(&mut self, _: BattleHit) -> Result<bool, GuestException> {
+            self.calls.push("is_renkei_3_reserve_hit");
+            Ok(self.renkei)
+        }
+        fn hit_tail(&mut self, _: BattleHit, _: BattleCharacter) -> Result<(), GuestException> {
+            self.note("hit (tail)")
+        }
+        fn calc_motion(
+            &mut self,
+            _: BattleCharacterMotion,
+            _: BattleHit,
+            timing: MotionSpecialTiming,
+        ) -> Result<(), GuestException> {
+            assert_eq!(timing, MotionSpecialTiming::HIT_BEFORE);
+            self.note("calc_motion HIT_BEFORE")
+        }
+        fn disp_damage(&mut self, _: BattleHit, _: BattleCharacter) -> Result<(), GuestException> {
+            self.note("disp_damage")
+        }
+        fn disp_weak_resist(
+            &mut self,
+            _: BattleHit,
+            _: BattleCharacter,
+        ) -> Result<(), GuestException> {
+            self.note("disp_weak_resist")
+        }
+        fn disp_hit_count(
+            &mut self,
+            _: BattleHit,
+            _: BattleCharacter,
+        ) -> Result<(), GuestException> {
+            self.note("disp_hit_count")
+        }
+        fn set_disp_combo(&mut self, _: BattleHit) -> Result<(), GuestException> {
+            self.note("set_disp_combo")
+        }
+        fn hit(&mut self, _: BattleHit, _: BattleCharacter) -> Result<(), GuestException> {
+            self.note("hit")
+        }
+        fn calc_motion_tail(
+            &mut self,
+            _: BattleCharacterMotion,
+            _: BattleHit,
+            timing: MotionSpecialTiming,
+        ) -> Result<(), GuestException> {
+            assert_eq!(timing, MotionSpecialTiming::HIT);
+            self.note("calc_motion HIT (tail)")
+        }
+        fn leave(&mut self, how: HitExit) -> Result<(), GuestException> {
+            self.note(match how {
+                HitExit::NoSkillParams => "leave: no skill params",
+                HitExit::TargetGone => "leave: target gone",
+                HitExit::NoMotion => "leave: no motion",
+            })
+        }
+    }
+
+    #[test]
+    fn exec_hit_calls_follow_the_game_order() {
+        for skill in [false, true] {
+            for only_se in [0u8, 1, 2, 0x80, 0xff] {
+                for renkei in [false, true] {
+                    // 0 no target, 1 target without a motion, 2 target with a motion
+                    for target in 0..3 {
+                        let g = HitGraph::new(skill, only_se, target > 0, target == 2);
+                        let mut r = Recorder::new(renkei);
+                        assert_eq!(g.hit().exec_hit(&mut r), Ok(()));
+                        let mut want: Vec<&str> = Vec::new();
+                        if !skill {
+                            want.push("leave: no skill params");
+                        } else if only_se != 0 {
+                            want.push("only_se_hit");
+                        } else {
+                            want.push("is_renkei_3_reserve_hit");
+                            if renkei {
+                                want.push("hit (tail)");
+                            } else {
+                                if target == 2 {
+                                    want.push("calc_motion HIT_BEFORE");
+                                }
+                                want.extend([
+                                    "disp_damage",
+                                    "disp_weak_resist",
+                                    "disp_hit_count",
+                                    "set_disp_combo",
+                                    "hit",
+                                ]);
+                                want.push(match target {
+                                    0 => "leave: target gone",
+                                    1 => "leave: no motion",
+                                    _ => "calc_motion HIT (tail)",
+                                });
+                            }
+                        }
+                        assert_eq!(r.calls, want, "{skill} {only_se:#x} {renkei} {target}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exec_hit_shim_stages_the_lifted_registers() {
+        use crate::bridge::tests::{CALLS, clear, install};
+        clear();
+        for target in [
+            hit_site::ONLY_SE_HIT,
+            hit_site::IS_RENKEI_3_RESERVE_HIT,
+            hit_site::HIT,
+            hit_site::DISP_DAMAGE,
+            hit_site::DISP_WEAK_RESIST,
+            hit_site::DISP_HIT_COUNT,
+            hit_site::SET_DISP_COMBO,
+            hit_site::CALC_MOTION,
+        ] {
+            install(target, |r| r[8] = 0x1234); // every fake callee leaves x8 behind
+        }
+        let g = HitGraph::new(true, 0, true, true);
+        let base = g.0.as_ptr() as u64;
+        let mut file = [0u64; 96];
+        file[0] = base;
+        file[19] = 0x1919;
+        file[29] = 0x2929;
+        file[30] = 0x3030;
+        file[31] = 0x8000;
+        unsafe { smrpg_hit_exec_hit(file.as_mut_ptr()) };
+        let calls: Vec<u64> = CALLS.with(|c| c.borrow().clone());
+        assert_eq!(
+            calls,
+            vec![
+                hit_site::IS_RENKEI_3_RESERVE_HIT,
+                hit_site::CALC_MOTION,
+                hit_site::DISP_DAMAGE,
+                hit_site::DISP_WEAK_RESIST,
+                hit_site::DISP_HIT_COUNT,
+                hit_site::SET_DISP_COMBO,
+                hit_site::HIT,
+                hit_site::CALC_MOTION,
+            ]
+        );
+        // The tail call to calc_motion(motion, skill params, HIT, hit, null) after the frame is popped.
+        assert_eq!(
+            (file[0], file[1], file[2], file[3], file[4]),
+            (base + 8 * 44, base + 8 * 40, 5, base, 0)
+        );
+        // The frame is popped: the registers it saved are back.
+        assert_eq!(
+            (file[19], file[29], file[30], file[31]),
+            (0x1919, 0x2929, 0x3030, 0x8000)
+        );
     }
 }
