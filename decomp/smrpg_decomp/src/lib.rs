@@ -1,5 +1,8 @@
 #![no_std]
 
+pub mod battle;
+pub mod object;
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {

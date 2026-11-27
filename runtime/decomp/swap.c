@@ -239,6 +239,53 @@ static void fill_fake_region(uint64_t *words, unsigned count, uint64_t *state) {
     }
 }
 
+/* Readable ports of Battle classes (task-51, decomp/smrpg_decomp/src/battle.rs). Each takes an object graph:
+ * motion (+0x10) -> character (+0x20) -> param (+0x98 status manager, +0xa0 buff manager). The selftest builds
+ * the whole graph in the private fake region with edge values for every field the ports read (never game
+ * memory). Returns which object x0 is: 1 param, 2 status manager, 3 Mario motion special, 0 not a battle port. */
+static int battle_object_kind(uint64_t address) {
+    switch (address) {
+    case 0x71021bdec0ULL: case 0x71021bcb30ULL: case 0x71021c3540ULL: case 0x71021c3600ULL:
+    case 0x71021c3580ULL: case 0x71021c3640ULL: case 0x71021c35a0ULL: return 1;
+    case 0x7101e2fa80ULL: return 2;
+    case 0x7101e73c40ULL: return 3;
+    default: return 0;
+    }
+}
+
+static uint32_t battle_edge_word(uint64_t *state) {
+    static const uint32_t edges[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0xffffffffu, 0x80000000u, 0x7fffffffu};
+    uint64_t r = random_word(state);
+    return (r & 3) == 0 ? (uint32_t)(r >> 8) : edges[(r >> 8) % RT_ARRAY_LEN(edges)];
+}
+
+static void prepare_battle(int kind, Ctx *c, uint64_t *fake, uint64_t *state) {
+    fill_fake_region(fake, 64, state);
+    const uint64_t base = (uint64_t)(uintptr_t)fake;
+    unsigned char *param = (unsigned char *)fake;                 /* word 0: BattleCharacterParam (0xb0 bytes) */
+    unsigned char *status = (unsigned char *)&fake[24];           /* BadStatusManager */
+    unsigned char *buff = (unsigned char *)&fake[32];             /* BuffManager */
+    uint64_t *character = &fake[40];                              /* BattleCharacter, +0x20 = param */
+    uint64_t *motion = &fake[48];                                 /* MotionSpecial_Mario, +0x10 = character */
+    static const unsigned bools[] = {0x6e, 0x71, 0x78};           /* is_join, is_bunnage, can_targetting */
+    static const unsigned char truthy[] = {1, 1, 1, 2, 0x80, 0xff};  /* any non-zero byte is true */
+    for (unsigned i = 0; i < 3; ++i) {
+        uint64_t r = random_word(state);
+        unsigned on_in_eight = i == 1 ? 2 : 7;                    /* join and targetting lean true, bunnage false */
+        param[bools[i]] = (r & 7) < on_in_eight ? truthy[(r >> 8) % RT_ARRAY_LEN(truthy)] : 0;
+    }
+    uint32_t act = battle_edge_word(state), turn = battle_edge_word(state), kind_word = battle_edge_word(state);
+    memcpy(param + 0x5c, &act, 4);
+    memcpy(buff + 0x28, &turn, 4);
+    memcpy(status + 0x10, &kind_word, 4);
+    memcpy(param + 0x98, &(uint64_t){base + 8 * 24}, 8);
+    memcpy(param + 0xa0, &(uint64_t){base + 8 * 32}, 8);
+    character[4] = base;                                          /* +0x20 */
+    uint64_t pick = random_word(state);
+    motion[2] = (pick & 7) == 0 ? 0 : base + 8 * 40;              /* +0x10: null one time in eight */
+    c->x[0] = kind == 1 ? base : kind == 2 ? base + 8 * 24 : base + 8 * 48;
+}
+
 /* Caller functions (task-44) dereference pointers they compute, so the selftest builds a valid shape in the
  * private fake region for each one (never game memory). Register-only callers keep the random registers. */
 static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *state, int edge_phase) {
@@ -318,6 +365,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
             for (unsigned j = 0; j < 3; ++j, k /= nedge) c.x[j] = edges[k % nedge];
         }
         if (leaf->rust_regs) prepare_caller(leaf->address, &c, fake, &seed, i < edge_cases);
+        if (battle_object_kind(leaf->address)) prepare_battle(battle_object_kind(leaf->address), &c, fake, &seed);
         if (pointer_leaf) {
             fill_fake_region(fake, RT_ARRAY_LEN(fake), &seed);
             /* null one time in eight, otherwise an 8-byte aligned slot with room for the +0x10 field */

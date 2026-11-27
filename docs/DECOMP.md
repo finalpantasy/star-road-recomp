@@ -101,6 +101,42 @@ The cap on lifted chunks exists because the build recompiles every chunk that ho
 
 Build cost (task-46, `-j 16`, BelowNormal). Compiling a wrapped chunk takes seconds to minutes (main_0169, 7.3 MB of C, ran past 8 minutes at -O2 and was killed), but the dominant cost is the final link: every wrapped chunk object adds about 4.5 MB to `smrpg.exe` (437 MB with 15 chunks, 1.13 GB with 185) and linking that took 9 minutes. A full set of 351 chunks cannot be linked inside the 10 minute limit, so the built set is the 120 best chunks (by functions plus call sites) of chunks 0 to 199 without main_0169: 3,778 of the 12,032 generated functions (the other 8,254 stay lifted; their Rust is generated and type-checked, not linked). Link time, not compile time, is the cap to attack next (for example a split link or less debug info), not the generator. The selftest cost is about 4 ms per row (3,806 rows in 15.3 s), so all 12,032 would take about 50 s; the selftest runs only with `SMRPG_DECOMP=ab` and `SMRPG_DECOMP_SELFTEST=1`, never in the default `on` mode (`on` starts in 0.35 s with 3,806 rows registered).
 
+## Readable ports (task-51)
+
+The bulk generator ports shapes. A readable port is a game method written as Rust a person can read, with the
+game's own class, field and method names. Conventions, so later ports match:
+
+- One module per IL2CPP class family, named for it (`decomp/smrpg_decomp/src/battle.rs` for `Battle.*`).
+- A field access layer (`object.rs`): `guest_class!(Name)` declares a one-field wrapper around a guest address;
+  the `GuestObject` trait reads fields (`bool_field`, `i32_field`, `u32_field`, `object_field`, `optional_field`)
+  with the same relaxed atomic loads as the lifted code. Each class names its fields once, as private `const`
+  offsets taken from the IL2CPP field table, and exposes accessors. The method bodies use accessors only: no
+  address arithmetic, no registers. Reference fields the original dereferences blind use `object_field`; ones it
+  tests for null use `optional_field`.
+- Enums stay raw integers (`BadStatusKind(u32)` with associated constants) because the game stores any int.
+- Where a method has several early exits, the readable function returns which test decided (`GlobeCheck`,
+  `CommandCheck`) and the public bool is derived from it. The extra information is what the shim needs.
+- The shim is at the bottom of the module and is the only code that sees registers. Pure leaves use a
+  `leaf_shim!(symbol, Class, method)` row (`LEAF`, x0 is `this`, x1 the hidden method pointer, result in x0).
+  Callers of other ported leaves use a `CLEAF` shim taking the register file. It copies the lifter's residue:
+  before each `bl` the lifted body writes x1 (the zero method pointer), x8 and x30 (the return address) to the
+  context and never restores them, so a path that reached a call must leave those values and a path that
+  returned before the call must not. The A/B compares the whole context, so a wrong residue is a mismatch.
+- Names, field offsets and addresses are in Git for hand-written ports, as they already are for the 28 leaves
+  in `leaves.def`. Bulk-derived sets stay on A:. If the owner rules the readable modules out of Git, move the
+  module to A: next to `gen.rs` and include it from `build.rs`.
+- Selftest: `battle_object_kind` and `prepare_battle` in `runtime/decomp/swap.c` build the object graph (motion,
+  character, param, status manager, buff manager) in the private fake region with edge values for every field
+  read (bool bytes 0, 1, 2, 0x80, 0xff; statuses 0 to 12 and the 32-bit edges; counts at the signed edges; a null
+  parent one time in eight). A new class needs a graph builder like it. `cargo test` repeats the logic against
+  an independent reference written from the disassembly (the status bit mask 0x248, for one).
+- Floating point is not in these ports. A float port must keep the lifted operation order and fusing, and the
+  selftest must include NaN, infinities, signed zeros and subnormals.
+
+First readable ports: `Battle.BadStatusManager.can_command`, `Battle.BattleCharacterParam` (`is_dead`,
+`is_gone`, `is_invincible`, `can_battle`, `can_targetting`, `can_act`, `can_use_any_command`) and
+`MotionSpecial_Mario.can_bunnage_globe` (nine rows, task-51).
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.
