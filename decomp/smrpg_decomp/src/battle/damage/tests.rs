@@ -188,3 +188,18 @@ fn group_metadata_returns_step_by_twelve() {
         0x7102201b2c
     );
 }
+
+#[test]
+fn driver_metadata_returns_step_by_twelve() {
+    use super::{driver_site, driver_slots};
+    assert_eq!(driver_slots::INIT_ORDER.len(), 26);
+    assert_eq!(
+        driver_site::FIRST_INIT_RETURN + driver_site::INIT_STEP * 25,
+        0x71021ff6e4
+    );
+    // no slot is resolved twice
+    let mut slots = driver_slots::INIT_ORDER.to_vec();
+    slots.sort_unstable();
+    slots.dedup();
+    assert_eq!(slots.len(), 26);
+}

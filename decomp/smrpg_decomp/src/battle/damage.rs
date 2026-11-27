@@ -29,7 +29,12 @@
 //! None of the three flushes a register: a port that leaves the register file alone is exact. Its only effects are
 //! guest stores, made through [`GuestStore`] (a real store, or a journal entry inside a replay trial).
 
+use super::belome::{
+    smrpg_skill_calc_belome_barrior_ratio, smrpg_skill_calc_belome_barrior_ratio_pre,
+};
+use super::element::smrpg_param_calc_element;
 use super::frame::Frame;
+use super::renkei::{smrpg_skill_calc_renkei_ratio, smrpg_skill_calc_renkei_ratio_pre};
 use super::{BattleCharacterParam, BuffManager, GuestException, GuestObject, Regs};
 use crate::bridge::prestate;
 use crate::object::guest_class;
@@ -1009,6 +1014,891 @@ const STATICS_INSTANCE: u64 = 0x10;
 const MANAGER_PC_LIST: u64 = 0xd8;
 const PC_LIST_ITEMS: u64 = 0x10;
 
+// ---- damage_calc driver (task-60) ----
+//
+// `Battle.SkillExecter.damage_calc()` (0x71021ff580, 613 instructions, `QLEAF`) finishes the damage of one hit. It starts from
+// `_tmp_value` (0x40, the product of the attack and defence methods of an earlier caller), applies the group, element and
+// barrier rules and stores the result into the target's `CharaSkillResultLogger`. In C# terms (names are IL2CPP's; every
+// `_monitor.write(..)` is a debug line that does nothing visible; `damage` is the stack int at `x29 - 4`, `ratio` the stack
+// float at `sp + 8`; the two `BattleManager` tests are the lazy class initialization the compiled code repeats at each use):
+//
+// ```text
+// void damage_calc() {
+//     _monitor.insert_indent();
+//     int damage = _tmp_value;
+//     _monitor.write(<text> + damage.ToString());
+//     group_a_b(ref damage);
+//     switch (_skill_obj._calc_type) {                  // EN_SPECIAL_1_POINT_5, EN_SPECIAL_2, EN_SPECIAL_4
+//         case 8:  write(..); damage = damage * 3 / 2; goto log;
+//         case 9:  write(..); damage = damage << 1;    goto log;
+//         case 10: write(..); damage = damage << 2;
+//         log:     _monitor.write(<text> + damage.ToString());
+//     }
+//     calc_renkei_ratio(ref damage);
+//     damage = Math.Max(damage, 1);
+//     set_acction_command_ratio();
+//     float ratio = _target.calc_element(_skill_obj._element);
+//     if (ratio == 0f && _acter._is_equip_kaiten_shoes && (uint)(_skill_obj._skill_id - 103) <= 4
+//         && ((1 << (_skill_obj._skill_id - 103)) & 0x15) != 0) {
+//         write(..); ratio = 1f;
+//     }
+//     calc_belome_barrior_ratio(_skill_obj, ref ratio);
+//     if (ratio == 0f)      { write(..); _target._result_logger._effective_state = 1; }
+//     else if (ratio == 2f) { write(..); _target._result_logger._effective_state = 2; }
+//     _monitor.write(<text> + ratio.ToString());
+//     damage = (int)(ratio * (float)damage);            // +inf becomes int.MinValue
+//     if (ratio != 0f) { write(..); damage = damage > 1 ? damage : 1; }
+//     if (BattleManager._instance._encounter_id != 0x819 && _skill_obj._skill_id != 0x2bd) {
+//         write(..); write(..); damage <<= 2;
+//     }
+//     switch (_target._character_id) {
+//         case 0x64f:
+//             if (_skill_obj._skill_id == 0x2e7) { write(..); damage = 0x50; }
+//             else if (_skill_obj._calc_type == 4) damage = 0;
+//             break;
+//         case 0x5dd: case 0x5ec: case 0x615: case 0x653: <not ported, see UNPORTED_CHARACTERS>
+//     }
+//     bool invincible = false;
+//     if (_skill_obj._skill_id >= 1000) { write(..); damage = 0; invincible = _target.is_invincible(); }
+//     else invincible = _target.is_invincible();
+//     bool barriered;
+//     if (invincible) { write(..); damage = 0; barriered = _target.is_barriered(); } else barriered = _target.is_barriered();
+//     if (barriered) { write(..); damage = 0; _target.use_damage_guard(); }
+//     if (!CommonRoutine.is_in(_skill_obj._skill_id, 0x2c3, 0x2c5)) {
+//         _target._result_logger._number = damage;
+//         _target._result_logger._number_state = 2;
+//         _monitor.write(<text> + damage.ToString());
+//     }
+// }
+// ```
+//
+// Not ported: the four character ids 0x5dd, 0x5ec, 0x615 and 0x653 (enemy rules that clear the result logger's
+// `_multi_number` list and read more `BattleManager` statics). In `on` mode the port runs the lifted body for them
+// (`Regs::run_lifted`, decided at entry before the port makes any call or store); in `ab` mode the pre-state hook defers
+// the call (counted as `deferred`, not compared), as it does for a clear lazy-initialization flag.
+//
+// The five nested rows (`group_a_b`, `calc_renkei_ratio`, `set_acction_command_ratio`, `calc_element`,
+// `calc_belome_barrior_ratio`, `use_damage_guard`) are called through their own shims (`Frame::call_port`). In a replay trial
+// they are not recorded (a replay row reached from inside another recorded call runs lifted), so their traced callees
+// belong to this call's recording and the port makes the same bridge calls in the same order. The pre-state hook calls
+// each nested hook with the registers the lifted code would give it, so the nested ports read the same snapshots; the two
+// stack cells (`damage`, `ratio`) are read back from the journal (`smrpg_guest_pre_read` returns a cell's own earlier store).
+
+/// `BattleCharacterParam._character_id` values whose rules the port leaves to the lifted body.
+const UNPORTED_CHARACTERS: [u32; 4] = [0x5dd, 0x5ec, 0x615, 0x653];
+/// `BattleCharacterParam._character_id` of the one character with a fixed damage rule.
+const CHARACTER_WITH_FIXED_DAMAGE: u32 = 0x64f;
+const SKILL_FIXED_DAMAGE: i32 = 0x2e7;
+const FIXED_DAMAGE: u32 = 0x50;
+const CALC_TYPE_ZERO_DAMAGE: u32 = 4;
+const SKILL_ENCOUNTER_QUADRUPLE: i32 = 0x2bd;
+const ENCOUNTER_QUADRUPLE: i32 = 0x819;
+/// `BattleManager._encounter_id`.
+const MANAGER_ENCOUNTER_ID: u64 = 0x168;
+/// `SkillObject.CalcType`: `EN_SPECIAL_1_POINT_5`, `EN_SPECIAL_2`, `EN_SPECIAL_4`.
+const CALC_TYPE_ONE_AND_A_HALF: u32 = 8;
+const CALC_TYPE_DOUBLE: u32 = 9;
+const CALC_TYPE_QUADRUPLE: u32 = 10;
+/// Skill ids from here on never leave damage.
+const SKILL_FIRST_NO_DAMAGE: i32 = 1000;
+const SKILL_NO_RESULT_FIRST: u64 = 0x2c3;
+const SKILL_NO_RESULT_LAST: u64 = 0x2c5;
+/// `BattleCharacterParam._result_logger`.
+const RESULT_LOGGER_FIELD: u64 = 0xb8;
+
+/// The lazy-initialization flag and the data page cells `damage_calc` uses.
+pub mod driver_slots {
+    pub const INIT_FLAG: u64 = 0x7103cba000 + 0xd71;
+    pub const FLAG_PAGE: u64 = 0x7103cba000;
+    pub const STRING_PAGE: u64 = 0x7103a83000;
+    /// The `System.Math` class cell (class initializer test before `Math.Max`).
+    pub const MATH_CLASS: u64 = 0x7103a46000 + 0xa90;
+    pub const BATTLE_MANAGER_CLASS: u64 = super::group_slots::BATTLE_MANAGER_CLASS;
+    pub const STATIC_FLAG_POINTER: u64 = super::group_slots::STATIC_FLAG_POINTER;
+    /// String literal cells (`STRING_PAGE` + offset).
+    pub const fn text(offset: u64) -> u64 {
+        STRING_PAGE + offset
+    }
+    pub const TEXT_TMP_VALUE: u64 = text(0xb40);
+    pub const TEXT_CALC_TYPE_8: u64 = text(0xbb8);
+    pub const TEXT_CALC_TYPE_9: u64 = text(0xbc0);
+    pub const TEXT_CALC_TYPE_10: u64 = text(0xb90);
+    pub const TEXT_DAMAGE_IS: u64 = text(0x540);
+    pub const TEXT_KAITEN_SHOES: u64 = text(0xba8);
+    pub const TEXT_RATIO: u64 = text(0xb88);
+    pub const TEXT_RATIO_ZERO: u64 = text(0xb80);
+    pub const TEXT_RATIO_DOUBLE: u64 = text(0xbc8);
+    pub const TEXT_RATIO_NOT_ZERO: u64 = text(0xb48);
+    pub const TEXT_ENCOUNTER_A: u64 = text(0xb78);
+    pub const TEXT_ENCOUNTER_B: u64 = text(0xb58);
+    pub const TEXT_FIXED_DAMAGE: u64 = text(0xb60);
+    pub const TEXT_NO_DAMAGE: u64 = text(0xb68);
+    pub const TEXT_INVINCIBLE: u64 = text(0xba0);
+    pub const TEXT_BARRIER: u64 = text(0xb70);
+    pub const TEXT_RESULT: u64 = text(0x5b0);
+    /// The 26 slots the first run resolves, in the order of its `initialize_runtime_metadata` calls.
+    pub const INIT_ORDER: [u64; 26] = [
+        0x7103a57e48,
+        0x7103a58048,
+        0x7103a4d788,
+        0x7103a4e8c8,
+        0x7103a4d790,
+        0x7103a46a90,
+        0x7103a83b48,
+        0x7103a83b50,
+        0x7103a83b58,
+        0x7103a83540,
+        0x7103a83b60,
+        0x7103a83b68,
+        0x7103a83b70,
+        0x7103a83b78,
+        0x7103a83b80,
+        0x7103a83b88,
+        0x7103a83b90,
+        0x7103a83b98,
+        0x7103a83ba0,
+        0x7103a83ba8,
+        0x7103a83bb0,
+        0x7103a83b40,
+        0x7103a83bb8,
+        0x7103a835b0,
+        0x7103a83bc0,
+        0x7103a83bc8,
+    ];
+}
+
+mod driver_callee {
+    /// `StellaDebug.DebugMonitor.insert_indent`.
+    pub const INSERT_INDENT: u64 = 0x71018bebf0;
+    /// `System.Math.Max(int, int)`.
+    pub const MATH_MAX: u64 = 0x710213e670;
+    /// `Common.CommonRoutine.is_in(int, int, int)`.
+    pub const IS_IN: u64 = 0x71018ba2c0;
+    pub const IS_INVINCIBLE: u64 = 0x71021bcb30;
+    pub const IS_BARRIERED: u64 = 0x71021c3bb0;
+}
+
+/// Return addresses (the `x30` each call site writes) and the register lists it flushes.
+mod driver_site {
+    pub const FIRST_INIT_RETURN: u64 = 0x71021ff5b8;
+    pub const INIT_STEP: u64 = 12;
+    pub const FIRST_INIT_CALL: &[usize] = &[0, 8, 19, 20, 21, 29];
+    pub const INSERT_INDENT_RETURN: u64 = 0x71021ff704;
+    pub const INSERT_INDENT: &[usize] = &[0, 1, 8, 19, 20, 21, 22, 29];
+    pub const VECTORS_01: &[usize] = &[0, 1];
+    pub const VECTORS_012: &[usize] = &[0, 1, 2];
+    pub const CONCAT: &[usize] = &[0, 1, 2];
+    pub const WRITE: &[usize] = &[0, 1, 2];
+}
+
+/// One `_monitor.write(Concat(<text>, damage.ToString()))` line: the registers that hold the monitor and the text cell,
+/// the flush list and return addresses of its three calls.
+struct NumberLine {
+    monitor: usize,
+    text: usize,
+    to_string: &'static [usize],
+    to_string_return: u64,
+    concat_return: u64,
+    write_return: u64,
+}
+
+const LINE_TMP_VALUE: NumberLine = NumberLine {
+    monitor: 20,
+    text: 21,
+    to_string: &[0, 1, 8, 20],
+    to_string_return: 0x71021ff71c,
+    concat_return: 0x71021ff72c,
+    write_return: 0x71021ff73c,
+};
+const LINE_CALC_TYPE: NumberLine = NumberLine {
+    monitor: 20,
+    text: 21,
+    to_string: &[0, 1, 8, 20, 21],
+    to_string_return: 0x71021ff7f8,
+    concat_return: 0x71021ff808,
+    write_return: 0x71021ff818,
+};
+const LINE_RESULT: NumberLine = NumberLine {
+    monitor: 19,
+    text: 20,
+    to_string: &[0, 1, 8, 9, 19, 20],
+    to_string_return: 0x71021ffe84,
+    concat_return: 0x71021ffe94,
+    write_return: 0x71021ffea4,
+};
+
+/// One `_monitor.write(<literal>)` call: the literal's cell, the call's return address and flush lists.
+struct LiteralLine {
+    text: u64,
+    return_address: u64,
+    list: &'static [usize],
+    vectors: &'static [usize],
+    with_sp: bool,
+}
+
+const fn literal(
+    text: u64,
+    return_address: u64,
+    list: &'static [usize],
+    vectors: &'static [usize],
+) -> LiteralLine {
+    LiteralLine {
+        text,
+        return_address,
+        list,
+        vectors,
+        with_sp: false,
+    }
+}
+
+const WRITE_8: &[usize] = &[0, 1, 2, 8];
+const WRITE_8_9: &[usize] = &[0, 1, 2, 8, 9];
+const WRITE_8_9_20: &[usize] = &[0, 1, 2, 8, 9, 20];
+const WRITE_8_20: &[usize] = &[0, 1, 2, 8, 20];
+const NO_VECTORS: &[usize] = &[];
+
+const LINE_CALC_TYPE_10: LiteralLine = literal(
+    driver_slots::TEXT_CALC_TYPE_10,
+    0x71021ff7b0,
+    WRITE_8,
+    NO_VECTORS,
+);
+const LINE_CALC_TYPE_9: LiteralLine = literal(
+    driver_slots::TEXT_CALC_TYPE_9,
+    0x71021ff7d4,
+    WRITE_8,
+    NO_VECTORS,
+);
+const LINE_CALC_TYPE_8: LiteralLine = literal(
+    driver_slots::TEXT_CALC_TYPE_8,
+    0x71021ff780,
+    WRITE_8,
+    NO_VECTORS,
+);
+const LINE_KAITEN_SHOES: LiteralLine = literal(
+    driver_slots::TEXT_KAITEN_SHOES,
+    0x71021ff8bc,
+    WRITE_8_9,
+    NO_VECTORS,
+);
+const LINE_ENCOUNTER_A: LiteralLine = literal(
+    driver_slots::TEXT_ENCOUNTER_A,
+    0x71021ff9fc,
+    WRITE_8_9_20,
+    driver_site::VECTORS_012,
+);
+const LINE_ENCOUNTER_B: LiteralLine = literal(
+    driver_slots::TEXT_ENCOUNTER_B,
+    0x71021ffa14,
+    WRITE_8,
+    NO_VECTORS,
+);
+const LINE_RATIO_NOT_ZERO: LiteralLine = literal(
+    driver_slots::TEXT_RATIO_NOT_ZERO,
+    0x71021ffb00,
+    WRITE_8_9,
+    driver_site::VECTORS_012,
+);
+const LINE_FIXED_DAMAGE: LiteralLine = literal(
+    driver_slots::TEXT_FIXED_DAMAGE,
+    0x71021ffce4,
+    WRITE_8_9_20,
+    driver_site::VECTORS_012,
+);
+const LINE_BARRIER: LiteralLine = literal(
+    driver_slots::TEXT_BARRIER,
+    0x71021ffe20,
+    WRITE_8,
+    NO_VECTORS,
+);
+const LINE_INVINCIBLE: LiteralLine = literal(
+    driver_slots::TEXT_INVINCIBLE,
+    0x71021ffefc,
+    WRITE_8,
+    NO_VECTORS,
+);
+/// `skill id >= 1000`: the write that follows a join, so the compiled code also flushes x9, x20 and x21 (and v0 to v2).
+const LINE_NO_DAMAGE: LiteralLine = LiteralLine {
+    text: driver_slots::TEXT_NO_DAMAGE,
+    return_address: 0x71021ffed0,
+    list: &[0, 1, 2, 8, 9, 20, 21],
+    vectors: driver_site::VECTORS_012,
+    with_sp: false,
+};
+
+/// What one call of the port keeps besides the registers: the two stack cells (`damage` at `x29 - 4`, `ratio` at
+/// `sp + 8`) and the damage value the port holds.
+struct DriverRun {
+    damage: u64,
+    ratio: u64,
+    value: i32,
+}
+
+impl DriverRun {
+    /// `str w, [x29, #-4]`: a stack store, journaled in a trial so that later reads and the final comparison see it.
+    fn store(&mut self, value: u64) {
+        self.value = value as u32 as i32;
+        prestate::store_u32(self.damage, value as u32);
+    }
+
+    /// After a nested port that edits the cell: the value it left (its journaled store in a trial).
+    fn refresh(&mut self) {
+        self.value = prestate::read_u32(self.damage) as i32;
+    }
+}
+
+impl CharaSkillResultLogger {
+    /// `_number` (the damage), `_number_state` (2 = damage) and `_effective_state` (1 = none, 2 = double).
+    const DAMAGE_NUMBER: u64 = 0x28;
+    const DAMAGE_STATE: u64 = 0x2c;
+    const EFFECTIVE_STATE: u64 = 0x4c;
+}
+
+impl SkillExecter {
+    /// `_tmp_value`.
+    const TMP_VALUE: u64 = 0x40;
+
+    /// `damage_calc()`. `f` is the register file at entry.
+    pub fn damage_calc(self, f: &mut Frame) -> Result<(), GuestException> {
+        let character = self.target().character_id();
+        if UNPORTED_CHARACTERS.contains(&character) {
+            // decided before any call or store: the lifted body does the whole call
+            f.regs.run_lifted(0x71021ff580);
+            return Ok(());
+        }
+        let flag = prestate::read_u8(driver_slots::INIT_FLAG);
+        // prologue: `sub sp, sp, #0x40`, `add x29, sp, #0x10`; x20 = the flag page, x21 = the string page, x8 = the flag byte,
+        // x21 = the first text cell, x19 = this
+        f.x[31] = f.entry[31].wrapping_sub(0x40);
+        f.x[29] = f.x[31].wrapping_add(0x10);
+        f.x[20] = driver_slots::FLAG_PAGE;
+        f.x[21] = driver_slots::STRING_PAGE;
+        f.x[8] = u64::from(flag);
+        f.x[21] = unsafe { guest_ld64(driver_slots::TEXT_TMP_VALUE) };
+        f.x[19] = self.address();
+        if flag & 1 == 0 {
+            self.resolve_driver_metadata(f)?;
+            prestate::store_u8(driver_slots::INIT_FLAG, 1);
+        }
+        let mut run = DriverRun {
+            damage: f.x[29].wrapping_sub(4),
+            ratio: f.x[31].wrapping_add(8),
+            value: 0,
+        };
+        let monitor = self.debug_monitor();
+        f.x[22] = unsafe { guest_ld64(driver_slots::MATH_CLASS) };
+        prestate::store_u32(run.ratio, 0);
+        // `_monitor.insert_indent()`
+        f.x[0] = monitor;
+        f.x[1] = 0;
+        f.call(
+            driver_callee::INSERT_INDENT,
+            driver_site::INSERT_INDENT_RETURN,
+            driver_site::INSERT_INDENT,
+            true,
+        )?;
+        // `int damage = _tmp_value; _monitor.write(<text> + damage.ToString())`
+        let tmp_value = unsafe { guest_ld32(self.address().wrapping_add(Self::TMP_VALUE)) };
+        f.x[8] = u64::from(tmp_value);
+        run.store(f.x[8]);
+        f.x[20] = monitor;
+        self.write_number(f, &run, &LINE_TMP_VALUE)?;
+        // `group_a_b(ref damage)`
+        f.x[0] = self.address();
+        f.x[1] = run.damage;
+        f.call_port(smrpg_skill_group_a_b, 0x71021ff748, &[0, 1], false)?;
+        run.refresh();
+        // the `_calc_type` switch: 8 is x1.5, 9 is x2, 10 is x4; the debug line follows in the three cases
+        let skill_obj = self.skill_obj();
+        f.x[8] = skill_obj.address();
+        let calc_type = skill_obj.calc_type();
+        f.x[8] = u64::from(calc_type);
+        if matches!(
+            calc_type,
+            CALC_TYPE_ONE_AND_A_HALF | CALC_TYPE_DOUBLE | CALC_TYPE_QUADRUPLE
+        ) {
+            match calc_type {
+                CALC_TYPE_QUADRUPLE => {
+                    self.write_literal(f, &LINE_CALC_TYPE_10)?;
+                    f.x[8] = w(run.value.wrapping_shl(2));
+                }
+                CALC_TYPE_DOUBLE => {
+                    self.write_literal(f, &LINE_CALC_TYPE_9)?;
+                    f.x[8] = w(run.value.wrapping_shl(1));
+                }
+                _ => {
+                    self.write_literal(f, &LINE_CALC_TYPE_8)?;
+                    f.x[8] = w(three_halves(run.value));
+                }
+            }
+            run.store(f.x[8]);
+            f.x[21] = unsafe { guest_ld64(driver_slots::TEXT_DAMAGE_IS) };
+            f.x[20] = monitor;
+            self.write_number(f, &run, &LINE_CALC_TYPE)?;
+        }
+        // `calc_renkei_ratio(ref damage)`
+        f.x[1] = run.damage;
+        f.x[0] = self.address();
+        f.call_port(
+            smrpg_skill_calc_renkei_ratio,
+            0x71021ff824,
+            &[0, 1, 8],
+            false,
+        )?;
+        run.refresh();
+        // `damage = Math.Max(damage, 1)` after the lazy class initialization of `System.Math`
+        f.x[0] = unsafe { guest_ld64(f.x[22]) };
+        f.x[20] = u64::from(run.value as u32);
+        let math_word = prestate::read_u32(f.x[0].wrapping_add(CLASS_INITIALIZED));
+        f.x[8] = u64::from(math_word);
+        if math_word == 0 {
+            f.call(
+                group_callee::CLASS_INITIALIZER,
+                0x71021ff838,
+                &[0, 8, 20],
+                false,
+            )?;
+        }
+        f.x[0] = f.x[20] & 0xffff_ffff;
+        f.x[1] = 1;
+        f.x[2] = 0;
+        f.call(
+            driver_callee::MATH_MAX,
+            0x71021ff848,
+            &[0, 1, 2, 8, 20],
+            false,
+        )?;
+        run.store(f.x[0] & 0xffff_ffff);
+        // `set_acction_command_ratio()`
+        f.x[0] = self.address();
+        f.call_port(
+            smrpg_skill_set_acction_command_ratio,
+            0x71021ff854,
+            &[0],
+            false,
+        )?;
+        // `ratio = _target.calc_element(_skill_obj._element)`
+        f.x[0] = self.target().address();
+        f.x[8] = skill_obj.address();
+        f.x[2] = 0;
+        f.x[1] = u64::from(skill_obj.element());
+        f.call_port(smrpg_param_calc_element, 0x71021ff864, &[0, 1, 2, 8], false)?;
+        let element_ratio = f32::from_bits(f.v[0].0 as u32);
+        let ratio_is_zero = f.regs.f32_compare(element_ratio, 0.0).z;
+        prestate::store_u32(run.ratio, element_ratio.to_bits());
+        if ratio_is_zero {
+            // no effect by element: an acter with Kaiten shoes using skill 103, 105 or 107 keeps a ratio of 1
+            let acter = self.acter();
+            f.x[8] = acter.address();
+            let shoes = acter.is_equip_kaiten_shoes_byte();
+            f.x[8] = u64::from(shoes);
+            if shoes != 0 {
+                f.x[8] = skill_obj.address();
+                f.x[8] = w(skill_obj.skill_id().wrapping_sub(0x67));
+                if f.x[8] as u32 <= 4 {
+                    f.x[9] = 1;
+                    f.x[8] = w(1i32.wrapping_shl(f.x[8] as u32));
+                    f.x[9] = 0x15;
+                    if f.x[8] & f.x[9] != 0 {
+                        self.write_literal(f, &LINE_KAITEN_SHOES)?;
+                        f.x[8] = 0x3f80_0000;
+                        prestate::store_u32(run.ratio, 0x3f80_0000);
+                    }
+                }
+            }
+        }
+        // `calc_belome_barrior_ratio(_skill_obj, ref ratio)`
+        f.x[22] = unsafe { guest_ld64(driver_slots::TEXT_RATIO) };
+        f.x[1] = skill_obj.address();
+        f.x[2] = run.ratio;
+        f.x[0] = self.address();
+        f.call_port(
+            smrpg_skill_calc_belome_barrior_ratio,
+            0x71021ff8dc,
+            &[0, 1, 2, 8, 9, 22],
+            false,
+        )?;
+        let ratio = f32::from_bits(prestate::read_u32(run.ratio));
+        f.v[0] = (u64::from(ratio.to_bits()), 0);
+        let ratio_zero = f.regs.f32_compare(ratio, 0.0).z;
+        let mut effective_state = 0;
+        if ratio_zero {
+            f.x[8] = unsafe { guest_ld64(driver_slots::TEXT_RATIO_ZERO) };
+            f.x[20] = 1;
+            effective_state = 1;
+        } else {
+            f.set_s(1, 2.0);
+            if f.regs.f32_compare(ratio, 2.0).z {
+                f.x[8] = unsafe { guest_ld64(driver_slots::TEXT_RATIO_DOUBLE) };
+                f.x[20] = 2;
+                effective_state = 2;
+            }
+        }
+        if effective_state != 0 {
+            f.x[0] = monitor;
+            f.x[2] = 0;
+            f.x[1] = unsafe { guest_ld64(f.x[8]) };
+            f.call_v(
+                group_callee::DEBUG_WRITE,
+                0x71021ff920,
+                WRITE_8_20,
+                driver_site::VECTORS_01,
+                false,
+            )?;
+            f.x[8] = self.target().address();
+            f.x[8] = unsafe { guest_ld64(f.x[8].wrapping_add(RESULT_LOGGER_FIELD)) };
+            prestate::store_u32(
+                f.x[8].wrapping_add(CharaSkillResultLogger::EFFECTIVE_STATE),
+                effective_state,
+            );
+        }
+        // `_monitor.write(<text> + ratio.ToString())`
+        f.x[21] = unsafe { guest_ld64(driver_slots::BATTLE_MANAGER_CLASS) };
+        f.x[20] = monitor;
+        self.write_ratio(f, &run)?;
+        // `damage = (int)(ratio * (float)damage)`, `+inf` stored as `int.MinValue`
+        f.v[1] = (u64::from(run.value as u32), 0);
+        f.x[9] = u64::from(INFINITY_BITS);
+        f.v[0] = (u64::from(ratio.to_bits()), 0);
+        let damage_float = f.regs.f32_from_i32(run.value);
+        f.set_s(1, damage_float);
+        let product = f.regs.f32_arith(0, ratio, damage_float);
+        f.set_s(1, product);
+        let truncated = f.regs.i32_from_f32_trunc(product);
+        f.x[8] = w(truncated);
+        f.set_s(2, f32::from_bits(INFINITY_BITS));
+        let infinite = f.regs.f32_compare(product, f32::from_bits(INFINITY_BITS)).z;
+        f.x[9] = u64::from(INFINITY_RESULT);
+        if infinite {
+            f.x[8] = f.x[9];
+        }
+        let ratio_zero = f.regs.f32_compare(ratio, 0.0).z;
+        run.store(f.x[8]);
+        if !ratio_zero {
+            self.write_literal(f, &LINE_RATIO_NOT_ZERO)?;
+            // `cmp w8, #1; csinc w8, w8, wzr, gt`: at least 1
+            f.x[8] = w(if run.value > 1 { run.value } else { 1 });
+            run.store(f.x[8]);
+        }
+        // `BattleManager._instance._encounter_id`, after the class and static flag checks
+        self.open_manager(f, !ratio_zero)?;
+        let class = f.x[0];
+        f.x[8] = unsafe { guest_ld64(class.wrapping_add(CLASS_STATIC_FIELDS)) };
+        f.x[8] = unsafe { guest_ld64(f.x[8].wrapping_add(STATICS_INSTANCE)) };
+        let encounter = unsafe { guest_ld32(f.x[8].wrapping_add(MANAGER_ENCOUNTER_ID)) } as i32;
+        f.x[8] = w(encounter);
+        if encounter == ENCOUNTER_QUADRUPLE {
+            f.x[8] = skill_obj.address();
+            let id = skill_obj.skill_id();
+            f.x[8] = w(id);
+            if id == SKILL_ENCOUNTER_QUADRUPLE {
+                self.write_literal(f, &LINE_ENCOUNTER_A)?;
+                self.write_literal(f, &LINE_ENCOUNTER_B)?;
+                f.x[8] = w(run.value.wrapping_shl(2));
+                run.store(f.x[8]);
+            }
+        }
+        // the target's character id: one rule here, four left to the lifted body (`UNPORTED_CHARACTERS`)
+        f.x[8] = self.target().address();
+        f.x[8] = u64::from(character);
+        if character == CHARACTER_WITH_FIXED_DAMAGE {
+            f.x[8] = skill_obj.address();
+            let id = skill_obj.skill_id();
+            f.x[9] = u64::from(id as u32);
+            if id == SKILL_FIXED_DAMAGE {
+                self.write_literal(f, &LINE_FIXED_DAMAGE)?;
+                f.x[8] = u64::from(FIXED_DAMAGE);
+                run.store(f.x[8]);
+            } else {
+                f.x[8] = u64::from(skill_obj.calc_type());
+                if skill_obj.calc_type() == CALC_TYPE_ZERO_DAMAGE {
+                    run.store(0);
+                }
+            }
+        }
+        self.finish(f, &mut run, monitor)
+    }
+
+    /// The 26 `initialize_runtime_metadata` calls of the first run, then `x8 = 1` (the flag store is the caller's).
+    fn resolve_driver_metadata(self, f: &mut Frame) -> Result<(), GuestException> {
+        for (n, slot) in driver_slots::INIT_ORDER.into_iter().enumerate() {
+            f.x[0] = unsafe { guest_ld64(slot) };
+            let (list, with_sp) = if n == 0 {
+                (driver_site::FIRST_INIT_CALL, true)
+            } else {
+                (group_site::LATER_INIT_CALL, false)
+            };
+            f.call(
+                group_callee::INITIALIZE_METADATA,
+                driver_site::FIRST_INIT_RETURN + driver_site::INIT_STEP * n as u64,
+                list,
+                with_sp,
+            )?;
+        }
+        f.x[8] = 1;
+        Ok(())
+    }
+
+    /// `_monitor.write(Concat(<text>, damage.ToString()))` for the `int` at `x29 - 4`.
+    fn write_number(
+        self,
+        f: &mut Frame,
+        run: &DriverRun,
+        line: &NumberLine,
+    ) -> Result<(), GuestException> {
+        f.x[0] = run.damage;
+        f.x[1] = 0;
+        let mut area = (run.value as u32).to_le_bytes();
+        f.call_out(
+            group_callee::INT32_TO_STRING,
+            line.to_string_return,
+            line.to_string,
+            false,
+            &mut area,
+        )?;
+        f.x[1] = f.x[0];
+        f.x[0] = unsafe { guest_ld64(f.x[line.text]) };
+        f.x[2] = 0;
+        f.call(
+            group_callee::STRING_CONCAT_2,
+            line.concat_return,
+            driver_site::CONCAT,
+            false,
+        )?;
+        f.x[1] = f.x[0];
+        f.x[0] = f.x[line.monitor];
+        f.x[2] = 0;
+        f.call(
+            group_callee::DEBUG_WRITE,
+            line.write_return,
+            driver_site::WRITE,
+            false,
+        )
+    }
+
+    /// `_monitor.write(Concat(<text>, ratio.ToString()))` for the `float` at `sp + 8`.
+    fn write_ratio(self, f: &mut Frame, run: &DriverRun) -> Result<(), GuestException> {
+        f.x[0] = run.ratio;
+        f.x[1] = 0;
+        let mut area = prestate::read_u32(run.ratio).to_le_bytes();
+        f.call_out_v(
+            group_callee::SINGLE_TO_STRING,
+            0x71021ff944,
+            &[0, 1, 8, 20, 21],
+            driver_site::VECTORS_01,
+            false,
+            &mut area,
+        )?;
+        f.x[1] = f.x[0];
+        f.x[0] = unsafe { guest_ld64(f.x[22]) };
+        f.x[2] = 0;
+        f.call(
+            group_callee::STRING_CONCAT_2,
+            0x71021ff954,
+            driver_site::CONCAT,
+            false,
+        )?;
+        f.x[1] = f.x[0];
+        f.x[0] = f.x[20];
+        f.x[2] = 0;
+        f.call(
+            group_callee::DEBUG_WRITE,
+            0x71021ff964,
+            driver_site::WRITE,
+            false,
+        )
+    }
+
+    /// `x8 = [cell]`, `x0 = _monitor`, `x2 = 0`, `x1 = [x8]`, `_monitor.write(<literal>)`.
+    fn write_literal(self, f: &mut Frame, line: &LiteralLine) -> Result<(), GuestException> {
+        f.x[8] = unsafe { guest_ld64(line.text) };
+        f.x[0] = self.debug_monitor();
+        f.x[2] = 0;
+        f.x[1] = unsafe { guest_ld64(f.x[8]) };
+        if line.vectors.is_empty() {
+            f.call(
+                group_callee::DEBUG_WRITE,
+                line.return_address,
+                line.list,
+                line.with_sp,
+            )
+        } else {
+            f.call_v(
+                group_callee::DEBUG_WRITE,
+                line.return_address,
+                line.list,
+                line.vectors,
+                line.with_sp,
+            )
+        }
+    }
+
+    /// The `BattleManager` class initialized word, the static-field flag byte and the class initialized word again, each
+    /// with its lazy initialization call (the three tests `group_a_b` makes before its `foreach`); leaves x0 = the class.
+    /// `poll_first` is the path from the `ratio != 0` branch, which reaches the first test through a back edge.
+    fn open_manager(self, f: &mut Frame, poll_first: bool) -> Result<(), GuestException> {
+        f.x[0] = unsafe { guest_ld64(f.x[21]) };
+        let word = prestate::read_u32(f.x[0].wrapping_add(CLASS_INITIALIZED));
+        f.x[8] = u64::from(word);
+        if poll_first {
+            f.regs
+                .safepoint_n(0x71021ffb18, &[(0, f.x[0]), (8, f.x[8])]);
+        }
+        let flag_byte = if word == 0 {
+            f.call_v(
+                group_callee::CLASS_INITIALIZER,
+                0x71021ffb20,
+                &[0, 8, 9],
+                driver_site::VECTORS_012,
+                false,
+            )?;
+            f.x[20] = unsafe { guest_ld64(driver_slots::STATIC_FLAG_POINTER) };
+            let flag = prestate::read_u8(f.x[20]);
+            f.x[8] = u64::from(flag);
+            f.regs
+                .safepoint_n(0x71021ffb2c, &[(8, f.x[8]), (20, f.x[20])]);
+            flag
+        } else {
+            f.x[20] = unsafe { guest_ld64(driver_slots::STATIC_FLAG_POINTER) };
+            let flag = prestate::read_u8(f.x[20]);
+            f.x[8] = u64::from(flag);
+            flag
+        };
+        let class_ready = if flag_byte == 0 {
+            // the static-field metadata of this method is not resolved yet
+            f.x[0] = unsafe { guest_ld64(driver_slots::BATTLE_MANAGER_CLASS) };
+            f.call_v(
+                group_callee::INITIALIZE_METADATA,
+                0x71021ffb3c,
+                &[0, 8, 9, 20],
+                driver_site::VECTORS_012,
+                false,
+            )?;
+            f.x[8] = 1;
+            prestate::store_u8(f.x[20], 1);
+            f.x[0] = unsafe { guest_ld64(f.x[21]) };
+            let again = unsafe { guest_ld32(f.x[0].wrapping_add(CLASS_INITIALIZED)) };
+            f.x[8] = u64::from(again);
+            f.regs
+                .safepoint_n(0x71021ffb4c, &[(0, f.x[0]), (8, f.x[8])]);
+            again != 0
+        } else {
+            f.x[0] = unsafe { guest_ld64(f.x[21]) };
+            let again = unsafe { guest_ld32(f.x[0].wrapping_add(CLASS_INITIALIZED)) };
+            f.x[8] = u64::from(again);
+            again != 0
+        };
+        if !class_ready {
+            f.call_v(
+                group_callee::CLASS_INITIALIZER,
+                0x71021ffb54,
+                &[0, 8, 9, 20],
+                driver_site::VECTORS_012,
+                false,
+            )?;
+            f.x[0] = unsafe { guest_ld64(f.x[21]) };
+            f.regs.safepoint_n(0x71021ffb58, &[(0, f.x[0])]);
+        }
+        Ok(())
+    }
+
+    /// The tail: skills that never leave damage, invincibility and barrier, then the result logger and the last debug line.
+    fn finish(
+        self,
+        f: &mut Frame,
+        run: &mut DriverRun,
+        monitor: u64,
+    ) -> Result<(), GuestException> {
+        let skill_obj = self.skill_obj();
+        let target = self.target();
+        f.x[8] = skill_obj.address();
+        let id = skill_obj.skill_id();
+        f.x[8] = w(id);
+        let invincible;
+        if id >= SKILL_FIRST_NO_DAMAGE {
+            self.write_literal(f, &LINE_NO_DAMAGE)?;
+            run.store(0);
+            f.x[0] = target.address();
+            f.x[1] = 0;
+            f.call(driver_callee::IS_INVINCIBLE, 0x71021ffee0, &[0, 1], false)?;
+            f.x[8] = f.regs.x(8);
+            f.regs.safepoint_n(0x71021ffee0, &[]);
+            invincible = f.x[0] & 1 != 0;
+        } else {
+            f.x[0] = target.address();
+            f.x[1] = 0;
+            f.call_v(
+                driver_callee::IS_INVINCIBLE,
+                0x71021ffdf4,
+                &[0, 1, 2, 8, 9, 20, 21],
+                driver_site::VECTORS_012,
+                false,
+            )?;
+            f.x[8] = f.regs.x(8);
+            invincible = f.x[0] & 1 != 0;
+        }
+        let barriered;
+        if invincible {
+            self.write_literal(f, &LINE_INVINCIBLE)?;
+            run.store(0);
+            f.x[0] = target.address();
+            f.x[1] = 0;
+            f.call(driver_callee::IS_BARRIERED, 0x71021fff0c, &[0, 1], false)?;
+            f.x[8] = f.regs.x(8);
+            f.regs.safepoint_n(0x71021fff0c, &[]);
+            barriered = f.x[0] & 1 != 0;
+            if !barriered {
+                f.regs.safepoint_n(0x71021fff10, &[]);
+            }
+        } else {
+            f.x[0] = target.address();
+            f.x[1] = 0;
+            f.call(driver_callee::IS_BARRIERED, 0x71021ffe04, &[0, 1], false)?;
+            f.x[8] = f.regs.x(8);
+            barriered = f.x[0] & 1 != 0;
+        }
+        if barriered {
+            self.write_literal(f, &LINE_BARRIER)?;
+            run.store(0);
+            f.x[0] = target.address();
+            f.x[1] = 0;
+            f.call_port(smrpg_param_use_damage_guard, 0x71021ffe30, &[0, 1], false)?;
+            f.x[8] = f.regs.x(8);
+            f.x[9] = f.regs.x(9);
+        }
+        // `Common.CommonRoutine.is_in(_skill_obj._skill_id, 0x2c3, 0x2c5)` skips the result store
+        f.x[8] = skill_obj.address();
+        f.x[1] = SKILL_NO_RESULT_FIRST;
+        f.x[2] = SKILL_NO_RESULT_LAST;
+        f.x[0] = u64::from(skill_obj.skill_id() as u32);
+        f.x[3] = 0;
+        f.call(driver_callee::IS_IN, 0x71021ffe48, &[0, 1, 2, 3, 8], false)?;
+        f.x[8] = f.regs.x(8);
+        f.x[9] = f.regs.x(9);
+        if f.x[0] & 1 == 0 {
+            // `_target._result_logger._number = damage; _number_state = 2; _monitor.write(<text> + damage.ToString())`
+            f.x[20] = unsafe { guest_ld64(driver_slots::TEXT_RESULT) };
+            f.x[8] = target.address();
+            f.x[0] = run.damage;
+            f.x[1] = 0;
+            f.x[8] = unsafe { guest_ld64(f.x[8].wrapping_add(RESULT_LOGGER_FIELD)) };
+            f.x[9] = u64::from(run.value as u32);
+            prestate::store_u32(
+                f.x[8].wrapping_add(CharaSkillResultLogger::DAMAGE_NUMBER),
+                f.x[9] as u32,
+            );
+            f.x[8] = target.address();
+            f.x[8] = unsafe { guest_ld64(f.x[8].wrapping_add(RESULT_LOGGER_FIELD)) };
+            f.x[9] = 2;
+            prestate::store_u32(f.x[8].wrapping_add(CharaSkillResultLogger::DAMAGE_STATE), 2);
+            f.x[19] = monitor;
+            self.write_number(f, run, &LINE_RESULT)?;
+        }
+        f.leave(&[19, 20, 21, 22, 29]);
+        Ok(())
+    }
+}
+
 // ---- Shim ----
 
 /// 0x71021c3bb0 `BattleCharacterParam.is_barriered`.
@@ -1091,6 +1981,93 @@ pub unsafe extern "C" fn smrpg_skill_group_a_b_pre(x: *mut u64) -> i32 {
         let class = guest_ld64(guest_ld64(group_slots::BATTLE_MANAGER_CLASS));
         prestate::snapshot(class.wrapping_add(CLASS_INITIALIZED), 4, false);
         prestate::snapshot(guest_ld64(group_slots::STATIC_FLAG_POINTER), 1, true);
+        0
+    }
+}
+
+/// 0x71021ff580 `SkillExecter.damage_calc` (replay row with a store journal; its nested ports are called through their shims).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_skill_damage_calc(x: *mut u64) {
+    unsafe {
+        let regs = Regs::from_raw(x);
+        let this = regs.x(0);
+        let mut frame = Frame::new(regs);
+        let _ = SkillExecter::at(this).damage_calc(&mut frame);
+    }
+}
+
+/// Pre-state hook of `damage_calc`: its own cells, and the cells of each nested port, by calling the nested hooks with the
+/// argument registers the lifted code would give them. Returns 1 (defer, run lifted and compare nothing) for the first run in
+/// a process (any lazy-initialization flag clear), for the four character ids the port does not cover, and when the lifted
+/// `group_a_b` or `calc_renkei_ratio` could initialize a class the driver tests itself afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smrpg_skill_damage_calc_pre(x: *mut u64) -> i32 {
+    unsafe {
+        let flag = guest_ld8(driver_slots::INIT_FLAG);
+        prestate::snapshot(driver_slots::INIT_FLAG, 1, true);
+        if flag & 1 == 0 {
+            return 1;
+        }
+        let regs = Regs::from_raw(x);
+        let this = SkillExecter::at(regs.x(0));
+        let target = this.target();
+        let skill = this.skill_obj();
+        if UNPORTED_CHARACTERS.contains(&target.character_id()) {
+            return 1;
+        }
+        // the stack cells: `damage` at `x29 - 4` = entry sp - 0x34, `ratio` at `sp + 8` = entry sp - 0x38
+        let damage_cell = regs.sp().wrapping_sub(0x34);
+        let ratio_cell = regs.sp().wrapping_sub(0x38);
+        let mut nested = [0u64; 32];
+        nested[0] = this.address();
+        nested[1] = damage_cell;
+        if smrpg_skill_group_a_b_pre(nested.as_mut_ptr()) != 0
+            || smrpg_skill_calc_renkei_ratio_pre(nested.as_mut_ptr()) != 0
+        {
+            return 1;
+        }
+        nested[1] = skill.address();
+        nested[2] = ratio_cell;
+        if smrpg_skill_calc_belome_barrior_ratio_pre(nested.as_mut_ptr()) != 0
+            || smrpg_skill_set_acction_command_ratio_pre(nested.as_mut_ptr()) != 0
+        {
+            return 1;
+        }
+        nested[0] = target.address();
+        let _ = smrpg_param_use_damage_guard_pre(nested.as_mut_ptr());
+        // the cells the port itself stores to or reads after the lifted body ran
+        let logger = target.result_logger().address();
+        for offset in [
+            CharaSkillResultLogger::DAMAGE_NUMBER,
+            CharaSkillResultLogger::DAMAGE_STATE,
+            CharaSkillResultLogger::EFFECTIVE_STATE,
+        ] {
+            prestate::snapshot(logger.wrapping_add(offset), 4, true);
+        }
+        let math_word =
+            guest_ld64(guest_ld64(driver_slots::MATH_CLASS)).wrapping_add(CLASS_INITIALIZED);
+        let manager_word = guest_ld64(guest_ld64(driver_slots::BATTLE_MANAGER_CLASS))
+            .wrapping_add(CLASS_INITIALIZED);
+        let static_flag = guest_ld64(driver_slots::STATIC_FLAG_POINTER);
+        prestate::snapshot(math_word, 4, false);
+        prestate::snapshot(manager_word, 4, false);
+        prestate::snapshot(static_flag, 1, true);
+        let nested_may_initialize = skill.skill_type() == SKILL_TYPE_RENKEI
+            || skill.skill_id() == super::renkei::skill::RENKEI_RANDOM_HITS;
+        if nested_may_initialize
+            && (guest_ld32(math_word) == 0
+                || guest_ld32(manager_word) == 0
+                || guest_ld8(static_flag) == 0)
+        {
+            return 1;
+        }
+        // skill 0x2c3 makes `calc_renkei_ratio` replace the logger's hit list with a new one, and `calc_belome_barrior_ratio` (which
+        // follows) then reads the fresh list's header, which the pre-state cannot hold: that call runs the lifted body only
+        if skill.skill_id() == super::renkei::skill::RENKEI_RANDOM_HITS
+            && target.character_id() == super::belome::BELOME_CHARACTER_ID
+        {
+            return 1;
+        }
         0
     }
 }

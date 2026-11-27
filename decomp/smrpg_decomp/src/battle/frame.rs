@@ -7,7 +7,7 @@
 //! names what each value is, and `call` / `call_out` / `leave` write the lists the lifted code writes (read off the
 //! lifted C by script, see docs/DECOMP.md "Readable ports").
 
-use crate::bridge::{GuestException, Regs};
+use crate::bridge::{GuestException, Regs, prestate};
 
 pub struct Frame {
     pub regs: Regs,
@@ -138,6 +138,29 @@ impl Frame {
         self.x[1] = self.regs.x(1);
         self.v[0] = (self.regs.v_low(0), self.regs.v_high(0));
         self.v[1] = (self.regs.v_low(1), self.regs.v_high(1));
+        self.v[2] = (self.regs.v_low(2), self.regs.v_high(2));
+    }
+
+    /// A call to a function that is itself a port: the lifted code writes `list` and x30, then the port edits the
+    /// register file through its own shim (it builds its own `Frame` from the file), then x0, x1 and v0 to v2 are
+    /// reloaded. Err when the port left a guest exception pending (task-60).
+    pub fn call_port(
+        &mut self,
+        port: unsafe extern "C" fn(*mut u64),
+        return_address: u64,
+        list: &[usize],
+        with_sp: bool,
+    ) -> Result<(), GuestException> {
+        self.x[30] = return_address;
+        self.flush(list, with_sp);
+        self.regs.set_x(30, self.x[30]);
+        unsafe { port(self.regs.as_ptr()) };
+        // the nested port's own frame lies below this function's sp and is dead once it returned: the lifted body's later callees
+        // overwrite it, so its journaled stores are not compared (the cells of this frame and above are)
+        prestate::forget_stores(self.x[31].wrapping_sub(0x400), self.x[31]);
+        let pending = self.regs.exception_pending();
+        self.reload();
+        if pending { Err(GuestException) } else { Ok(()) }
     }
 
     /// The epilogue: x19 to x22 and x29 come back from the stack frame (their entry values), sp is the entry sp, and

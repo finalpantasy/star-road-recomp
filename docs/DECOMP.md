@@ -545,6 +545,16 @@ What remains for the driver (`damage_calc` 0x71021ff580, 613 instructions), unch
 x1 (= `x29 - 4`) 4 bytes in; `Single.ToString` x0 (= `sp + 8`) 4 bytes in. As a replay row the driver calls `group_a_b` through the bridge only when `group_a_b` is a traced row; it is now a replay row (`QLEAF`), so the
 driver has to call the Rust function directly and the row must stay a replay row for its own comparison (a replay row reached from inside another recorded call is not recorded, `compare_replay`).
 
+## damage_calc (task-60): the driver ported
+
+`SkillExecter.damage_calc` (0x71021ff580, 613 instructions, `QLEAF`, hook `smrpg_skill_damage_calc_pre`) is in `decomp/smrpg_decomp/src/battle/damage.rs`. It follows the original order: 26 lazy metadata slots on the first call, the debug lines (tables of number and literal lines), the callees (`calc_attack`, `calc_magic_attack`, `calc_element`, `calc_defence`, `calc_magic_defence`, `calc_belome_barrior_ratio`, `calc_renkei_ratio`, `group_a_b`, `is_barriered`, `set_acction_command_ratio`, `use_damage_guard`), then the special cases: skill id 1000 or above (signed) takes the no-damage branch; encounter 0x819 with skill 0x2bd multiplies by 4; character 0x64f with skill 0x2e7 gets fixed damage 0x50. Ported callees are called as Rust; the rest through the bridge. Nested replay rows are reached with `Frame::call_port`, which shares the register context, so their traced callees are recorded in the driver's recording.
+
+Four character ids (0x5dd, 0x5ec, 0x615, 0x653) still run the lifted body: their list-clear and BattleManager paths are not ported. In `on` mode the entry runs the lifted function; in `ab` mode the hook defers. The hook also defers the first call per process (lazy init pending), calls that could initialize the Math or BattleManager class or the static flag byte, and skill 0x2c3 on Belome (renkei swaps the logger's list).
+
+Replay changes in `swap.c`: pre-state reads look in the store journal first, an out callee's post bytes are journaled again after its footprint drops stores, nested frames' dead stack stores are forgotten, and the first mismatch of a trial lists the recorded calls.
+
+Evidence: selftest 25,625 calls, 0 differences; route 15 live calls, 0 differences, 5 deferred; `on` mode reached the battle (`calls=15`); two mutations caught. The task42 save never reached a battle. Details in `backlog/tasks/task-60.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

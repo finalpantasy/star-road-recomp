@@ -50,7 +50,7 @@ use crate::guest_ld64;
 use crate::object::guest_class;
 
 /// `_character_id` of the target the barrier list applies to.
-const BELOME_CHARACTER_ID: u32 = 0x649;
+pub(crate) const BELOME_CHARACTER_ID: u32 = 0x649;
 /// `SkillObject.CalcType.SP_ATTACK`.
 const CALC_TYPE_SP_ATTACK: u32 = 2;
 
@@ -191,11 +191,11 @@ impl SkillObject {
     const CALC_TYPE: u64 = 0x24;
     const ELEMENT: u64 = 0x38;
 
-    fn calc_type(self) -> u32 {
+    pub(crate) fn calc_type(self) -> u32 {
         self.u32_field(Self::CALC_TYPE)
     }
 
-    fn element(self) -> u32 {
+    pub(crate) fn element(self) -> u32 {
         self.u32_field(Self::ELEMENT)
     }
 }
@@ -204,11 +204,11 @@ impl BattleCharacterParam {
     const CHARACTER_ID: u64 = 0x20;
     const IS_EQUIP_KAITEN_SHOES: u64 = 0x7d;
 
-    fn character_id(self) -> u32 {
+    pub(crate) fn character_id(self) -> u32 {
         self.u32_field(Self::CHARACTER_ID)
     }
 
-    fn is_equip_kaiten_shoes_byte(self) -> u8 {
+    pub(crate) fn is_equip_kaiten_shoes_byte(self) -> u8 {
         self.u8_field(Self::IS_EQUIP_KAITEN_SHOES)
     }
 }

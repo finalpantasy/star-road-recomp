@@ -202,7 +202,7 @@ static void compare_store(Leaf *leaf, Ctx *c) {
 #define REC_LIMIT 4096
 #define OUT_MAX 24
 typedef struct { uint64_t target; Ctx pre, post; unsigned char out_pre[OUT_MAX], out_post[OUT_MAX]; } RecCall;
-typedef struct { RecCall *calls; unsigned count, next, cap; int bad; int hide_callee_fpsr; uint32_t raised; } Recording;
+typedef struct { RecCall *calls; unsigned count, next, cap; int bad; int dumped; int hide_callee_fpsr; uint32_t raised; } Recording;
 #define FPSR_CUM 0x0800009fu   /* IOC DZC OFC UFC IXC IDC QC: the cumulative FPSR bits */
 static __thread Recording *tl_rec, *tl_replay;
 static __thread unsigned tl_depth;
@@ -221,7 +221,7 @@ static __thread uint64_t tl_stub;   /* selftest: nonzero = traced callees do not
  *  - the port's stores go through smrpg_guest_store: outside a trial it stores, in a trial it only journals, and
  *    after the trial every journaled store must equal what the lifted body left in memory, and every watched cell
  *    the lifted body changed must have a journaled store of that value. */
-#define PRE_MAX 32
+#define PRE_MAX 96   /* task-60: the damage_calc driver names the cells of its five nested ports too */
 typedef struct { uint64_t addr; unsigned size, watch; uint64_t value; } PreCell;
 typedef struct { uint64_t addr; unsigned size; uint64_t value; } StoreRec;
 static __thread PreCell tl_pre[PRE_MAX];
@@ -252,9 +252,13 @@ void smrpg_guest_snapshot(uint64_t addr, unsigned size, unsigned watch) {
 }
 
 uint64_t smrpg_guest_pre_read(uint64_t addr, unsigned size) {
-    if (tl_replay)
+    if (tl_replay) {
+        /* task-60: a port reads what it stored itself first (a stack cell a later nested port reads again), then the snapshot */
+        for (unsigned i = tl_st_n; i-- > 0;)
+            if (tl_st[i].addr == addr && tl_st[i].size == size) return tl_st[i].value;
         for (unsigned i = 0; i < tl_pre_n; ++i)
             if (tl_pre[i].addr == addr && tl_pre[i].size == size) return tl_pre[i].value;
+    }
     return raw_load(addr, size);
 }
 
@@ -265,6 +269,15 @@ void smrpg_guest_store(uint64_t addr, unsigned size, uint64_t value) {
     }
     if (tl_st_n >= PRE_MAX) tl_st_overflow = 1;
     else tl_st[tl_st_n++] = (StoreRec){addr, size, value};
+}
+
+/* task-60: a nested port's stack frame is dead once it returned, and the lifted body's later callees overwrite it: forget its stores. */
+void smrpg_guest_forget_stores(uint64_t lo, uint64_t hi) {
+    if (!tl_replay) return;
+    unsigned kept = 0;
+    for (unsigned i = 0; i < tl_st_n; ++i)
+        if (tl_st[i].addr < lo || tl_st[i].addr >= hi) tl_st[kept++] = tl_st[i];
+    tl_st_n = kept;
 }
 
 /* After the trial: 0 when the journal and the lifted body's memory agree, otherwise the first problem is logged. */
@@ -568,6 +581,10 @@ static int replay_call(Recording *r, Ctx *c, uint64_t target) {
                 rt_log("decomp replay: call %u to %#llx, x%u: lifted=%#llx rust=%#llx", r->next, (unsigned long long)target, i,
                        (unsigned long long)call->pre.x[i], (unsigned long long)c->x[i]);
             }
+        if (shown && !r->dumped) { /* task-60: the first mismatch of a trial lists the recorded calls (target, x29, sp) to find which site differs */
+            r->dumped = 1;
+            for (unsigned k = 0; k < r->count && k < 40; ++k) rt_log("DBG call %u target=%#llx x29=%#llx x31=%#llx", k + 1, (unsigned long long)r->calls[k].target, (unsigned long long)r->calls[k].pre.x[29], (unsigned long long)r->calls[k].pre.x[31]);
+        }
         for (unsigned i = 0; i < 32; ++i)
             if (memcmp(&c->v[i], &call->pre.v[i], sizeof c->v[i]) && shown++ < 8) {
                 r->bad = 1;
@@ -580,6 +597,23 @@ static int replay_call(Recording *r, Ctx *c, uint64_t target) {
     }
     memcpy(c, &call->post, sizeof *c);
     return c->exc != 0;
+}
+
+/* task-60: the exception test the lifted code makes after a call, for a nested port (it has no return value). */
+int smrpg_guest_exc(uint64_t *x) {
+    return ((Ctx *)(void *)x)->exc != 0;
+}
+
+/* task-60: a port that leaves a case to the lifted body (the damage_calc driver for a few character ids) runs it here. Only
+ * `on` mode may: in a replay trial the lifted body already ran on live memory, so running it again would repeat its side effects. */
+void smrpg_guest_lifted(uint64_t *x, uint64_t target) {
+    if (tl_replay) rt_exit(10, "decomp bridge: lifted body requested inside a replay trial");
+    for (int i = 0; i < leaf_count; ++i)
+        if (leaves[i].address == target && leaves[i].lifted) {
+            leaves[i].lifted((Ctx *)(void *)x);
+            return;
+        }
+    rt_exit(10, "decomp bridge: no lifted body for the requested address");
 }
 
 int smrpg_guest_bl(uint64_t *x, uint64_t target) {
@@ -633,6 +667,13 @@ int smrpg_guest_bl_out(uint64_t *x, uint64_t target, unsigned char *buf, unsigne
             for (unsigned i = 0; i < tl_st_n; ++i)
                 if (tl_st[i].addr < lo || tl_st[i].addr >= hi) tl_st[kept++] = tl_st[i];
             tl_st_n = kept;
+            /* task-60: what the callee left in the cell is a store of its own: a later read of the cell by the port or a nested port
+             * sees it, and the end-of-trial check holds it to the lifted body's final memory (unless a later store supersedes it) */
+            if ((n == 1 || n == 4 || n == 8) && tl_st_n < PRE_MAX) {
+                uint64_t post = 0;
+                memcpy(&post, call->out_post, n);
+                tl_st[tl_st_n++] = (StoreRec){lo, n, post};
+            }
             for (unsigned i = 0; i < tl_pre_n; ++i)
                 if (tl_pre[i].addr >= lo && tl_pre[i].addr < hi) tl_pre[i].watch = 0;
         }
@@ -805,6 +846,30 @@ static void restore_group_globals(void) {
     tl_stub_current = 0;
 }
 
+/* damage_calc driver (task-60): its own flag byte and 26 metadata slots plus everything its nested ports read (group_a_b,
+ * calc_renkei_ratio, calc_belome_barrior_ratio: flag bytes and slots), saved once and restored after the row. */
+static const uint64_t driver_slot_address[26] = {
+    0x7103a57e48ULL, 0x7103a58048ULL, 0x7103a4d788ULL, 0x7103a4e8c8ULL, 0x7103a4d790ULL, 0x7103a46a90ULL, 0x7103a83b48ULL, 0x7103a83b50ULL,
+    0x7103a83b58ULL, 0x7103a83540ULL, 0x7103a83b60ULL, 0x7103a83b68ULL, 0x7103a83b70ULL, 0x7103a83b78ULL, 0x7103a83b80ULL, 0x7103a83b88ULL,
+    0x7103a83b90ULL, 0x7103a83b98ULL, 0x7103a83ba0ULL, 0x7103a83ba8ULL, 0x7103a83bb0ULL, 0x7103a83b40ULL, 0x7103a83bb8ULL, 0x7103a835b0ULL,
+    0x7103a83bc0ULL, 0x7103a83bc8ULL};
+static const uint64_t driver_flag_address[4] = {0x7103cba000ULL + 0xd71, 0x7103cba000ULL + 0xd73, 0x7103cba000ULL + 0xd5e, 0x7103cba000ULL + 0xd5d};
+#define DRIVER_SLOTS (26 + 9 + 13)
+static uint64_t driver_saved[DRIVER_SLOTS + 4];
+static int driver_have_saved;
+static uint64_t driver_slot_at(int i) {
+    if (i < 26) return driver_slot_address[i];
+    if (i < 35) return group_slot_address[i - 26];
+    return renkei_slot_address[i - 35];
+}
+static void restore_driver_globals(void) {
+    if (!driver_have_saved) return;
+    for (int i = 0; i < 4; ++i) *(volatile uint8_t *)(uintptr_t)driver_flag_address[i] = (uint8_t)driver_saved[DRIVER_SLOTS + i];
+    for (int i = 0; i < DRIVER_SLOTS; ++i) *(uint64_t *)(uintptr_t)driver_slot_at(i) = driver_saved[i];
+    driver_have_saved = 0;
+    tl_stub_instance = tl_stub_new = tl_stub_current = 0;
+}
+
 static void restore_belome_globals(void) {
     if (!belome_have_saved) return;
     *(volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5d) = (uint8_t)belome_saved[0];
@@ -822,8 +887,8 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
     uint64_t base = (uint64_t)(uintptr_t)fake;
     /* The lifted prologue pushes x29 and x30 below sp, so sp must be a real 16-byte aligned stack. The Rust
      * body has no stack; those bytes are dead once the function returns and are not compared. */
-    static _Alignas(16) uint64_t stack[64];   /* task-58: calc_renkei_ratio's frame is 0x70 bytes, the old 16 words overflowed it */
-    c->x[31] = (uint64_t)(uintptr_t)&stack[40];
+    static _Alignas(16) uint64_t stack[128];   /* task-58: calc_renkei_ratio's frame is 0x70 bytes, the old 16 words overflowed it */
+    c->x[31] = (uint64_t)(uintptr_t)&stack[104];
     switch (address) {
     case 0x71005b3d70ULL:   /* x0 + (int)x1 * 8 + 0x20 is loaded: keep it inside the 64 words */
         fill_fake_region(fake, 64, state);
@@ -1004,6 +1069,128 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->x[0] = rb;                                          /* the executer */
         c->x[1] = rb + 8 * 70;                                 /* the skill object */
         c->x[2] = rb + 8 * 240;                                /* the ratio cell */
+        break;
+    }
+    case 0x71021ff580ULL: { /* Battle.SkillExecter.damage_calc (task-60): the executer (+0x10 monitor, +0x20 acter, +0x28 target, +0x30 skill object,
+                             * +0x40 _tmp_value), the target (+0x20 id, +0x76 _is_guard, +0x8c counter, +0x98/+0xa0 managers, +0xa8 element manager with its int[],
+                             * +0xb8 result logger with +0x50 List<int>), the acter, the skill object, the BattleManager class cell, the System.Math class cell,
+                             * the byte flag, the GlobalWork stand-in with its bool[], and every flag byte and metadata slot of this row and its nested ports
+                             * pointed at private cells and restored after the row. */
+        static uint64_t region[1000];
+        if (!driver_have_saved) {
+            for (int i = 0; i < 4; ++i) driver_saved[DRIVER_SLOTS + i] = *(volatile uint8_t *)(uintptr_t)driver_flag_address[i];
+            for (int i = 0; i < DRIVER_SLOTS; ++i) driver_saved[i] = *(uint64_t *)(uintptr_t)driver_slot_at(i);
+            driver_have_saved = 1;
+        }
+        fill_fake_region(region, 1000, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        uint64_t r;
+        #define WORD(n) (rb + 8 * (n))
+        #define PUT32(word, off, value) do { uint32_t put_ = (value); memcpy(bytes + 8 * (word) + (off), &put_, 4); } while (0)
+        region[2] = WORD(600);
+        region[3] = WORD(650);                                  /* +0x18 _cur_skill_result */
+        region[4] = WORD(140);
+        region[5] = WORD(24);
+        region[6] = WORD(70);
+        static const uint32_t tmp_values[] = {0, 1, 2, 3, 7, 100, 9999, 0xffffffffu, 0xfffffff9u, 0x7fffffffu, 0x80000000u, 0x80000001u, 0x3f800000u,
+                                              0x7f800000u, 0x4b800000u, 0x20000000u, 0x55555555u};
+        r = random_word(state);
+        PUT32(0, 0x40, (r & 7) == 0 ? (uint32_t)(r >> 8) : tmp_values[(r >> 8) % RT_ARRAY_LEN(tmp_values)]);
+        static const uint32_t skill_ids[] = {1, 0x2c3, 0x2c3, 0x2bd, 0x2bd, 0x2c4, 0x2c5, 0x2e7, 0x2e7, 103, 104, 105, 106, 107, 108, 102, 999, 1000, 1001,
+                                             0x7fffffffu, 0x80000000u, 0xffffffffu, 0x28, 0x9e, 0x9f, 0x2ba, 0x2c9, 0x100, 0x2c2, 0x2c6};
+        static const uint32_t calc_types[] = {0, 1, 2, 4, 4, 8, 8, 9, 9, 10, 10, 3, 0xffffffffu};
+        static const uint32_t skill_types[] = {13, 13, 13, 0, 1, 2, 12, 14, 0xffffffffu, 0x80000000u};
+        static const uint32_t elements[] = {0, 0, 1, 2, 3, 4, 5, 6, 7, 0xffffffffu, 0x80000000u};
+        r = random_word(state);
+        PUT32(70, 0x14, (r & 7) == 0 ? (uint32_t)(r >> 8) % 0x400 : skill_ids[(r >> 8) % RT_ARRAY_LEN(skill_ids)]);
+        PUT32(70, 0x24, calc_types[(pick >> 8) % RT_ARRAY_LEN(calc_types)]);
+        PUT32(70, 0x20, skill_types[(pick >> 12) % RT_ARRAY_LEN(skill_types)]);
+        PUT32(70, 0x38, elements[(pick >> 16) % RT_ARRAY_LEN(elements)]);
+        static const uint32_t ids[] = {0x649, 0x649, 0x64f, 0x64f, 0x64f, 0x64f, 0, 1, 0x648, 0x650, 0xffffffffu, 0x2c3};
+        static const uint32_t unported[] = {0x5dd, 0x5ec, 0x615, 0x653};
+        r = random_word(state);
+        PUT32(24, 0x20, (r & 15) == 0 ? unported[(r >> 8) & 3] : ids[(r >> 12) % RT_ARRAY_LEN(ids)]);
+        static const unsigned char guards[] = {0, 0, 1, 2, 0x80, 0xff};
+        bytes[8 * 24 + 0x76] = guards[(pick >> 20) % RT_ARRAY_LEN(guards)];
+        static const uint32_t counters[] = {0, 1, 1, 2, 3, 4, 6, 0xffffffffu, 0x80000000u};
+        PUT32(24, 0x8c, counters[(pick >> 24) % RT_ARRAY_LEN(counters)]);
+        region[24 + 0xa8 / 8] = WORD(80);
+        region[24 + 0xb8 / 8] = WORD(200);
+        region[80 + 2] = WORD(84);
+        static const uint32_t lengths[] = {0, 1, 2, 3, 4, 5, 6, 9};
+        PUT32(84, 0x18, lengths[(pick >> 28) % RT_ARRAY_LEN(lengths)]);
+        for (unsigned i = 0; i < 12; ++i) {
+            uint64_t q = random_word(state);
+            PUT32(84, 0x20 + 4 * i, (q & 7) == 0 ? (uint32_t)(q >> 8) : (uint32_t)((q >> 8) % 7));
+        }
+        static const unsigned char shoes[] = {0, 0, 1, 2, 0xff};
+        bytes[8 * 140 + 0x7d] = shoes[(pick >> 32) % RT_ARRAY_LEN(shoes)];
+        static const uint32_t statuses[] = {5, 5, 5, 0, 1, 4, 6, 0xffffffffu};
+        static const unsigned char buff_flags[] = {0, 0, 1, 1, 2, 0xff};
+        static const unsigned character_word[3] = {24, 140, 170};
+        static const unsigned manager_word[3] = {520, 540, 560};
+        for (unsigned k = 0; k < 3; ++k) {
+            region[character_word[k] + 0x98 / 8] = WORD(manager_word[k]);
+            region[character_word[k] + 0xa0 / 8] = WORD(manager_word[k] + 8);
+            PUT32(manager_word[k], 0x10, statuses[random_word(state) % RT_ARRAY_LEN(statuses)]);
+            bytes[8 * (manager_word[k] + 8) + 0x10] = buff_flags[random_word(state) % RT_ARRAY_LEN(buff_flags)];
+            bytes[8 * (manager_word[k] + 8) + 0x11] = buff_flags[random_word(state) % RT_ARRAY_LEN(buff_flags)];
+            PUT32(manager_word[k] + 8, 0x28, battle_edge_word(state));
+            PUT32(manager_word[k] + 8, 0x2c, battle_edge_word(state));
+        }
+        region[580 + 4] = WORD(170);
+        region[200 + 0x50 / 8] = ((pick >> 36) & 7) == 0 ? 0 : WORD(220);
+        static const uint32_t sizes[] = {0, 0, 1, 2, 3, 5, 0xffffffffu, 0x80000000u};
+        static const uint32_t versions[] = {0, 1, 0xffffffffu, 0x7fffffffu, 5};
+        region[220 + 2] = WORD(226);
+        PUT32(220, 0x18, sizes[(pick >> 40) % RT_ARRAY_LEN(sizes)]);
+        PUT32(220, 0x1c, versions[(pick >> 44) % RT_ARRAY_LEN(versions)]);
+        region[230 + 2] = WORD(234);
+        PUT32(230, 0x18, 0);
+        region[96 + 0xe8 / 8] = WORD(130);
+        static const uint32_t blengths[] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 0xffffffffu};
+        PUT32(130, 0x18, blengths[(pick >> 48) % RT_ARRAY_LEN(blengths)]);
+        static const unsigned char entries[] = {0, 0, 1, 1, 2, 0xff};
+        for (unsigned i = 0; i < 16; ++i) bytes[8 * 130 + 0x20 + i] = entries[random_word(state) % RT_ARRAY_LEN(entries)];
+        region[240] = WORD(244);
+        region[244 + 0xb8 / 8] = WORD(280);
+        region[280 + 2] = WORD(290);
+        region[290 + 0xd8 / 8] = WORD(345);
+        region[290 + 0x60 / 8] = WORD(310);                     /* the instance's +0x60 object (the lifted-only character 0x615 path) */
+        region[345 + 2] = WORD(350);
+        static const uint32_t encounters[] = {0x819, 0x819, 0, 1, 0x818, 0x81a, 0xffffffffu, 0x80000000u};
+        PUT32(290, 0x168, encounters[(pick >> 52) % RT_ARRAY_LEN(encounters)]);
+        r = random_word(state);
+        PUT32(244, 0xe0, (r & 3) == 0 ? 0 : (uint32_t)(r >> 8) | 1);
+        region[360] = WORD(364);
+        r = random_word(state);
+        PUT32(364, 0xe0, (r & 3) == 0 ? 0 : (uint32_t)(r >> 8) | 1);
+        region[410] = WORD(414);
+        r = random_word(state);
+        PUT32(414, 0xe0, (r & 7) == 0 ? 0 : (uint32_t)(r >> 8) | 1);
+        bytes[8 * 400] = ((pick >> 56) & 3) == 0 ? 0 : (((pick >> 58) & 7) == 0 ? 0x80 : 1);
+        for (int i = 0; i < DRIVER_SLOTS; ++i) {
+            region[800 + 2 * i] = WORD(801 + 2 * i);
+            *(uint64_t *)(uintptr_t)driver_slot_at(i) = WORD(800 + 2 * i);
+        }
+        *(uint64_t *)(uintptr_t)0x7103a57e48ULL = WORD(240);
+        *(uint64_t *)(uintptr_t)0x7103a581d0ULL = WORD(400);
+        *(uint64_t *)(uintptr_t)0x7103a46a90ULL = WORD(360);
+        *(uint64_t *)(uintptr_t)0x7103a58048ULL = WORD(410);
+        region[450] = WORD(452);
+        region[452 + 4] = WORD(460);
+        region[460 + 0xc0 / 8] = WORD(470);
+        *(uint64_t *)(uintptr_t)0x7103a4e8c8ULL = WORD(450);
+        r = random_word(state);
+        *(volatile uint8_t *)(uintptr_t)driver_flag_address[0] = ((r >> 8) & 15) == 0 ? 0 : 1;
+        for (int i = 1; i < 4; ++i) *(volatile uint8_t *)(uintptr_t)driver_flag_address[i] = ((random_word(state) >> 8) & 31) == 0 ? 0 : 1;
+        tl_stub_instance = WORD(96);
+        tl_stub_new = WORD(230);
+        tl_stub_current = WORD(580);
+        #undef PUT32
+        #undef WORD
+        c->x[0] = rb;
         break;
     }
     case 0x71021f5ed0ULL: { /* Battle.SkillExecter.calc_renkei_ratio (task-58): the executer (+0x10 monitor, +0x28 target, +0x30 skill object), the target
@@ -1282,6 +1469,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     restore_belome_globals();
     restore_renkei_globals();
     restore_group_globals();
+    restore_driver_globals();
     atomic_store(&leaf->deferred, 0);
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);

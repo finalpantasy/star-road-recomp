@@ -29,6 +29,15 @@ unsafe extern "C" {
     /// `runtime/decomp/swap.c` (task-57): the same with an out footprint: `buf` (`n` bytes) is the caller's stack slot
     /// the callee writes. In a replay trial the callee does not run and `buf` receives the recorded bytes.
     fn smrpg_guest_bl_out(x: *mut u64, target: u64, buf: *mut u8, n: u32) -> i32;
+    /// `runtime/decomp/swap.c` (task-60): 1 when the context holds a pending guest exception (`c->exc != 0`), the test
+    /// the lifted code makes after each call. Used after a nested port, which has no return value of its own.
+    fn smrpg_guest_exc(x: *mut u64) -> i32;
+    /// `runtime/decomp/swap.c` (task-60): in a replay trial, forget the journaled stores in `[lo, hi)`: the dead stack frame of a
+    /// nested port, which later callee frames of the lifted body overwrite. Outside a trial it does nothing.
+    fn smrpg_guest_forget_stores(lo: u64, hi: u64);
+    /// `runtime/decomp/swap.c` (task-60): runs the lifted body of the replay row at `target` on the register file, for
+    /// a port that leaves a case to the lifted code. Never inside a replay trial (it would run the body twice).
+    fn smrpg_guest_lifted(x: *mut u64, target: u64);
 }
 
 #[cfg(not(test))]
@@ -92,6 +101,12 @@ pub(crate) use tests::fake_guest_bl as smrpg_guest_bl;
 #[cfg(test)]
 pub(crate) use tests::fake_guest_bl_out as smrpg_guest_bl_out;
 #[cfg(test)]
+pub(crate) use tests::fake_guest_exc as smrpg_guest_exc;
+#[cfg(test)]
+pub(crate) use tests::fake_guest_forget_stores as smrpg_guest_forget_stores;
+#[cfg(test)]
+pub(crate) use tests::fake_guest_lifted as smrpg_guest_lifted;
+#[cfg(test)]
 pub(crate) use tests::fake_safepoint as smrpg_guest_safepoint;
 #[cfg(test)]
 pub(crate) use tests::fake_safepoint_n as smrpg_guest_safepoint_n;
@@ -113,6 +128,11 @@ pub mod prestate {
     /// Pre-state hook: remember a cell. `watch` marks one the port stores to itself (see `store`).
     pub fn snapshot(addr: u64, size: u32, watch: bool) {
         unsafe { smrpg_guest_snapshot(addr, size, u32::from(watch)) }
+    }
+
+    /// The journaled stores in `[lo, hi)` are dead (the stack frame of a nested port that has returned).
+    pub fn forget_stores(lo: u64, hi: u64) {
+        unsafe { smrpg_guest_forget_stores(lo, hi) }
     }
 
     pub fn read_u8(addr: u64) -> u8 {
@@ -167,6 +187,26 @@ impl Regs {
     pub fn set_x(&mut self, n: usize, value: u64) {
         assert!(n < 32);
         unsafe { self.x.add(n).write(value) }
+    }
+
+    /// The raw register file, for a nested port that takes `*mut u64` like a shim (task-60).
+    pub fn as_ptr(&self) -> *mut u64 {
+        self.x
+    }
+
+    /// A second handle on the same register file, for a nested port's own `Frame` (task-60).
+    pub fn alias(&self) -> Regs {
+        Regs { x: self.x }
+    }
+
+    /// The context holds a pending guest exception (the lifted code returns at once when it does).
+    pub fn exception_pending(&self) -> bool {
+        unsafe { smrpg_guest_exc(self.x) != 0 }
+    }
+
+    /// Runs the lifted body of the replay row at `target` on this register file (task-60).
+    pub fn run_lifted(&mut self, target: u64) {
+        unsafe { smrpg_guest_lifted(self.x, target) }
     }
 
     pub fn sp(&self) -> u64 {
@@ -445,6 +485,14 @@ pub(crate) mod tests {
     ) {
         SAFEPOINTS.with(|s| s.borrow_mut().push(pc));
     }
+
+    pub unsafe fn fake_guest_exc(_x: *mut u64) -> i32 {
+        0
+    }
+
+    pub unsafe fn fake_guest_forget_stores(_lo: u64, _hi: u64) {}
+
+    pub unsafe fn fake_guest_lifted(_x: *mut u64, _target: u64) {}
 
     pub unsafe fn fake_snapshot(_addr: u64, _size: u32, _watch: u32) {}
 
