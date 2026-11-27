@@ -69,7 +69,7 @@ foreach(chunk IN LISTS chunks)
     COMMAND "${Python3_EXECUTABLE}" -I "${glue}/wrap_chunk.py" "${original}" "${manifest}" "${wrapped}"
     DEPENDS "${original}" "${glue}/wrap_chunk.py" "${manifest}"
     VERBATIM)
-  set_source_files_properties("${wrapped}" PROPERTIES COMPILE_OPTIONS "-w;-fno-exceptions")
+  set_source_files_properties("${wrapped}" PROPERTIES COMPILE_OPTIONS "-w;-fno-exceptions;-g0")   # task-47: unwrapped lifted objects carry no DWARF; -g added 550 KB of 605 KB per chunk
   target_sources(smrpg_boot PRIVATE "${wrapped}")
 endforeach()
 target_sources(smrpg_boot PRIVATE "${glue}/swap.c")

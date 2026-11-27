@@ -105,3 +105,5 @@ python -I tools/rtprep/heavy_lock.py -- python tools/game_check.py run --root .
 ```
 
 The startup test calls each registered entry with 10,000 seeded random inputs and every combination of 25 boundary values (15,625). Counters reset before the guest starts. The log check requires a positive live count for each address and zero differences in both phases.
+
+Build size fix (task-47). Cause of the 4.5 MB per wrapped chunk: the runtime target compiled wrapped chunks with `-O2 -g`, while the lifted objects have no DWARF; a wrapped `main_0001` object was 604,849 B (550 KB DWARF) against 55,333 B unwrapped with the same 53,695 B of code. `runtime/decomp/game.cmake` now adds `-g0` for wrapped chunks. 120 chunks: `smrpg.exe` 948 MB to 312 MB, rebuild plus relink 208 s. All 350 chunks with generated functions (12,028 functions, main_0169 still excluded): `smrpg.exe` 314 MB, 322 s for the full build, 12,056 rows registered. The task-46 limit on the built set no longer applies; the generator command above with `--max-chunks 0 --exclude-chunks 169` is the normal set.
