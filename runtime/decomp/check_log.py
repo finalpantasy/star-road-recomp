@@ -11,7 +11,7 @@ import collections
 import re
 import sys
 
-ROW = r"[SCGNVD]?LEAF\(\w+, ([0-9a-f]+),"
+ROW = r"(?<!O)[SCGNVD]?LEAF\(\w+, ([0-9a-f]+),"
 GEN_DIR = Path(r"A:\AI\Recomps\smrpg-work\decompgen")
 
 

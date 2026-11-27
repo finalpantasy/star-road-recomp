@@ -229,7 +229,7 @@ impl CharaSkillResultLogger {
 impl BattleCharacterParam {
     const RESULT_LOGGER: u64 = 0xb8;
 
-    fn result_logger(self) -> CharaSkillResultLogger {
+    pub(crate) fn result_logger(self) -> CharaSkillResultLogger {
         self.object_field(Self::RESULT_LOGGER)
     }
 

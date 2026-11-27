@@ -11,8 +11,10 @@ use crate::object::{GuestObject, Int32Array, guest_class};
 use crate::unity::{Camera, DEG2RAD, Quaternion, Transform, Vector3};
 
 pub mod attack;
+pub mod belome;
 pub mod damage;
 pub mod element;
+pub(crate) mod frame;
 
 /// `Battle.BadStatusManager.BadStatusKind`, the raw 32-bit value (the game stores any int, so no Rust enum).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

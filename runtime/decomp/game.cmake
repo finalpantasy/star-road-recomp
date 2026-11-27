@@ -51,7 +51,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${glue}/leaves.d
 file(STRINGS "${manifest}" rows)
 set(chunks "")
 foreach(row IN LISTS rows)
-  if(NOT row MATCHES "^[SCGNVDPEQ]?LEAF[(](main_[0-9]+),")
+  if(NOT row MATCHES "^[SCGNVDPEQO]?LEAF[(](main_[0-9]+),")
     message(FATAL_ERROR "Invalid swap manifest row: ${row}")
   endif()
   list(APPEND chunks "${CMAKE_MATCH_1}")

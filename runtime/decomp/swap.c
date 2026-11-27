@@ -25,6 +25,7 @@ typedef struct {
     unsigned clear_fpsr;            /* ELEAF: compare with the cumulative FPSR bits cleared on both sides (task-54) */
     unsigned replay;                /* ELEAF: a port whose callees have side effects, compared by replay (task-52) */
     unsigned probe;                 /* PLEAF: a traced row, counts live calls and runs the lifted body (task-52) */
+    unsigned out_reg, out_off, out_bytes, out_in; /* OLEAF: a traced row whose callee writes out_bytes bytes at x[out_reg] + out_off; out_in: the bytes are also an input (task-57) */
     int (*pre)(uint64_t *);         /* QLEAF: pre-state hook, run before the lifted body; nonzero = defer the comparison (task-55) */
     atomic_ullong deferred;         /* QLEAF: calls whose comparison was deferred (lazy initialization still pending) */
     atomic_ullong calls, differences;
@@ -52,11 +53,13 @@ typedef struct {
     extern void f_##addr##_lifted(Ctx *); \
     extern uint64_t rust(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 #define PLEAF(chunk, addr)     void f_##addr(Ctx *);     extern void f_##addr##_lifted(Ctx *);
+#define OLEAF(chunk, addr, reg, off, bytes, in) PLEAF(chunk, addr)
 #define ELEAF(chunk, addr, rust) CLEAF(chunk, addr, rust)
 #define QLEAF(chunk, addr, rust, hook) CLEAF(chunk, addr, rust) extern int hook(uint64_t *);
 #include "manifest.def"
 #undef QLEAF
 #undef ELEAF
+#undef OLEAF
 #undef PLEAF
 #undef LEAF
 #undef SLEAF
@@ -75,11 +78,13 @@ enum {
 #define DLEAF(chunk, addr, rust, base, off, len, off2) index_##addr,
 #define VLEAF(chunk, addr, rust, vkind, vreg, base, off, len, off2) index_##addr,
 #define PLEAF(chunk, addr) index_##addr,
+#define OLEAF(chunk, addr, reg, off, bytes, in) index_##addr,
 #define ELEAF(chunk, addr, rust) index_##addr,
 #define QLEAF(chunk, addr, rust, hook) index_##addr,
 #include "manifest.def"
 #undef QLEAF
 #undef ELEAF
+#undef OLEAF
 #undef PLEAF
 #undef LEAF
 #undef SLEAF
@@ -107,11 +112,13 @@ static Leaf leaves[leaf_count] = {
     {HEAD(addr), .rust_vec = sym, .base_reg = base, .offset = off, .bytes = len, \
      .load_kind = (vkind_) == 1 ? 1 : (vkind_) == 4 ? 3 : 0, .offset2 = off2, .vkind = vkind_, .vreg = vreg_},
 #define PLEAF(chunk, addr) {HEAD(addr), .probe = 1},
+#define OLEAF(chunk, addr, reg_, off_, bytes_, in_) {HEAD(addr), .probe = 1, .out_reg = reg_, .out_off = off_, .out_bytes = bytes_, .out_in = in_},
 #define ELEAF(chunk, addr, sym) {HEAD(addr), .rust_regs = sym, .replay = 1, .clear_fpsr = 1},
 #define QLEAF(chunk, addr, sym, hook) {HEAD(addr), .rust_regs = sym, .replay = 1, .clear_fpsr = 1, .pre = hook},
 #include "manifest.def"
 #undef QLEAF
 #undef ELEAF
+#undef OLEAF
 #undef PLEAF
 #undef LEAF
 #undef SLEAF
@@ -187,9 +194,15 @@ static void compare_store(Leaf *leaf, Ctx *c) {
  * file of the port must equal the lifted one and every recorded call must have been used. What this does and does
  * not cover is in docs/DECOMP.md. A traced row that is reached while another call is being recorded (nested) is not
  * recorded; a callee reached through an untraced function is not seen, so the row's callees must all be traced. */
-#define REC_MAX 12
-typedef struct { uint64_t target; Ctx pre, post; } RecCall;
-typedef struct { RecCall calls[REC_MAX]; unsigned count, next; int overflow, bad; int hide_callee_fpsr; uint32_t raised; } Recording;
+/* The recorded calls live in a per-thread heap buffer that grows (task-57; the first limit, 12 calls on the stack, was
+ * too small for the damage driver, which makes about 60 traced calls). It grows by doubling up to REC_LIMIT and a
+ * body that makes more traced calls than that stops the run (exit 10): a silently skipped comparison could hide a
+ * difference. An out footprint (OLEAF) is kept next to the call. */
+#define REC_START 64
+#define REC_LIMIT 4096
+#define OUT_MAX 16
+typedef struct { uint64_t target; Ctx pre, post; unsigned char out_pre[OUT_MAX], out_post[OUT_MAX]; } RecCall;
+typedef struct { RecCall *calls; unsigned count, next, cap; int bad; int hide_callee_fpsr; uint32_t raised; } Recording;
 #define FPSR_CUM 0x0800009fu   /* IOC DZC OFC UFC IXC IDC QC: the cumulative FPSR bits */
 static __thread Recording *tl_rec, *tl_replay;
 static __thread unsigned tl_depth;
@@ -208,7 +221,7 @@ static __thread uint64_t tl_stub;   /* selftest: nonzero = traced callees do not
  *  - the port's stores go through smrpg_guest_store: outside a trial it stores, in a trial it only journals, and
  *    after the trial every journaled store must equal what the lifted body left in memory, and every watched cell
  *    the lifted body changed must have a journaled store of that value. */
-#define PRE_MAX 16
+#define PRE_MAX 32
 typedef struct { uint64_t addr; unsigned size, watch; uint64_t value; } PreCell;
 typedef struct { uint64_t addr; unsigned size; uint64_t value; } StoreRec;
 static __thread PreCell tl_pre[PRE_MAX];
@@ -305,9 +318,15 @@ static void stub_callee(Ctx *c) {
     tl_stub = w | 1;
 }
 
+static __thread uint64_t tl_stub_instance;   /* selftest: what the stand-in GlobalWork.get_inst returns (a fake object, never a random word) */
+
 static void run_traced(Leaf *leaf, Ctx *c) {
-    if (tl_stub) stub_callee(c);
-    else leaf->lifted(c);
+    if (tl_stub) {
+        stub_callee(c);
+        if (leaf->address == 0x7101886a00ULL && tl_stub_instance) c->x[0] = tl_stub_instance;
+    } else {
+        leaf->lifted(c);
+    }
 }
 
 static void compare_replay(Leaf *leaf, Ctx *c) {
@@ -335,21 +354,22 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     }
     Ctx pristine, trial;
     memcpy(&pristine, c, sizeof pristine);
+    static __thread RecCall *buffer;   /* kept between calls: a fresh allocation per call would cost more than the compare */
+    static __thread unsigned buffer_cap;
     Recording rec;
+    rec.calls = buffer;
+    rec.cap = buffer_cap;
     rec.count = rec.next = 0;
-    rec.overflow = rec.bad = 0;
+    rec.bad = 0;
     rec.hide_callee_fpsr = leaf->clear_fpsr;
     rec.raised = 0;
     tl_rec = &rec;
     tl_depth = 0;
     leaf->lifted(c);   /* live memory sees only this run */
     tl_rec = 0;
+    buffer = rec.calls;
+    buffer_cap = rec.cap;
     atomic_fetch_add(&leaf->calls, 1);
-    if (rec.overflow) {
-        rt_log("decomp replay skipped addr=%#llx (more than %d traced calls)", (unsigned long long)leaf->address, REC_MAX);
-        c->fpsr |= fpsr_saved | rec.raised;
-        return;
-    }
     memcpy(&trial, &pristine, sizeof trial);
     tl_replay = &rec;
     leaf->rust_regs(trial.x);
@@ -420,15 +440,22 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
         if (mode == AB) atomic_fetch_add(&leaf->calls, 1);
         Recording *r = tl_rec;
         if (r && tl_depth == 0) {
-            if (r->count >= REC_MAX) {
-                r->overflow = 1;
-                ++tl_depth;
-                run_traced(leaf, c);
-                --tl_depth;
-            } else {
+            if (r->count >= r->cap) {
+                if (r->cap >= REC_LIMIT) {
+                    rt_log("decomp replay: more than %u traced calls in one body", REC_LIMIT);
+                    rt_exit(10, "decomp replay: recorder full");
+                }
+                unsigned cap = r->cap ? r->cap * 2 : REC_START;
+                RecCall *grown = realloc(r->calls, (size_t)cap * sizeof *grown);
+                if (!grown) rt_exit(10, "decomp replay: out of memory growing the recorder");
+                r->calls = grown;
+                r->cap = cap;
+            }
+            {
                 RecCall *call = &r->calls[r->count];
                 call->target = leaf->address;
                 memcpy(&call->pre, c, sizeof *c);
+                if (leaf->out_bytes) memcpy(call->out_pre, (const void *)(uintptr_t)(c->x[leaf->out_reg] + leaf->out_off), leaf->out_bytes);
                 /* The flags the callee raises are kept out of the context while the compared body runs, so that a
                  * flag the port forgets after the call cannot hide behind one the callee already set (task-54).
                  * They are ORed back once the comparison is done (compare_replay). */
@@ -439,6 +466,7 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
                 --tl_depth;
                 if (r->hide_callee_fpsr) { r->raised |= c->fpsr & FPSR_CUM; c->fpsr = (c->fpsr & ~FPSR_CUM) | held; }
                 memcpy(&call->post, c, sizeof *c);
+                if (leaf->out_bytes) memcpy(call->out_post, (const void *)(uintptr_t)(call->pre.x[leaf->out_reg] + leaf->out_off), leaf->out_bytes);
                 ++r->count;
             }
         } else if (r) {   /* nested inside a recorded callee */
@@ -464,11 +492,13 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
 #define VLEAF(chunk, addr, rust, vkind, vreg, base, off, len, off2) \
     void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define PLEAF(chunk, addr) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
+#define OLEAF(chunk, addr, reg, off, bytes, in) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define ELEAF(chunk, addr, rust) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #define QLEAF(chunk, addr, rust, hook) void f_##addr(Ctx *c) { dispatch(&leaves[index_##addr], c); }
 #include "manifest.def"
 #undef QLEAF
 #undef ELEAF
+#undef OLEAF
 #undef PLEAF
 #undef LEAF
 #undef SLEAF
@@ -560,6 +590,53 @@ int smrpg_guest_bl(uint64_t *x, uint64_t target) {
     if (f) f(c);
     else rt_icall(c, target);   /* no lifted entry: interpreter fallback, which also sets c->pc like a miss */
     return c->exc != 0;
+}
+
+/* Guest call with an out footprint (task-57, OLEAF rows). The callee writes `n` bytes at x[out_reg] + out_off: a slot of
+ * the caller's own stack frame, or fields of an object the caller edits in place (the header of a List<T>). The port
+ * keeps those bytes as a local buffer, so it hands the buffer over: `buf` holds the bytes the area has at the call and
+ * receives the bytes it has after.
+ *  - replay trial: the callee does not run. The call is matched as usual (smrpg_guest_bl). For a row that declares the
+ *    area an input too (out_in) the port's bytes must equal the bytes the lifted body had there at the call, so a wrong
+ *    value passed by reference, or a store the port made to the area before the call, is checked here; then `buf` gets
+ *    the bytes the callee left, recorded from the lifted run. The area now holds what the callee changed, so the
+ *    journal no longer compares the port's earlier stores into it with the final memory (they were just compared with
+ *    the memory at the call): those entries and the watch marks on those cells are dropped.
+ *  - otherwise the port is the only run (on mode): the bytes go to the area (input rows only), the callee runs on the
+ *    live stack, and `buf` receives what it wrote. A row that is not declared with this footprint stops the run. */
+int smrpg_guest_bl_out(uint64_t *x, uint64_t target, unsigned char *buf, unsigned n) {
+    Ctx *c = (Ctx *)(void *)x;
+    const Leaf *row = 0;
+    for (int i = 0; i < leaf_count; ++i)
+        if (leaves[i].probe && leaves[i].address == target) row = &leaves[i];
+    if (!row || row->out_bytes != n || n > OUT_MAX) rt_exit(10, "decomp bridge: callee has no matching out footprint row");
+    if (tl_replay) {
+        Recording *r = tl_replay;
+        const unsigned index = r->next;
+        const int pending = replay_call(r, c, target);
+        if (index < r->count && r->calls[index].target == target) {
+            const RecCall *call = &r->calls[index];
+            const uint64_t lo = call->pre.x[row->out_reg] + row->out_off, hi = lo + n;
+            if (row->out_in && memcmp(buf, call->out_pre, n)) {
+                r->bad = 1;
+                rt_log("decomp replay: call %u to %#llx, the bytes passed by reference differ from the lifted body's", index + 1,
+                       (unsigned long long)target);
+            }
+            memcpy(buf, call->out_post, n);
+            unsigned kept = 0;
+            for (unsigned i = 0; i < tl_st_n; ++i)
+                if (tl_st[i].addr < lo || tl_st[i].addr >= hi) tl_st[kept++] = tl_st[i];
+            tl_st_n = kept;
+            for (unsigned i = 0; i < tl_pre_n; ++i)
+                if (tl_pre[i].addr >= lo && tl_pre[i].addr < hi) tl_pre[i].watch = 0;
+        }
+        return pending;
+    }
+    unsigned char *const area = (unsigned char *)(uintptr_t)(c->x[row->out_reg] + row->out_off);
+    if (row->out_in) memcpy(area, buf, n);
+    const int pending = smrpg_guest_bl(x, target);
+    memcpy(buf, area, n);
+    return pending;
 }
 
 /* The Rust archive is built for a Windows msvc target, where any float use references the CRT marker `_fltused`
@@ -675,6 +752,20 @@ static void restore_attack_globals(void) {
     *(uint64_t *)(uintptr_t)0x7103a57e48ULL = attack_saved[3];
     *(uint64_t *)(uintptr_t)0x7103a581d0ULL = attack_saved[4];
     attack_have_saved = 0;
+}
+
+/* calc_belome_barrior_ratio (task-57) reads the lazy-initialization flag and three metadata slots; the selftest points them
+ * into a private region and puts the originals back afterwards. */
+static uint64_t belome_saved[4];
+static int belome_have_saved;
+static void restore_belome_globals(void) {
+    if (!belome_have_saved) return;
+    *(volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5d) = (uint8_t)belome_saved[0];
+    *(uint64_t *)(uintptr_t)(0x7103a58000ULL + 0x48) = belome_saved[1];
+    *(uint64_t *)(uintptr_t)(0x7103a4d000ULL + 0x788) = belome_saved[2];
+    *(uint64_t *)(uintptr_t)(0x7103a4e000ULL + 0x8c8) = belome_saved[3];
+    belome_have_saved = 0;
+    tl_stub_instance = 0;
 }
 
 /* Caller functions (task-44) dereference pointers they compute, so the selftest builds a valid shape in the
@@ -807,6 +898,65 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
         c->fpcr = fpcr_modes[(pick >> 56) % RT_ARRAY_LEN(fpcr_modes)];
         c->fpsr = (uint32_t)(pick >> 32) & 0x0800009fu;
+        break;
+    }
+    case 0x71021f5c50ULL: { /* Battle.SkillExecter.calc_belome_barrior_ratio (task-57): the executer (+0x20 acter, +0x28 target), the target's logger
+                             * (+0xb8) and its List<int> (+0x50), the skill object (+0x14 id, +0x24 calc type, +0x38 element), the GlobalWork
+                             * stand-in with its bool[] (+0xe8), the GlobalWork class (+0xe0), the flag byte and three metadata slots. */
+        static uint64_t region[256];
+        volatile uint8_t *flag = (volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5d);
+        uint64_t *slot_class = (uint64_t *)(uintptr_t)(0x7103a58000ULL + 0x48), *slot_add = (uint64_t *)(uintptr_t)(0x7103a4d000ULL + 0x788),
+                 *slot_context = (uint64_t *)(uintptr_t)(0x7103a4e000ULL + 0x8c8);
+        if (!belome_have_saved) {
+            belome_saved[0] = *flag; belome_saved[1] = *slot_class; belome_saved[2] = *slot_add; belome_saved[3] = *slot_context;
+            belome_have_saved = 1;
+        }
+        fill_fake_region(region, 256, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        uint64_t r;
+        uint32_t v;
+        #define WORD(n) (rb + 8 * (n))
+        region[4] = WORD(8);                                   /* executer +0x20 _acter */
+        region[5] = WORD(24);                                  /* +0x28 _target */
+        static const unsigned char shoes[] = {0, 0, 1, 2, 0xff};
+        bytes[8 * 8 + 0x7d] = shoes[(pick >> 8) % RT_ARRAY_LEN(shoes)];
+        static const uint32_t ids[] = {0x649, 0x649, 0x649, 0x649, 0x649, 0x649, 0x649, 0x648, 0, 0xffffffffu};
+        v = ids[(pick >> 12) % RT_ARRAY_LEN(ids)]; memcpy(bytes + 8 * 24 + 0x20, &v, 4);   /* target _character_id */
+        region[24 + 0xb8 / 8] = WORD(48);                      /* target +0xb8 _result_logger */
+        region[48 + 0x50 / 8] = ((pick >> 16) & 7) == 0 ? 0 : WORD(60);   /* logger +0x50 _multi_number (null one time in eight) */
+        region[62] = WORD(66);                                 /* list +0x10 _items */
+        static const uint32_t sizes[] = {0, 0, 1, 2, 3, 5, 0xffffffffu, 0x80000000u};
+        static const uint32_t versions[] = {0, 1, 0xffffffffu, 0x7fffffffu, 5};
+        v = sizes[(pick >> 20) % RT_ARRAY_LEN(sizes)]; memcpy(bytes + 8 * 60 + 0x18, &v, 4);
+        v = versions[(pick >> 24) % RT_ARRAY_LEN(versions)]; memcpy(bytes + 8 * 60 + 0x1c, &v, 4);
+        static const uint32_t elements[] = {0, 0, 1, 2, 3, 4, 5, 6, 7, 0xffffffffu, 0x80000000u};
+        static const uint32_t calc_types[] = {0, 1, 2, 2, 2, 3, 0xffffffffu};
+        static const uint32_t skill_ids[] = {1, 0, 2, 0x9d, 0x9e, 0x9f, 0xa0, 0x2b9, 0x2ba, 0x2bb, 0x2c3, 0x2c4, 0x2c9, 0x2ca,
+                                             0x2d9, 0x7fffffffu, 0x80000000u, 0xffffffffu, 0x28, 0x100};
+        v = elements[(pick >> 28) % RT_ARRAY_LEN(elements)]; memcpy(bytes + 8 * 70 + 0x38, &v, 4);
+        v = calc_types[(pick >> 32) % RT_ARRAY_LEN(calc_types)]; memcpy(bytes + 8 * 70 + 0x24, &v, 4);
+        r = random_word(state);
+        v = (r & 3) == 0 ? (uint32_t)(r >> 8) % 0x300 : skill_ids[(r >> 8) % RT_ARRAY_LEN(skill_ids)]; memcpy(bytes + 8 * 70 + 0x14, &v, 4);
+        region[80 + 0xe8 / 8] = WORD(112);                     /* GlobalWork stand-in +0xe8 _belomu_barrior_list */
+        static const uint32_t lengths[] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 0xffffffffu};
+        v = lengths[(pick >> 36) % RT_ARRAY_LEN(lengths)]; memcpy(bytes + 8 * 112 + 0x18, &v, 4);
+        static const unsigned char entries[] = {0, 0, 1, 1, 2, 0xff};
+        for (unsigned i = 0; i < 16; ++i) bytes[8 * 112 + 0x20 + i] = entries[random_word(state) % RT_ARRAY_LEN(entries)];
+        v = ((pick >> 40) & 7) == 0 ? 0 : (uint32_t)(r = random_word(state)) | 1; memcpy(bytes + 8 * 120 + 0xe0, &v, 4);   /* class initialized word */
+        region[150] = WORD(120);                               /* the slot's value points at a word that holds the class */
+        region[152] = WORD(154);                               /* LIST_CONTEXT chain: [[slot]] = 154, +0x20 -> 160, +0xc0 -> 190, +0xc8 any */
+        region[154 + 4] = WORD(160);
+        region[160 + 0xc0 / 8] = WORD(190);
+        *flag = ((pick >> 44) & 15) == 0 ? 0 : 1;               /* lazy initialization pending one time in sixteen */
+        *slot_class = WORD(150);
+        *slot_context = WORD(152);
+        *slot_add = WORD(230);
+        tl_stub_instance = WORD(80);
+        #undef WORD
+        c->x[0] = rb;                                          /* the executer */
+        c->x[1] = rb + 8 * 70;                                 /* the skill object */
+        c->x[2] = rb + 8 * 240;                                /* the ratio cell */
         break;
     }
     case 0x71021f7ea0ULL: { /* Battle.SkillExecter.set_acction_command_ratio (task-56): +0x18 result record, +0x20 acter param (+0x6c _is_player),
@@ -972,6 +1122,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     if (stores && !stores_seen) rt_exit(10, "decomp selftest: store leaf never wrote");
     tl_stub = 0;
     restore_attack_globals();
+    restore_belome_globals();
     atomic_store(&leaf->deferred, 0);
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);

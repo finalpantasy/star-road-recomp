@@ -26,6 +26,9 @@ unsafe extern "C" {
     /// `runtime/decomp/swap.c`: runs the lifted function at `target` on the register file `x`; 1 if an exception
     /// is pending afterwards.
     fn smrpg_guest_bl(x: *mut u64, target: u64) -> i32;
+    /// `runtime/decomp/swap.c` (task-57): the same with an out footprint: `buf` (`n` bytes) is the caller's stack slot
+    /// the callee writes. In a replay trial the callee does not run and `buf` receives the recorded bytes.
+    fn smrpg_guest_bl_out(x: *mut u64, target: u64, buf: *mut u8, n: u32) -> i32;
 }
 
 #[cfg(not(test))]
@@ -75,6 +78,8 @@ unsafe fn smrpg_fp_shadow(_: u32, _: u32, _: u32, _: u64, _: u64, _: u32, _: u64
 #[cfg(test)]
 pub(crate) use tests::fake_guest_bl as smrpg_guest_bl;
 #[cfg(test)]
+pub(crate) use tests::fake_guest_bl_out as smrpg_guest_bl_out;
+#[cfg(test)]
 pub(crate) use tests::fake_safepoint as smrpg_guest_safepoint;
 #[cfg(test)]
 pub(crate) use tests::fake_safepoint_n as smrpg_guest_safepoint_n;
@@ -102,6 +107,10 @@ pub mod prestate {
 
     pub fn read_u32(addr: u64) -> u32 {
         unsafe { smrpg_guest_pre_read(addr, 4) as u32 }
+    }
+
+    pub fn read_u64(addr: u64) -> u64 {
+        unsafe { smrpg_guest_pre_read(addr, 8) }
     }
 
     /// A one-byte store the port makes (a lazy-initialization flag): done for real outside a replay trial, checked
@@ -296,6 +305,21 @@ impl Regs {
         self.invoke(target)
     }
 
+    /// A call whose callee writes a slot of the caller's own stack frame (the lifted code passes `sp + offset` in
+    /// `x<reg>` and reads the slot afterwards). `slot` is the port's copy of that slot: its bytes at the call go in,
+    /// the bytes the callee left come out. In a replay trial the callee does not run (the recorded bytes are returned);
+    /// in `on` mode it runs on the live stack. The row must be declared `OLEAF(chunk, addr, reg, bytes, in)` in
+    /// `runtime/decomp/leaves.def` with `bytes == slot.len()` (task-57). Returns x0.
+    pub fn invoke_out(&mut self, target: u64, slot: &mut [u8]) -> Result<u64, GuestException> {
+        assert!(slot.len() <= 16);
+        let pending =
+            unsafe { smrpg_guest_bl_out(self.x, target, slot.as_mut_ptr(), slot.len() as u32) };
+        if pending != 0 {
+            return Err(GuestException);
+        }
+        Ok(self.x(0))
+    }
+
     /// Runs the callee on the register file exactly as it stands: the port has staged every register itself, the
     /// way the lifted code does at that call site (it writes only the registers it changed since the last call).
     /// A tail call (`b target`) is the same with x30 left alone. Returns x0.
@@ -401,6 +425,32 @@ pub(crate) mod tests {
         let regs = unsafe { std::slice::from_raw_parts_mut(x, 32 + 64) };
         body.expect("call to an uninstalled fake callee")(regs);
         i32::from(regs[0] == u64::MAX && regs[1] == u64::MAX) // a fake raises "exception" by setting x0 = x1 = all ones
+    }
+
+    /// Stands in for `smrpg_guest_bl_out`: the installed fake runs, and the bytes it writes to the slot at `x2`
+    /// (the pointer register of the test row) come back in `buf`.
+    pub unsafe fn fake_guest_bl_out(x: *mut u64, target: u64, buf: *mut u8, n: u32) -> i32 {
+        let pending = unsafe { fake_guest_bl(x, target) };
+        let slot = unsafe { *x.add(2) } as *const u8;
+        unsafe { std::ptr::copy_nonoverlapping(slot, buf, n as usize) };
+        pending
+    }
+
+    #[test]
+    fn invoke_out_returns_the_bytes_the_callee_wrote() {
+        clear();
+        install(0x4321, |r| {
+            let slot = r[2] as *mut u32;
+            unsafe { slot.write(0x3fc0_0000) };
+            r[0] = 5;
+        });
+        let mut file = [0u64; 96];
+        let mut stack_slot = 0xdead_beefu32;
+        file[2] = &mut stack_slot as *mut u32 as u64;
+        let mut regs = unsafe { Regs::from_raw(file.as_mut_ptr()) };
+        let mut copy = [0u8; 4];
+        assert_eq!(regs.invoke_out(0x4321, &mut copy), Ok(5));
+        assert_eq!(u32::from_le_bytes(copy), 0x3fc0_0000);
     }
 
     #[test]
