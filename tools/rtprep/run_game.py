@@ -13,7 +13,20 @@ import sys
 BUILD = r"A:\AI\Recomps\smrpg-work\build"
 
 
+def gpu_busy():
+    """Percent GPU use right now, or None (task-48: other 3D work on the GPU makes runs crawl)."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return max(int(x) for x in out.split())
+    except Exception:
+        return None
+
+
 def run(a):
+    busy = gpu_busy()
+    if busy is not None and busy >= 30:
+        print(f"WARNING: GPU already {busy}% busy before the run; frame rate results may be invalid (task-48)")
     log = os.path.join(BUILD, "logs", a.log + ".log")
     exe = os.path.join(BUILD, "bin", "smrpg.exe")
     env = dict(os.environ)
@@ -40,6 +53,8 @@ def run(a):
             if n > 150:
                 print("... (more in log)")
                 break
+    busy_after = gpu_busy()
+    print("gpu busy before", busy, "after", busy_after)
     print("exit code", p.returncode, "log", log)
     return 0
 
