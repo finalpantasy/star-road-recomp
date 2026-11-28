@@ -627,6 +627,30 @@ Evidence is in `backlog/tasks/task-65.md`.
 
 Evidence is in `backlog/tasks/task-66.md`.
 
+## exec_koudou_kouka callees (task-67): nine small ones ported, a split plan
+
+`exec_koudou_kouka` (0x71021f6340, 4,193 lifted lines, 195 labels, three jump tables, an exception landing, a `List<T>` enumerator loop) is too big for one exact port. Task-67 works bottom-up. Its direct lifted callees, by state:
+
+- Ported before: `is_barriered` 0x71021c3bb0 (16 lines), `is_invincible` 0x71021bcb30 (16), `is_dead` 0x71021bdec0 (16), `use_damage_guard` 0x71021be280 (14), `calc_defence` 0x71021bc270 (79), `calc_attack` 0x71021c3ea0 (286), `set_acction_command_ratio` 0x71021f7ea0 (160). Traced rows already: `Int32.ToString` 0x710213a840 (112), `String.Concat` 0x71020147d0 (211), `GlobalWork.get_inst` 0x7101886a00 (151), 0x7101892aa0 (159), the enumerator current 0x7100183d20 (199), 0x71018fe040 (561), 0x7101b52040 (132), 0x71021bddd0 (92), 0x71021bde90 (38), 0x71021b7fb0 (13), the metadata helpers 0x71000c4090/4150/4330/44d0 (5 each), and the generated getters 0x71018bebc0, 0x71018fe030, 0x71018876b0, 0x71021b7fa0, 0x71021c3c20.
+- Ported now (`battle/exec_koudou_leaves.rs`, 9 rows): 0x71021be0f0 (12 lines, `_buff_mng._invincible_turn = 0`), 0x71021ba6d0 (22), 0x71021ba6a0 (28, with a collection safepoint), 0x71021be1f0 (40, `int[]` add with a bounds check), 0x71021bd6c0 (26, tail call), 0x71021be2f0 (9, tail), 0x71021c3c00 (18, tail), 0x71021c68c0 (12, tail), 0x71021bf040 (46, a call, a u16 copy, a tail call). Their callees became `PLEAF` rows: 0x71021be300, 0x7101c060b0, 0x71021c68d0, 0x7101c06250, 0x7101e22a40, 0x7101e30240.
+- Still lifted, now traced rows (`PLEAF`, so the next task sees live counts): 0x71021f76a0 (825 lines), 0x7101cd4790 (644), 0x71021f7b40 (585), 0x7101e30a60 (362), 0x7100185130 (320, `List<T>.MoveNext`), 0x7101c2e370 (229), 0x71021be470 (222), 0x71018bfbc0 (202), 0x7101b6b8b0 (156), 0x71021be5c0 (129), 0x71021b9c50 (107), 0x7101e287b0 (64), 0x7101b51870 (55), 0x7101e30400 (34), 0x71021ba3b0 (5, a tail into 0x71021ba3c0, a lazy-initialization helper), and seven rows of 12 to 16 lines (0x7101888880, 0x7101cd28f0, 0x710153a0f0, 0x710153a100, 0x710153a110, 0x71000ba3b0, 0x710003e500).
+
+The new rows are `BuffManager` accessors (`+0x28` is `_invincible_turn`): clear it, set byte +0x11 or +0x10 when it is not positive, add to an `int[]` element, and the tail-call loaders. A function that returns plainly writes no register (the lifted C writes `c->x[n]` only at calls, safepoints and the return), so only `add_buff_value`, `bf040` and the tails flush registers. `smrpg_guest_store` and the snapshot cells now handle 2-byte cells (`prestate::store_u16`).
+
+Live comparison inside a lifted caller. `exec_koudou_kouka` is a traced row run lifted inside the recording of `exec_each_targets`, so its callees are reached at depth 1 of that recording, where a replay row is normally run lifted and not compared. `swap.c` now has `is_deep_row` (the nine addresses): at depth 1 of a recording such a row is run as its own full replay comparison with the outer recording and journal parked (`run_nested_replay`), like the task-62 rows at depth 0. From any other caller the usual comparison runs. This path was not reached live in the battle route (see below), so it is covered by reading, not by a live count.
+
+Evidence. The battle route runs `exec_koudou_kouka` 15 times, but none of the nine rows was called (0 live calls in `ab` and `on`): its only traced calls on the route are the `is_invincible` tests (29 calls, two per run). The nine rows are proved by the startup selftest (25,625 calls each, 0 differences, with the `BuffManager` graph in `prepare_caller`) and by nine mutations, each caught at its own row. The probe rows show which of the larger callees the route reaches: 0x71021ba3b0 (2 calls), 0x71021b9c50 (2), 0x7101e287b0 (12), 0x7101b51870 (224), 0x7101b6b8b0 (232), 0x7101c2e370 (65), 0x7100185130 (357); these have other callers too, so the counts do not say how many come from `exec_koudou_kouka`.
+
+### Plan: splitting `exec_koudou_kouka`
+
+1. Port the prologue, the lazy initialization and the first loop (labels up to 0x71021f67d0: the `is_invincible` tests, the `_skill_obj` reads, a `skill_obj[+0x28] - 5 < 0x5b` range test) as one exact port with a pre-state hook that defers (returns 1, so the body is run lifted and not compared) whenever the arm it would select is not ported yet. This is the design that lets arms land one task at a time: the hook evaluates the selectors from the pre-state, the port covers the arms it knows, everything else is lifted and counted as deferred.
+2. Table 1 (`switch (x12)` at line 1028 of the lifted C, at least 31 distinct targets, lifted lines 1028 to 1988): split by arm; each arm is a method on `SkillExecter` keyed by its label, ported in groups by skill family. Arms share a tail (0x71021f7610, the epilogue).
+3. The enumerator loop (lines 1988 to 2220: `get_Current` 0x7100183d20, `MoveNext` 0x7100185130, the exception landing `eh_land` 0x7102bf169c to 0x7102bf16ef) as its own method with the exception case; table 2 (`switch (x9)`, 4 targets at line 2019) and its arms (lines 2220 to about 3990, the bulk of the 4,193 lines).
+4. Table 3 (`switch (x11)`, `skill_obj[+0x14] - 0x2d9 < 0x12`, 5 targets at line 4012) and the closing lines 4032 to 4193 (the 0x71018fe030 debug call, the logger store, the epilogue).
+5. Each step needs: the bigger traced callees ported first when an arm uses them (0x71021f76a0 and 0x71021f7b40 are the largest; both are unreached on this route), a route that reaches the arms (the battle route only reaches the `is_invincible` tests; another skill or enemy is needed for live counts, otherwise selftest graphs carry the proof), and the `deep` comparison path above checked live the first time an arm reaches a row of the set.
+
+Evidence is in `backlog/tasks/task-67.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

@@ -235,6 +235,7 @@ static __thread int tl_st_overflow;
 static uint64_t raw_load(uint64_t addr, unsigned size) {
     switch (size) {
     case 1: return __atomic_load_n((uint8_t *)(uintptr_t)addr, __ATOMIC_RELAXED);
+    case 2: return __atomic_load_n((uint16_t *)(uintptr_t)addr, __ATOMIC_RELAXED);   /* task-67 */
     case 4: return __atomic_load_n((uint32_t *)(uintptr_t)addr, __ATOMIC_RELAXED);
     default: return __atomic_load_n((uint64_t *)(uintptr_t)addr, __ATOMIC_RELAXED);
     }
@@ -243,6 +244,7 @@ static uint64_t raw_load(uint64_t addr, unsigned size) {
 static void raw_store(uint64_t addr, unsigned size, uint64_t value) {
     switch (size) {
     case 1: __atomic_store_n((uint8_t *)(uintptr_t)addr, (uint8_t)value, __ATOMIC_RELAXED); break;
+    case 2: __atomic_store_n((uint16_t *)(uintptr_t)addr, (uint16_t)value, __ATOMIC_RELAXED); break;   /* task-67 */
     case 4: __atomic_store_n((uint32_t *)(uintptr_t)addr, (uint32_t)value, __ATOMIC_RELAXED); break;
     default: __atomic_store_n((uint64_t *)(uintptr_t)addr, value, __ATOMIC_RELAXED); break;
     }
@@ -515,6 +517,19 @@ static int is_nested_row(uint64_t address) {
            address == 0x71021f8040ULL || address == 0x71021fe9d0ULL || address == 0x71021fee50ULL;
 }
 
+/* task-67: small callees of exec_koudou_kouka (a traced row run lifted inside exec_each_targets's recording). Reached from that lifted body (depth 1
+ * of the outer recording) each is run as its own full replay comparison with the outer recording and journal parked, like the rows above. Reached
+ * from any other lifted code they are compared normally (compare_replay). */
+static int is_deep_row(uint64_t address) {
+    switch (address) {
+    case 0x71021be0f0ULL: case 0x71021ba6d0ULL: case 0x71021ba6a0ULL: case 0x71021be1f0ULL: case 0x71021bd6c0ULL:
+    case 0x71021be2f0ULL: case 0x71021c3c00ULL: case 0x71021c68c0ULL: case 0x71021bf040ULL:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* task-62: damage_calc reached from the lifted body of a row that records its callees (exec_each_targets, its only caller) is one
  * recorded call of that body, run as its own replay comparison with the outer recording and journal parked: the outer port
  * bridges the call, the driver's port is still compared against the lifted driver at the moment of the call. */
@@ -553,7 +568,10 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
     }
     if (__builtin_expect(is_nested_row(leaf->address), 0))
         nested_replay = tl_rec && !tl_replay && tl_depth == 0 && tl_nest == 0;
-    if (leaf->probe || nested_replay) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
+    int deep_replay = 0;
+    if (__builtin_expect(is_deep_row(leaf->address), 0))
+        deep_replay = tl_rec && !tl_replay && tl_depth == 1 && tl_nest == 0 && !tl_stub;
+    if (leaf->probe || nested_replay || deep_replay) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
         if (mode == AB && leaf->probe) atomic_fetch_add(&leaf->calls, 1);
         Recording *r = tl_rec;
         if (r && tl_depth == 0) {
@@ -590,7 +608,8 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
             }
         } else if (r) {   /* nested inside a recorded callee */
             ++tl_depth;
-            run_traced(leaf, c);
+            if (deep_replay) run_nested_replay(leaf, c);
+            else run_traced(leaf, c);
             --tl_depth;
         } else {
             run_traced(leaf, c);
@@ -1781,6 +1800,53 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->x[0] = base;
         break;
     }
+    case 0x71021be0f0ULL:   /* task-67: small callees of exec_koudou_kouka. The param graph: +0x28 -> a cell, +0x98 status manager (+0x10 _status), */
+    case 0x71021ba6d0ULL:   /* +0xa0 buff manager (flag bytes +0x10, +0x11, u16 +0x12, +0x18 -> int[] with length +0x18 and elements +0x20, */
+    case 0x71021ba6a0ULL:   /* _invincible_turn +0x28), all inside the private region. */
+    case 0x71021be1f0ULL:
+    case 0x71021bd6c0ULL:
+    case 0x71021be2f0ULL:
+    case 0x71021bf040ULL: {
+        fill_fake_region(fake, 64, state);
+        unsigned char *bytes = (unsigned char *)fake;
+        fake[0x28 / 8] = base + 8 * 50;
+        fake[0x98 / 8] = base + 8 * 24;
+        fake[0xa0 / 8] = base + 8 * 30;
+        fake[30 + 3] = base + 8 * 40;
+        static const uint32_t turns[] = {0, 0, 1, 2, 0xffffffffu, 0x80000000u, 0x7fffffffu, 5, 0xfffffffeu};
+        static const uint32_t statuses[] = {5, 5, 3, 0, 0x105, 4, 6, 0x80000005u};
+        uint32_t turn = turns[(pick >> 8) % RT_ARRAY_LEN(turns)];
+        uint32_t status = statuses[(pick >> 16) % RT_ARRAY_LEN(statuses)];
+        uint32_t length = (uint32_t)((pick >> 24) % 9);   /* up to 8 ints at words 44..47 */
+        memcpy(bytes + 8 * 30 + 0x28, &turn, 4);
+        memcpy(bytes + 8 * 24 + 0x10, &status, 4);
+        memcpy(bytes + 8 * 40 + 0x18, &length, 4);
+        if (address == 0x71021be1f0ULL) {   /* index: mostly in range, sometimes at, past or far past the length */
+            uint64_t index_pick = random_word(state);
+            static const uint64_t outside[] = {0, 1, 0xffffffffULL, 0x80000000ULL, 0xdead000000000000ULL};
+            uint64_t index = length ? (index_pick >> 8) % length : 0;
+            switch ((index_pick >> 4) & 7) {
+            case 0: index = length; break;
+            case 1: index = (uint64_t)length + 1 + ((index_pick >> 40) & 3); break;
+            case 2: index = outside[(index_pick >> 40) % RT_ARRAY_LEN(outside)]; break;
+            case 3: index |= (index_pick & 0xffffffff00000000ULL); break;   /* the high word is ignored */
+            default: break;
+            }
+            c->x[1] = index;
+        }
+        c->x[0] = base;
+        break;
+    }
+    case 0x71021c3c00ULL:   /* x0 -> +0x30 -> an object with a word at +0x10; x1 random */
+        fill_fake_region(fake, 64, state);
+        fake[0x30 / 8] = base + 8 * 10;
+        c->x[0] = base;
+        break;
+    case 0x71021c68c0ULL:   /* x1 and x2 -> objects with a word at +0x10 */
+        fill_fake_region(fake, 64, state);
+        c->x[1] = base + 8 * 10;
+        c->x[2] = base + 8 * 20;
+        break;
     case 0x71021be280ULL: { /* Battle.BattleCharacterParam.use_damage_guard (task-56): param +0xb8 -> logger, flag byte at +0x49 */
         fill_fake_region(fake, 64, state);
         unsigned char *bytes = (unsigned char *)fake;

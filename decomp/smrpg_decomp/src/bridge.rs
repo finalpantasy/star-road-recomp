@@ -159,6 +159,11 @@ pub mod prestate {
         unsafe { smrpg_guest_store(addr, 1, u64::from(value)) }
     }
 
+    /// A two-byte store (a short field), journaled the same way (task-67).
+    pub fn store_u16(addr: u64, value: u16) {
+        unsafe { smrpg_guest_store(addr, 2, u64::from(value)) }
+    }
+
     /// A four-byte store (a float or int field), journaled the same way.
     pub fn store_u32(addr: u64, value: u32) {
         unsafe { smrpg_guest_store(addr, 4, u64::from(value)) }
