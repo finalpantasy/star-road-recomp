@@ -574,6 +574,20 @@ What stays unproved: the port reads the three flag bytes, the target and the log
 
 Evidence is in `backlog/tasks/task-62.md`.
 
+## exec_each_targets callees (task-63): three of the seven ported
+
+Three callees of `exec_each_targets` are in `decomp/smrpg_decomp/src/battle/exec_steps.rs`, each a `QLEAF` replay row with a pre-state hook: `BattleCharacterParam.got_physics_attack` (0x71021bdef0, 122 lifted lines), `SkillExecter.resister_thank_you_message` (0x7102200060, 140) and `SkillExecter.heal_calc` (0x71021fff20, 203). Still lifted: `is_hit_calc_succeed` (0x71021fe9d0, 816 lines), `skill_calc_exception` (0x71021f8040, 514), `exec_calc_type` (0x71021fee50, 1136) and `exec_koudou_kouka` (0x71021f6340, 4193).
+
+- `got_physics_attack`: returns unless `_badstatus_mng._status == 3`; otherwise a logger setter (+0x60), a string literal lookup, a debug call and a tail call into the empty debug writer. Its lazy-initialization arm (two `initialize_runtime_metadata` calls and the flag store) is ported and compared (the hook snapshots the two slots it passes to the initializer), so the hook never defers.
+- `resister_thank_you_message`: for `_skill_obj._skill_type == 3` and a true acter/target check, the `BattleManager` class and static-field lazy initialization (class word, flag byte, metadata, three GC polls) and `_instance.<+0x48>.<+0x38> |= 2`. The hook defers the first run of a process (flag byte clear: the class cell is still a token).
+- `heal_calc`: `heal = Math.Max(_tmp_value, 1)`, `set_acction_command_ratio` through its own shim (`Frame::call_port`; the hook calls its hook), `heal = 0` plus a debug line from skill id 1000 on, stores `_target._result_logger` +0x28 (heal) and +0x2c (1), then a debug line built from `heal.ToString()` (the `OLEAF` `Int32.ToString` with the 4-byte stack cell). The int cell is journaled like the damage cell of `damage_calc`. Defers the first run of a process.
+
+How they are compared live. These rows are reached only from `exec_each_targets`'s lifted body, which `ab` mode records. `swap.c` generalizes the task-62 rule for `damage_calc` to a set (`is_nested_row`: damage_calc and these three): a row of the set reached at depth 0 of a recording is recorded as one call of the outer body and compared on its own (`run_nested_replay`: own call buffer, journal and pre-state). `exec_each_targets` therefore still calls them through the bridge (`Frame::call`, which reaches the row entry, so in `on` mode it is the Rust port and in `ab` mode the nested comparison), not through `call_port`. That keeps a live count and a difference count per function, which `call_port` (the lifted callee unrecorded, its callees recorded into the outer row) would not. `heal_calc`'s nested `set_acction_command_ratio` is the other way round (it is not in the set), as in `damage_calc`.
+
+New traced rows (`PLEAF`): 0x71021f7690 (logger setter), 0x71018bfa40 (string literal lookup), 0x71021c3a20 (acter/target check). New selftest graphs for the three rows in `prepare_caller`, with the flag bytes and seven slots saved and restored (`t63_save_globals`). `bridge.rs` test fake: `fake_guest_bl_out` takes the slot pointer from x0 when x2 is zero and reads it before the fake runs.
+
+Evidence is in `backlog/tasks/task-63.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

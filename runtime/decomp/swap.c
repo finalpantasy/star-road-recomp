@@ -506,6 +506,12 @@ static void note_damage_calc(const Ctx *c) {
     atomic_fetch_add(&rule_calls[slot], 1);
 }
 
+/* task-63: the replay rows exec_each_targets (the caller) reaches: damage_calc (task-62) and the three callees ported since. Each is
+ * recorded as one call of the caller's body and compared on its own when it is reached from that body. */
+static int is_nested_row(uint64_t address) {
+    return address == 0x71021ff580ULL || address == 0x71021fff20ULL || address == 0x71021bdef0ULL || address == 0x7102200060ULL;
+}
+
 /* task-62: damage_calc reached from the lifted body of a row that records its callees (exec_each_targets, its only caller) is one
  * recorded call of that body, run as its own replay comparison with the outer recording and journal parked: the outer port
  * bridges the call, the driver's port is still compared against the lifted driver at the moment of the call. */
@@ -541,8 +547,9 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
     int nested_replay = 0;
     if (__builtin_expect(leaf->address == 0x71021ff580ULL, 0)) {
         note_damage_calc(c);
-        nested_replay = tl_rec && !tl_replay && tl_depth == 0 && tl_nest == 0;
     }
+    if (__builtin_expect(is_nested_row(leaf->address), 0))
+        nested_replay = tl_rec && !tl_replay && tl_depth == 0 && tl_nest == 0;
     if (leaf->probe || nested_replay) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
         if (mode == AB && leaf->probe) atomic_fetch_add(&leaf->calls, 1);
         Recording *r = tl_rec;
@@ -712,7 +719,7 @@ int smrpg_guest_bl(uint64_t *x, uint64_t target) {
     Ctx *c = (Ctx *)(void *)x;   /* Ctx.x is the first member: the Rust side holds a pointer to the register file */
     if (tl_replay) {
         for (int i = 0; i < leaf_count; ++i)
-            if ((leaves[i].probe || target == 0x71021ff580ULL) && leaves[i].address == target) return replay_call(tl_replay, c, target);   /* task-62: damage_calc is recorded by exec_each_targets */
+            if ((leaves[i].probe || is_nested_row(target)) && leaves[i].address == target) return replay_call(tl_replay, c, target);   /* task-62/63: the replay rows exec_each_targets records */
     }
     if (mode == AB && !callee_is_pure(target)) {
         rt_log("decomp bridge: ab mode, callee %#llx is not on the pure allowlist (it would run twice)", (unsigned long long)target);
@@ -962,6 +969,26 @@ static void restore_driver_globals(void) {
     tl_stub_instance = tl_stub_new = tl_stub_current = 0;
 }
 
+/* got_physics_attack, resister_thank_you_message and heal_calc (task-63): three flag bytes and seven metadata slots (data page + offset),
+ * pointed at private cells for the selftest of any of the three and restored after it. */
+static const uint64_t t63_flag_address[3] = {0x7103cba000ULL + 0xbef, 0x7103cba000ULL + 0xd6c, 0x7103cba000ULL + 0xd72};
+static const uint64_t t63_slot_address[7] = {0x7103a82000ULL + 0x900, 0x7103a68000ULL + 0x978, 0x7103a57000ULL + 0xe48, 0x7103a58000ULL + 0x1d0,
+                                             0x7103a46000ULL + 0xa90, 0x7103a83000ULL + 0xbd0, 0x7103a83000ULL + 0xbd8};
+static uint64_t t63_saved[10];
+static int t63_have_saved;
+static void t63_save_globals(void) {
+    if (t63_have_saved) return;
+    for (int i = 0; i < 3; ++i) t63_saved[i] = *(volatile uint8_t *)(uintptr_t)t63_flag_address[i];
+    for (int i = 0; i < 7; ++i) t63_saved[3 + i] = *(uint64_t *)(uintptr_t)t63_slot_address[i];
+    t63_have_saved = 1;
+}
+static void restore_t63_globals(void) {
+    if (!t63_have_saved) return;
+    for (int i = 0; i < 3; ++i) *(volatile uint8_t *)(uintptr_t)t63_flag_address[i] = (uint8_t)t63_saved[i];
+    for (int i = 0; i < 7; ++i) *(uint64_t *)(uintptr_t)t63_slot_address[i] = t63_saved[3 + i];
+    t63_have_saved = 0;
+}
+
 static void restore_belome_globals(void) {
     if (!belome_have_saved) return;
     *(volatile uint8_t *)(uintptr_t)(0x7103cba000ULL + 0xd5d) = (uint8_t)belome_saved[0];
@@ -1181,6 +1208,90 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         uint32_t id = ids[(r >> 48) % RT_ARRAY_LEN(ids)];
         memcpy(bytes + 8 * 16 + 0x20, &id, 4);
         c->x[0] = base;
+        break;
+    }
+    case 0x71021bdef0ULL: { /* Battle.BattleCharacterParam.got_physics_attack (task-63): the target (+0x98 status manager with +0x10 _status, +0xb8 result
+                             * logger), the lazy-initialization flag byte (clear one time in sixteen) and the two metadata slots, pointed at private cells
+                             * and restored after the row. */
+        static uint64_t region[96];
+        t63_save_globals();
+        fill_fake_region(region, 96, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        #define WORD(n) (rb + 8 * (n))
+        static const uint32_t statuses[] = {3, 3, 3, 3, 3, 0, 1, 2, 4, 5, 8, 9, 0xffffffffu, 0x80000003u, 7, 0x100};
+        region[0x98 / 8] = WORD(24);
+        region[0xb8 / 8] = WORD(40);
+        uint32_t v = statuses[(pick >> 8) % RT_ARRAY_LEN(statuses)];
+        memcpy(bytes + 8 * 24 + 0x10, &v, 4);
+        *(uint64_t *)(uintptr_t)t63_slot_address[0] = WORD(70);     /* slot A: the pointer the tail call loads */
+        *(uint64_t *)(uintptr_t)t63_slot_address[1] = WORD(60);     /* slot B: the string literal cell */
+        *(volatile uint8_t *)(uintptr_t)t63_flag_address[0] = ((pick >> 20) & 15) == 0 ? 0 : (((pick >> 24) & 7) == 0 ? 0x81 : 1);
+        #undef WORD
+        c->x[0] = rb;
+        break;
+    }
+    case 0x7102200060ULL: { /* Battle.SkillExecter.resister_thank_you_message (task-63): the executer (+0x20 acter, +0x28 target, +0x30 skill object with
+                             * +0x3c _skill_type), the BattleManager class cell (class +0xb8 statics, +0xe0 initialized word; statics +0x10 instance; instance
+                             * +0x48 object with the +0x38 int), the static-field byte, the lazy-initialization flag (clear one time in sixteen) and the slots. */
+        static uint64_t region[140];
+        t63_save_globals();
+        fill_fake_region(region, 140, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        #define WORD(n) (rb + 8 * (n))
+        static const uint32_t types[] = {3, 3, 3, 3, 3, 0, 1, 2, 4, 5, 13, 0xffffffffu, 0x80000003u, 7};
+        region[6] = WORD(20);
+        uint32_t v = types[(pick >> 8) % RT_ARRAY_LEN(types)];
+        memcpy(bytes + 8 * 20 + 0x3c, &v, 4);
+        region[30] = WORD(40);                                   /* the class cell holds the class */
+        v = ((pick >> 16) & 3) == 0 ? 0 : (uint32_t)(random_word(state) | 1);
+        memcpy(bytes + 8 * 40 + 0xe0, &v, 4);                    /* class initialized word: zero one time in four */
+        region[40 + 0xb8 / 8] = WORD(70);                        /* statics */
+        region[70 + 2] = WORD(80);                               /* _instance */
+        region[80 + 9] = WORD(90);                               /* +0x48 object */
+        bytes[8 * 100] = ((pick >> 20) & 3) == 0 ? 0 : (((pick >> 22) & 7) == 0 ? 0x80 : 1);   /* the static-field byte */
+        *(uint64_t *)(uintptr_t)t63_slot_address[2] = WORD(30);
+        *(uint64_t *)(uintptr_t)t63_slot_address[3] = WORD(100);
+        *(volatile uint8_t *)(uintptr_t)t63_flag_address[1] = ((pick >> 28) & 15) == 0 ? 0 : 1;
+        #undef WORD
+        c->x[0] = rb;
+        break;
+    }
+    case 0x71021fff20ULL: { /* Battle.SkillExecter.heal_calc (task-63): the executer (+0x10 monitor, +0x18 result record, +0x20 acter, +0x28 target, +0x30 skill
+                             * object with +0x14 _skill_id, +0x40 _tmp_value), the target's result logger (+0x28 and +0x2c are stored), the System.Math class cell,
+                             * the string slots, the lazy-initialization flag (clear one time in sixteen); the nested set_acction_command_ratio runs on the
+                             * same graph (result record, acter +0x6c byte, skill object). */
+        static uint64_t region[200];
+        t63_save_globals();
+        fill_fake_region(region, 200, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        #define WORD(n) (rb + 8 * (n))
+        region[3] = WORD(64);
+        region[4] = WORD(56);
+        region[5] = WORD(16);
+        region[6] = WORD(48);
+        region[16 + 0xb8 / 8] = WORD(100);
+        static const uint32_t tmp_values[] = {0, 1, 2, 3, 7, 100, 9999, 0xffffffffu, 0xfffffff9u, 0x7fffffffu, 0x80000000u, 0x80000001u, 0x55555555u};
+        uint64_t r = random_word(state);
+        uint32_t v = (r & 7) == 0 ? (uint32_t)(r >> 8) : tmp_values[(r >> 8) % RT_ARRAY_LEN(tmp_values)];
+        memcpy(bytes + 0x40, &v, 4);
+        static const uint32_t skill_ids[] = {1, 0x2d7, 727, 999, 1000, 1001, 1002, 0x7fffffffu, 0x80000000u, 0x80000001u, 0xffffffffu, 0, 103, 104, 0x2c3, 0x100};
+        r = random_word(state);
+        v = (r & 3) == 0 ? (uint32_t)(r >> 8) : skill_ids[(r >> 8) % RT_ARRAY_LEN(skill_ids)];
+        memcpy(bytes + 8 * 48 + 0x14, &v, 4);
+        static const unsigned char flags[] = {0, 0, 1, 1, 2, 0x80, 0xff};
+        bytes[8 * 56 + 0x6c] = flags[(pick >> 8) % RT_ARRAY_LEN(flags)];
+        region[120] = WORD(130);                                 /* the class cell holds the class */
+        v = ((pick >> 16) & 3) == 0 ? 0 : (uint32_t)(random_word(state) | 1);
+        memcpy(bytes + 8 * 130 + 0xe0, &v, 4);                   /* class initialized word: zero one time in four */
+        *(uint64_t *)(uintptr_t)t63_slot_address[4] = WORD(120);
+        *(uint64_t *)(uintptr_t)t63_slot_address[5] = WORD(140);
+        *(uint64_t *)(uintptr_t)t63_slot_address[6] = WORD(150);
+        *(volatile uint8_t *)(uintptr_t)t63_flag_address[2] = ((pick >> 28) & 15) == 0 ? 0 : 1;
+        #undef WORD
+        c->x[0] = rb;
         break;
     }
     case 0x71021ff580ULL: { /* Battle.SkillExecter.damage_calc (task-60): the executer (+0x10 monitor, +0x20 acter, +0x28 target, +0x30 skill object,
@@ -1590,6 +1701,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     restore_renkei_globals();
     restore_group_globals();
     restore_driver_globals();
+    restore_t63_globals();
     atomic_store(&leaf->deferred, 0);
     unsigned long long calls = atomic_exchange(&leaf->calls, 0);
     unsigned long long differences = atomic_exchange(&leaf->differences, 0);

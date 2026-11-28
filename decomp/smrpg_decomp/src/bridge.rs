@@ -554,8 +554,10 @@ pub(crate) mod tests {
     /// Stands in for `smrpg_guest_bl_out`: the installed fake runs, and the bytes it writes to the slot at `x2`
     /// (the pointer register of the test row) come back in `buf`.
     pub unsafe fn fake_guest_bl_out(x: *mut u64, target: u64, buf: *mut u8, n: u32) -> i32 {
+        // task-63: a row whose out pointer is x0 (`Int32.ToString` in `heal_calc`) leaves x2 zero; read it before the fake runs
+        let pointer = unsafe { *x.add(2) };
+        let slot = (if pointer == 0 { unsafe { *x } } else { pointer }) as *const u8;
         let pending = unsafe { fake_guest_bl(x, target) };
-        let slot = unsafe { *x.add(2) } as *const u8;
         unsafe { std::ptr::copy_nonoverlapping(slot, buf, n as usize) };
         pending
     }
