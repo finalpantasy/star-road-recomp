@@ -352,9 +352,10 @@ impl Regs {
 
     /// The lifted safepoint where the code flushes several registers when a collection is pending.
     pub fn safepoint_n(&mut self, pc: u64, flushed: &[(u32, u64)]) {
-        let regs: [u32; 4] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.0));
-        let values: [u64; 4] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.1));
-        assert!(flushed.len() <= 4);
+        // task-70: up to 12 registers (the first loop of exec_koudou_kouka flushes nine at one poll)
+        let regs: [u32; 12] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.0));
+        let values: [u64; 12] = core::array::from_fn(|i| flushed.get(i).map_or(0, |f| f.1));
+        assert!(flushed.len() <= 12);
         unsafe {
             smrpg_guest_safepoint_n(
                 self.x,
