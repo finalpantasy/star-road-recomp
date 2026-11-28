@@ -697,3 +697,45 @@ Cause of the remaining variance (12 or 16 `exec_each_targets` calls): the virtua
 Why not "port the head, run the rest lifted": a Rust port cannot hand control to the middle of a lifted body. So the port is exact only for calls whose skill type does not take jump table 1 (`type - 5` above 0x5a, which goes straight to the epilogue). The hook returns 1 (deferred, counted, lifted body alone, nothing compared) for a table type, a clear lazy-initialization flag, any null link on the path, a zero literal cell, and a type at or past the list length (the lifted code calls the IndexOutOfRange thrower, which the selftest stand-in does not model). In `on` mode the port starts by running the whole lifted body for a table type (`run_lifted`), so the game behaves the same. Table-1 arms and everything after stay lifted; the live summary reports the compared and deferred shares.
 
 Details a later step needs: after a nested call the lifted code reloads more than x0, x1 and v0 to v3 at some sites (x2 and x8 after `bd6c0`, x8 after `get_value`, `is_barriered`, x8 and x9 after `use_damage_guard`); the port reloads the same registers, found by reading the raw lifted C per call site. `bridge::safepoint_n` now takes up to 12 registers. The row runs as its own nested replay (`is_nested_row`), so the ported callees (`bd6c0`, `use_damage_guard`) go through their shims inside the port. The selftest graph (`swap.c`, case 0x71021f6340) generates only types the port compares (0 to 4 and 0x60 to 0x6f, lists of 0x80 or more), because a deferred call runs lifted on that stand-in graph, which is not built for table types.
+
+## exec_koudou_kouka table 1, first arms (task-72)
+
+`exec_koudou_head.rs` now dispatches table 1 (`switch (x12)`, lifted C lines 61825 to 64800 of `main_0378.c`; halfword entries at 0x7102b04ef0, `target = 0x71021f6800 + 4 * entry`, indexed by `type - 5`, 0x5b entries). The 31 targets, from the table bytes, with the lifted lines reachable from each (labels shared with other arms counted once) and its callees:
+
+| Target | Types | Lines | Callees | State |
+|---|---|---|---|---|
+| 0x71021f7610 (epilogue) | 52 types: 0x14 0x16 0x1a to 0x1b 0x1d 0x1f to 0x22 0x24 to 0x2c 0x2e 0x30 to 0x3b 0x3d to 0x45 0x47 to 0x49 0x4b 0x53 0x58 to 0x5e | 0 | none | ported |
+| 0x71021f7618 | 0x12 | 0 | none | ported |
+| 0x71021f6800 | 0xb to 0x10 | 10 | none | ported, reached by `bwf` (type 0xe) |
+| 0x71021f6840 | 0x15 0x19 0x46 | 3 | none | ported |
+| 0x71021f6928 | 0x4a | 5 | none | ported |
+| 0x71021f68e8 | 0x50 | 38 | `ba6d0` | ported |
+| 0x71021f68f4 | 8 | 34 | `ba6d0` | ported |
+| 0x71021f6aa0 | 7, 9 | 32 | `ba6a0` | ported |
+| 0x71021f6ad0 | 5 | 59 | 0x71021b7fb0 getter | ported |
+| 0x71021f6b28 | 6 | 38 | 0x71021b7fa0 getter | ported |
+| 0x71021f6884 | 0x11, 0x54 | 122 | `7101e30400`, `is_invincible`, `use_damage_guard`, `is_barriered`, debug write | lifted (small, next) |
+| 0x71021f68bc | 0x55 | 152 | debug write, `String.Concat`, `Int32.ToString`, `is_invincible`, `use_damage_guard`, `is_barriered`, 0x71021b7fb0 | lifted |
+| 0x71021f6904 | 0x5f | 121 | `is_barriered`, `use_damage_guard`, `be2f0`, 0x71021f7ea0 | lifted |
+| 0x71021f6938 | 0x1c | 135 | class init, `get_inst`, 0x7101c2e370, 0x71021be470, 0x71021be5c0 | lifted |
+| 0x71021f6960 | 0x51 | 59 | 0x71021b7fb0, `is_dead` | lifted |
+| 0x71021f6994 | 0x18 | 24 | 0x71021f76a0 (825 lines) | lifted |
+| 0x71021f69a0 | 0x1e | 24 | 0x71021f7b40 (585 lines) | lifted |
+| 0x71021f69ac | 0x3c | 30 | `c68c0` | lifted |
+| 0x71021f69c0 | 0x4c | 102 | metadata init | lifted |
+| 0x71021f69fc | 0x2d | 55 | 0x7101cd4790 (644 lines), `be0f0` | lifted |
+| 0x71021f6a48 | 0x4d | 114 | debug write, `String.Concat`, `Int32.ToString`, `ba6a0` | lifted |
+| 0x71021f6ac0 | 0x4f | 27 | 0x7101888880 | lifted |
+| 0x71021f6b60 | 0x23 | 26 | 0x7101cd28f0 | lifted |
+| 0x71021f6b70 | 0x56 | 204 | 11 callees incl. `bf040`, `c3c00`, 0x71018fe040 | lifted |
+| 0x71021f6ca0 | 0xa | 71 | `is_invincible`, `use_damage_guard`, `is_barriered` | lifted (small, next) |
+| 0x71021f6ce0 | 0x2f | 899 | 16 callees, the `List<T>` enumerator | lifted |
+| 0x71021f6d30 | 0x4e | 191 | 10 callees | lifted |
+| 0x71021f6e0c | 0x52 | 170 | `calc_defence`, `calc_attack`, debug | lifted |
+| 0x71021f6ed4 | 0x13 | 38 | 0x7101c2e370 | lifted |
+| 0x71021f6f10 | 0x17 | 53 | `ba6a0`, `ba6d0` | lifted |
+| 0x71021f75b0 | 0x57 | 54 | `be1f0` plus table 3 | lifted |
+
+Route `bwf` reaches table 1 once per run, with type 0xe (target 0x71021f6800, found with a temporary log in the hook, removed); every other call is outside the table or the first call of the process (lazy initialization). Ported now: the ten targets marked ported above (69 of the 91 table entries by type, the one the route reaches, the types 5 to 9 family, and the 0x50 and 0x4a arms). The port dispatches like the lifted code (`x10 = type - 5`, `x11` the table, `x13` the halfword, `x12` the target, `x9 = 9`) because the arms' call sites flush `x9` to `x13`. The hook defers only when the table target is not one of the ported labels (and for null result object, buff or status managers, or getter object); it snapshots the cells the arms store, the `this +0x44` byte (read by the barrier branch before the arm stores it) and the nested `ba6a0` or `ba6d0` pre-state. The 0x12 and 0x15 arms enter the epilogue store directly (`w9` is 9 or 1, no `x19` test). No arm needed a large callee: the two getters (13 lines each) run lifted inside the port. Left for the next step: 0x71021f6884 and 0x71021f6ca0 (only small callees, all already rows), then arms with the 0x71021f76a0 and 0x71021f7b40 callees.
+
+Selftest graph (`swap.c` case 0x71021f6340): types now include the ported arms, with the result object (+0x18), the getter object (target +0x28), skill object +0x14 and the status manager's +0x10 built (`calls=25625 differences=0`). Evidence, mutations and run counts: `backlog/tasks/task-72.md`.

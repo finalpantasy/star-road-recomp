@@ -23,26 +23,40 @@
 //!         }
 //!     } else skipped = false;
 //!     if (last != 0) _target.result_logger.<+0x60> = last;
-//!     if (_skill_obj._type - 5 <= 0x5a) goto <jump table 1>;         // not ported: the whole call runs lifted
-//!     if (last != 0) _target.result_logger.<+0x60> = last;           // the epilogue's own store
+//!     switch (_skill_obj._type) {                                    // table 1 (task-72): `Arm`, ported arms only
+//!         case <outside 5..=0x5f>, <the 52 types whose target is the epilogue>: break;
+//!         case 0xb..=0x10: if (skipped) logger.<+0x40> = 1; this._flag_44 = false; break;
+//!         case 0x12: logger.<+0x60> = 9; return;  case 0x15, 0x19, 0x46: logger.<+0x60> = 1; return;
+//!         case 0x4a: _result.<+0x24> = 1; break;
+//!         case 0x50: _result.<+0x24> = 1; goto case 8;
+//!         case 8: _target.<ba6d0>(); _result.<+0x38> |= 8; break;    // 7 and 9: <ba6a0>, |= 4
+//!         case 5: <halved or plain getter value, two marks>;  case 6: <getter value, mode 3, a byte>;
+//!         default: <lifted: the whole call runs in the lifted body>
+//!     }
+//!     if (last != 0) _target.result_logger.<+0x60> = last;           // the epilogue's own store (not for 0x12, 0x15, ...)
 //! }
 //! ```
 //!
-//! The port covers every path that leaves through the epilogue at 0x71021f7610 without entering the compiled jump table
-//! (`_skill_obj._type - 5` above 0x5a). A call that would take the table is run lifted: in `ab` mode the pre-state hook
-//! returns 1 (deferred, counted, the lifted body runs alone and nothing is compared); in `on` mode the port starts with
-//! the same test and hands the untouched register file to the lifted body (`Regs::run_lifted`). A bounds failure of the
-//! list index (the lifted code calls the IndexOutOfRange thrower, which never returns) is deferred in `ab` mode too: the
-//! selftest's stand-in callee returns where the real one throws, so it cannot be compared there.
+//! The port covers every path that leaves through one of those arms. A call whose arm is not ported is run lifted: in `ab`
+//! mode the pre-state hook returns 1 (deferred, counted, the lifted body runs alone and nothing is compared); in `on` mode
+//! the port starts with the same test and hands the untouched register file to the lifted body (`Regs::run_lifted`). The
+//! table entry is read from the guest's table (halfwords at 0x7102b04ef0, units of 4 bytes from 0x71021f6800). A bounds
+//! failure of the list index (the lifted code calls the IndexOutOfRange thrower, which never returns) is deferred in `ab`
+//! mode too: the selftest's stand-in callee returns where the real one throws, so it cannot be compared there.
 //!
 //! The function keeps the lifted register residue (see `Frame`): each call site writes the register list the lifted C
 //! writes there, and the stack stores of the frame (dead locals, never read on these paths) are not journaled.
 
 use super::damage::{SkillExecter, smrpg_param_use_damage_guard, smrpg_param_use_damage_guard_pre};
-use super::exec_koudou_leaves::smrpg_param_bd6c0;
+use super::exec_koudou_leaves::{
+    smrpg_param_bd6c0, smrpg_param_flag_10, smrpg_param_flag_10_pre, smrpg_param_flag_11,
+    smrpg_param_flag_11_pre,
+};
 use super::frame::Frame;
 use super::{GuestException, GuestObject, Regs};
 use crate::bridge::prestate;
+#[cfg(not(test))]
+use crate::guest_ld16;
 use crate::{guest_ld8, guest_ld32, guest_ld64};
 
 /// The function this port heads.
@@ -63,6 +77,11 @@ mod callee {
     pub const IS_BARRIERED: u64 = 0x71021c3bb0;
     pub const BD6C0: u64 = 0x71021bd6c0;
     pub const USE_DAMAGE_GUARD: u64 = 0x71021be280;
+    pub const FLAG_10: u64 = 0x71021ba6a0;
+    pub const FLAG_11: u64 = 0x71021ba6d0;
+    /// Getters of the target: `[[x0 + 0x28] + 0x10]` and `[[x0 + 0x28] + 0x18]`.
+    pub const GETTER_10: u64 = 0x71021b7fb0;
+    pub const GETTER_18: u64 = 0x71021b7fa0;
 }
 
 mod cells {
@@ -129,6 +148,18 @@ mod field {
     pub const TARGET: u64 = 0x28;
     pub const SKILL_OBJ: u64 = 0x30;
     pub const FLAG_44: u64 = 0x44;
+    /// The result object (`this + 0x18`): byte +0x24, flag word +0x38.
+    pub const RESULT_OBJECT: u64 = 0x18;
+    pub const RESULT_BYTE_24: u64 = 0x24;
+    pub const RESULT_FLAGS_38: u64 = 0x38;
+    /// `_skill_obj` field the type 5 arm compares with 0x7f.
+    pub const SKILL_FIELD_14: u64 = 0x14;
+    /// Logger cells the arms store.
+    pub const LOGGER_VALUE_28: u64 = 0x28;
+    pub const LOGGER_MODE_2C: u64 = 0x2c;
+    pub const LOGGER_MARK_40: u64 = 0x40;
+    pub const LOGGER_BYTE_41: u64 = 0x41;
+    pub const LOGGER_BYTE_45: u64 = 0x45;
     /// `_skill_obj`: the type that indexes the list and the jump table.
     pub const SKILL_TYPE: u64 = 0x28;
     /// The acter's byte the debug block tests.
@@ -226,9 +257,69 @@ fn skill_type(this: u64) -> Option<u32> {
     }
 }
 
-/// True when the type takes the compiled jump table (the part that stays lifted).
-fn takes_table(skill_type: u32) -> bool {
-    skill_type.wrapping_sub(5) <= TABLE_RANGE
+/// The arms of the compiled jump table (table 1) that are ported, named by the label they sit at and by what they do.
+/// Every other table target stays in the lifted body (the pre-state hook defers it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arm {
+    /// 0x71021f7610: the common epilogue (also the target of every type outside the table).
+    Epilogue,
+    /// 0x71021f7618: the epilogue's logger store, entered with `w9` as the dispatch left it (9).
+    StoreNine,
+    /// 0x71021f6840: `w9 = 1`, then the epilogue's logger store.
+    StoreOne,
+    /// 0x71021f6800: mark the logger when the loop skipped, clear `_flag_44`.
+    ClearFlag,
+    /// 0x71021f6928: the result object's byte +0x24 = 1.
+    ResultByte,
+    /// 0x71021f68e8: `ResultByte`, then `Guard11`.
+    ResultByteGuard11,
+    /// 0x71021f68f4: `ba6d0` on the target, then `result +0x38 |= 8`.
+    Guard11,
+    /// 0x71021f6aa0: `ba6a0` on the target, then `result +0x38 |= 4`.
+    Guard10,
+    /// 0x71021f6ad0 (type 5): half of a getter value, or the value itself, into the logger.
+    Half,
+    /// 0x71021f6b28 (type 6): a getter value into the logger.
+    Plain,
+}
+
+/// The table's code base (`adr x12`), its halfword entries, and the entry for a type.
+const TABLE_CODE: u64 = 0x71021f6800;
+const TABLE_DATA: u64 = 0x7102b04ef0;
+
+#[cfg(not(test))]
+fn table_entry(index: u32) -> u16 {
+    unsafe { guest_ld16(TABLE_DATA.wrapping_add(u64::from(index) << 1)) }
+}
+
+#[cfg(test)]
+fn table_entry(index: u32) -> u16 {
+    tests::fake_entry(index)
+}
+
+fn arm_at(target: u64) -> Option<Arm> {
+    Some(match target {
+        0x71021f7610 => Arm::Epilogue,
+        0x71021f7618 => Arm::StoreNine,
+        0x71021f6840 => Arm::StoreOne,
+        0x71021f6800 => Arm::ClearFlag,
+        0x71021f6928 => Arm::ResultByte,
+        0x71021f68e8 => Arm::ResultByteGuard11,
+        0x71021f68f4 => Arm::Guard11,
+        0x71021f6aa0 => Arm::Guard10,
+        0x71021f6ad0 => Arm::Half,
+        0x71021f6b28 => Arm::Plain,
+        _ => return None,
+    })
+}
+
+/// The arm a skill type selects: the epilogue for a type outside the table, else the table's target when it is ported.
+fn arm_of(skill_type: u32) -> Option<Arm> {
+    let index = skill_type.wrapping_sub(5);
+    if index > TABLE_RANGE {
+        return Some(Arm::Epilogue);
+    }
+    arm_at(TABLE_CODE.wrapping_add(u64::from(table_entry(index)) << 2))
 }
 
 impl SkillExecter {
@@ -239,9 +330,9 @@ impl SkillExecter {
     /// `f` is the register file at entry. Returns Ok after the epilogue, Err when a callee left an exception pending.
     pub fn exec_koudou_head(self, f: &mut Frame) -> Result<(), GuestException> {
         use field::*;
-        // `on` mode: a call that would take the jump table runs lifted, whole, before the port touches anything
+        // `on` mode: a call that would take a lifted arm runs lifted, whole, before the port touches anything
         match skill_type(f.x[0]) {
-            Some(kind) if !takes_table(kind) => {}
+            Some(kind) if arm_of(kind).is_some() => {}
             _ => {
                 f.regs.run_lifted(ENTRY);
                 return Ok(());
@@ -367,13 +458,68 @@ impl SkillExecter {
         )?;
         f.x[23] = f.x[0];
         self.first_loop(f)?;
-        // 0x71021f67d0: the jump table test (never taken here); 0x71021f7610 and the epilogue
+        self.dispatch(f)
+    }
+
+    /// 0x71021f67d0: the jump table test and dispatch (table 1), then the arm, then the common epilogue.
+    fn dispatch(self, f: &mut Frame) -> Result<(), GuestException> {
+        use field::*;
         f.x[8] = ld64(Self::this_head(f).wrapping_add(SKILL_OBJ));
         f.x[9] = w(ld32(f.x[8].wrapping_add(SKILL_TYPE)));
         f.x[10] = w((f.x[9] as u32).wrapping_sub(5));
-        debug_assert!(f.x[10] as u32 > TABLE_RANGE);
-        f.x[9] = w(f.x[19] as u32);
-        if f.x[19] as u32 != 0 {
+        if f.x[10] as u32 > TABLE_RANGE {
+            return Self::epilogue(f, false);
+        }
+        f.x[11] = TABLE_DATA;
+        f.x[12] = TABLE_CODE;
+        f.x[13] = u64::from(table_entry(f.x[10] as u32));
+        f.x[12] = f.x[12].wrapping_add(f.x[13] << 2);
+        f.x[9] = 9;
+        match arm_at(f.x[12]) {
+            Some(Arm::Epilogue) => Self::epilogue(f, false),
+            Some(Arm::StoreNine) => Self::epilogue(f, true),
+            Some(Arm::StoreOne) => {
+                f.x[9] = 1;
+                Self::epilogue(f, true)
+            }
+            Some(Arm::ClearFlag) => {
+                // 0x71021f6800
+                if f.x[24] as u32 != 0 {
+                    f.x[8] = ld64(f.x[28]);
+                    f.x[9] = 1;
+                    f.x[8] = ld64(f.x[8].wrapping_add(RESULT_LOGGER));
+                    prestate::store_u8(f.x[8].wrapping_add(LOGGER_MARK_40), 1);
+                }
+                prestate::store_u8(Self::this_head(f).wrapping_add(FLAG_44), 0);
+                Self::epilogue(f, false)
+            }
+            Some(Arm::ResultByte) => {
+                self.result_byte(f);
+                Self::epilogue(f, false)
+            }
+            Some(Arm::ResultByteGuard11) => {
+                self.result_byte(f);
+                self.guard(f, true)
+            }
+            Some(Arm::Guard11) => self.guard(f, true),
+            Some(Arm::Guard10) => self.guard(f, false),
+            Some(Arm::Half) => self.type_five(f),
+            Some(Arm::Plain) => self.type_six(f),
+            None => unreachable!("the pre-state hook defers every arm that is not ported"),
+        }
+    }
+
+    /// 0x71021f7610 (`direct` false: `w9 = w19`, the store only for a nonzero result) or 0x71021f7618 (`direct`: the store
+    /// with `w9` as it is) and the function epilogue.
+    fn epilogue(f: &mut Frame, direct: bool) -> Result<(), GuestException> {
+        use field::*;
+        let store = if direct {
+            true
+        } else {
+            f.x[9] = w(f.x[19] as u32);
+            f.x[19] as u32 != 0
+        };
+        if store {
             f.x[8] = ld64(f.x[28]);
             f.x[8] = ld64(f.x[8].wrapping_add(RESULT_LOGGER));
             prestate::store_u32(f.x[8].wrapping_add(LOGGER_VALUE), f.x[9] as u32);
@@ -384,6 +530,105 @@ impl SkillExecter {
         f.leave(&[0, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
         f.flush_v(&[8, 9, 10]);
         Ok(())
+    }
+
+    /// 0x71021f68e8 / 0x71021f6928: the result object's byte +0x24 = 1.
+    fn result_byte(self, f: &mut Frame) {
+        use field::*;
+        f.x[8] = ld64(Self::this_head(f).wrapping_add(RESULT_OBJECT));
+        f.x[9] = 1;
+        prestate::store_u8(f.x[8].wrapping_add(RESULT_BYTE_24), 1);
+    }
+
+    /// 0x71021f68f4 (`guard11`: `ba6d0`, then `+0x38 |= 8`) and 0x71021f6aa0 (`ba6a0`, then `+0x38 |= 4`), both on the
+    /// target and with `x1 = 0`.
+    fn guard(self, f: &mut Frame, guard11: bool) -> Result<(), GuestException> {
+        use field::*;
+        f.x[0] = ld64(Self::this_head(f).wrapping_add(TARGET));
+        f.x[1] = 0;
+        let list = &[0, 1, 8, 9, 10, 11, 12, 13, 19, 23, 24, 28];
+        if guard11 {
+            call_nested(f, smrpg_param_flag_11, callee::FLAG_11, 0x71021f6900, list)?;
+        } else {
+            call_nested(f, smrpg_param_flag_10, callee::FLAG_10, 0x71021f6aac, list)?;
+        }
+        f.x[8] = f.regs.x(8);
+        f.x[9] = f.regs.x(9);
+        // 0x71021f6f38 (or the same three lines in the other arm)
+        f.x[8] = ld64(Self::this_head(f).wrapping_add(RESULT_OBJECT));
+        let cell = f.x[8].wrapping_add(RESULT_FLAGS_38);
+        f.x[9] = w(prestate::read_u32(cell));
+        f.x[9] = w((f.x[9] as u32) | if guard11 { 8 } else { 4 });
+        prestate::store_u32(cell, f.x[9] as u32);
+        Self::epilogue(f, false)
+    }
+
+    /// 0x71021f6ad0, skill type 5: `x1 = 0; x21 = skill_obj[+0x14]; x20 = target.result_logger; v = <getter>(target)`;
+    /// the logger gets `v` and two marks when `x21` is not 0x7f, else `v / 2` (rounded toward zero), two marks and a byte.
+    fn type_five(self, f: &mut Frame) -> Result<(), GuestException> {
+        use field::*;
+        f.x[0] = ld64(f.x[28]);
+        f.x[1] = 0;
+        f.x[21] = w(ld32(f.x[8].wrapping_add(SKILL_FIELD_14)));
+        f.x[20] = ld64(f.x[0].wrapping_add(RESULT_LOGGER));
+        f.call(
+            callee::GETTER_10,
+            0x71021f6ae4,
+            &[0, 1, 8, 9, 10, 11, 12, 13, 19, 20, 21, 23, 24, 28],
+            false,
+        )?;
+        f.x[8] = f.regs.x(8);
+        if f.x[21] as u32 == 0x7f {
+            let v = f.x[0] as u32 as i32;
+            f.x[8] = w((v.wrapping_add(i32::from(v < 0)) >> 1) as u32);
+            prestate::store_u32(f.x[20].wrapping_add(LOGGER_VALUE_28), f.x[8] as u32);
+            Self::logger_marks(f, true);
+        } else {
+            prestate::store_u32(f.x[20].wrapping_add(LOGGER_VALUE_28), f.x[0] as u32);
+            Self::logger_marks(f, false);
+        }
+        Self::epilogue(f, false)
+    }
+
+    /// 0x71021f6fe4 / 0x71021f6afc: `logger +0x2c = 1; logger +0x60 = 1`, and for the halved value a byte +0x45 = 1.
+    fn logger_marks(f: &mut Frame, with_byte: bool) {
+        use field::*;
+        f.x[9] = 1;
+        for (offset, value) in [(LOGGER_MODE_2C, 1u32), (LOGGER_VALUE, 1)] {
+            f.x[8] = ld64(f.x[28]);
+            f.x[8] = ld64(f.x[8].wrapping_add(RESULT_LOGGER));
+            prestate::store_u32(f.x[8].wrapping_add(offset), value);
+        }
+        if with_byte {
+            f.x[8] = ld64(f.x[28]);
+            f.x[8] = ld64(f.x[8].wrapping_add(RESULT_LOGGER));
+            prestate::store_u8(f.x[8].wrapping_add(LOGGER_BYTE_45), 1);
+        }
+    }
+
+    /// 0x71021f6b28, skill type 6: the other getter's value, mode 3 and a byte +0x41 in the logger.
+    fn type_six(self, f: &mut Frame) -> Result<(), GuestException> {
+        use field::*;
+        f.x[0] = ld64(f.x[28]);
+        f.x[1] = 0;
+        f.x[20] = ld64(f.x[0].wrapping_add(RESULT_LOGGER));
+        f.call(
+            callee::GETTER_18,
+            0x71021f6b38,
+            &[0, 1, 8, 9, 10, 11, 12, 13, 19, 20, 23, 24, 28],
+            false,
+        )?;
+        f.x[8] = f.regs.x(8);
+        prestate::store_u32(f.x[20].wrapping_add(LOGGER_VALUE_28), f.x[0] as u32);
+        f.x[8] = ld64(f.x[28]);
+        f.x[8] = ld64(f.x[8].wrapping_add(RESULT_LOGGER));
+        f.x[9] = 3;
+        prestate::store_u32(f.x[8].wrapping_add(LOGGER_MODE_2C), 3);
+        f.x[8] = ld64(f.x[28]);
+        f.x[8] = ld64(f.x[8].wrapping_add(RESULT_LOGGER));
+        f.x[9] = 1;
+        prestate::store_u8(f.x[8].wrapping_add(LOGGER_BYTE_41), 1);
+        Self::epilogue(f, false)
     }
 
     /// 0x71021f6380: 27 metadata slots, then the flag byte.
@@ -609,7 +854,7 @@ impl SkillExecter {
                 f.x[9] = 1;
                 f.x[8] = ld64(f.x[8].wrapping_add(RESULT_LOGGER));
                 prestate::store_u8(f.x[8].wrapping_add(LOGGER_FLAG_47), 1);
-                f.x[8] = u64::from(ld8(this.wrapping_add(FLAG_44)));
+                f.x[8] = u64::from(prestate::read_u8(this.wrapping_add(FLAG_44)));
                 if f.x[8] as u32 == 0 {
                     // 0x71021f6768
                     f.x[0] = ld64(f.x[28]);
@@ -661,6 +906,52 @@ impl SkillExecter {
     }
 }
 
+/// The cells an arm stores or reads that the lifted body may have changed before the port runs. False when a pointer the
+/// arm follows is null (the lifted body then runs alone, as everywhere in the hook).
+unsafe fn arm_snapshots(arm: Arm, this: u64, target: u64, logger: u64) -> bool {
+    use field::*;
+    unsafe {
+        let result = guest_ld64(this.wrapping_add(RESULT_OBJECT));
+        match arm {
+            Arm::Epilogue | Arm::StoreNine | Arm::StoreOne => {}
+            Arm::ClearFlag => prestate::snapshot(logger.wrapping_add(LOGGER_MARK_40), 1, true),
+            Arm::ResultByte | Arm::ResultByteGuard11 | Arm::Guard11 | Arm::Guard10 => {
+                if result == 0 {
+                    return false;
+                }
+                if matches!(arm, Arm::ResultByte | Arm::ResultByteGuard11) {
+                    prestate::snapshot(result.wrapping_add(RESULT_BYTE_24), 1, true);
+                }
+                if arm != Arm::ResultByte {
+                    // the nested flag port: its buff manager (and, for the second flag, the status manager) must exist
+                    let buff = guest_ld64(target.wrapping_add(0xa0));
+                    if buff == 0 || guest_ld64(target.wrapping_add(0x98)) == 0 {
+                        return false;
+                    }
+                    let mut nested = [0u64; 32];
+                    nested[0] = target;
+                    if arm == Arm::Guard10 {
+                        let _ = smrpg_param_flag_10_pre(nested.as_mut_ptr());
+                    } else {
+                        let _ = smrpg_param_flag_11_pre(nested.as_mut_ptr());
+                    }
+                    prestate::snapshot(result.wrapping_add(RESULT_FLAGS_38), 4, true);
+                }
+            }
+            Arm::Half | Arm::Plain => {
+                if guest_ld64(target.wrapping_add(0x28)) == 0 {
+                    return false;
+                }
+                prestate::snapshot(logger.wrapping_add(LOGGER_VALUE_28), 4, true);
+                prestate::snapshot(logger.wrapping_add(LOGGER_MODE_2C), 4, true);
+                prestate::snapshot(logger.wrapping_add(LOGGER_BYTE_41), 1, true);
+                prestate::snapshot(logger.wrapping_add(LOGGER_BYTE_45), 1, true);
+            }
+        }
+    }
+    true
+}
+
 /// 0x71021f6340 `SkillExecter.exec_koudou_kouka`, head only (replay row with a store journal; the pre-state hook defers every
 /// call that would leave the ported part).
 #[unsafe(no_mangle)]
@@ -693,9 +984,9 @@ pub unsafe extern "C" fn smrpg_skill_exec_koudou_kouka_pre(x: *mut u64) -> i32 {
         let Some(kind) = skill_type(this) else {
             return 1;
         };
-        if takes_table(kind) {
+        let Some(arm) = arm_of(kind) else {
             return 1;
-        }
+        };
         let target = guest_ld64(this.wrapping_add(field::TARGET));
         let acter = guest_ld64(this.wrapping_add(field::ACTER));
         if target == 0 || acter == 0 {
@@ -756,6 +1047,10 @@ pub unsafe extern "C" fn smrpg_skill_exec_koudou_kouka_pre(x: *mut u64) -> i32 {
         prestate::snapshot(static_flag, 1, true);
         prestate::snapshot(logger.wrapping_add(field::LOGGER_FLAG_47), 1, true);
         prestate::snapshot(logger.wrapping_add(field::LOGGER_VALUE), 4, true);
+        prestate::snapshot(this.wrapping_add(field::FLAG_44), 1, arm == Arm::ClearFlag);
+        if !arm_snapshots(arm, this, target, logger) {
+            return 1;
+        }
         // the nested use_damage_guard the loop may reach
         let mut nested = [0u64; 32];
         nested[0] = target;

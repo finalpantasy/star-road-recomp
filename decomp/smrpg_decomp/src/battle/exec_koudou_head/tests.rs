@@ -12,6 +12,25 @@ std::thread_local! {
     static CHECK: Cell<u64> = const { Cell::new(0) };
     static BARRIERED: Cell<u64> = const { Cell::new(0) };
     static SINGLETON_MODE: Cell<u64> = const { Cell::new(0) };
+    static GETTER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The compiled table's entry (halfword, units of 4 bytes from 0x71021f6800) for the ported arms; any other type gets an
+/// entry that selects no ported arm.
+pub(super) fn fake_entry(index: u32) -> u16 {
+    match index + 5 {
+        5 => 0xb4,
+        6 => 0xca,
+        7 | 9 => 0xa8,
+        8 => 0x3d,
+        0xb..=0x10 => 0,
+        0x12 => 0x386,
+        0x14 | 0x16 | 0x1a => 0x384,
+        0x15 | 0x19 | 0x46 => 0x10,
+        0x4a => 0x4a,
+        0x50 => 0x3a,
+        _ => 0xffff,
+    }
 }
 
 fn pre(address: u64, size: u32, value: u64) {
@@ -61,6 +80,10 @@ struct Setup {
     flag_44: u8,
     logger_47: u8,
     static_flag: u8,
+    /// `_skill_obj +0x14`.
+    field_14: u32,
+    /// The result object's flag word (+0x38).
+    flags_38: u32,
 }
 
 fn plain(skill_type: u32) -> Setup {
@@ -75,6 +98,8 @@ fn plain(skill_type: u32) -> Setup {
         flag_44: 0,
         logger_47: 0,
         static_flag: 1,
+        field_14: 0,
+        flags_38: 0,
     }
 }
 
@@ -84,7 +109,11 @@ fn graph(s: &Setup) -> Box<[u64; 512]> {
     w[2] = 0xdead;
     w[4] = b + 8 * 30;
     w[5] = b + 8 * 50;
+    w[3] = b + 8 * 200;
     w[6] = b + 8 * 70;
+    w[55] = b + 8 * 205; // target + 0x28 (the getters' object)
+    put32(&mut w, 8 * 70 + 0x14, s.field_14);
+    put32(&mut w, 8 * 200 + 0x38, s.flags_38);
     put8(&mut w, 0x44, s.flag_44);
     put32(&mut w, 8 * 70 + 0x28, s.skill_type);
     put8(&mut w, 8 * 30 + 0x6c, s.acter_byte);
@@ -99,7 +128,7 @@ fn graph(s: &Setup) -> Box<[u64; 512]> {
     w[110 + 0xb8 / 8] = b + 8 * 420;
     w[420 + 0xe0 / 8] = b + 8 * 160;
     put32(&mut w, 8 * 160 + 0x18, s.length);
-    for index in [0usize, 4, 0x60] {
+    for index in [0usize, 4, 0x60, s.skill_type as usize] {
         w[164 + index] = b + 8 * 400;
     }
     w[130 + 0xb8 / 8] = b + 8 * 150;
@@ -145,6 +174,22 @@ fn install_all(g: &[u64; 512]) {
         r[0] = BD6C0.with(|t| t.borrow()[r[1] as usize])
     });
     install(callee::USE_DAMAGE_GUARD, |_| {});
+    install(callee::FLAG_10, |r| {
+        r[8] = 0x1010;
+        r[9] = 0x1011;
+    });
+    install(callee::FLAG_11, |r| {
+        r[8] = 0x1110;
+        r[9] = 0x1111;
+    });
+    install(callee::GETTER_10, |r| {
+        r[0] = GETTER.with(Cell::get);
+        r[8] = 0x2010;
+    });
+    install(callee::GETTER_18, |r| {
+        r[0] = GETTER.with(Cell::get);
+        r[8] = 0x2018;
+    });
     install(callee::INDEX_OUT_OF_RANGE, |r| {
         r[0] = u64::MAX;
         r[1] = u64::MAX;
@@ -166,6 +211,7 @@ fn reset() {
     CHECK.with(|c| c.set(0));
     BARRIERED.with(|c| c.set(0));
     SINGLETON_MODE.with(|c| c.set(0));
+    GETTER.with(|c| c.set(0));
 }
 
 fn run(g: &[u64; 512]) -> ([u64; 96], Result<(), GuestException>) {
@@ -208,13 +254,25 @@ fn assert_epilogue(file: &[u64; 96]) {
 }
 
 #[test]
-fn the_jump_table_range_is_type_minus_five_up_to_0x5a() {
-    assert!(!takes_table(4));
-    assert!(takes_table(5));
-    assert!(takes_table(0x5f));
-    assert!(!takes_table(0x60));
-    assert!(!takes_table(0));
-    assert!(!takes_table(0xffff_ffff));
+fn the_arm_of_a_type_follows_the_table_and_defers_what_is_not_ported() {
+    for kind in [0u32, 4, 0x60, 0xffff_ffff] {
+        assert_eq!(arm_of(kind), Some(Arm::Epilogue), "type {kind:#x}");
+    }
+    assert_eq!(arm_of(5), Some(Arm::Half));
+    assert_eq!(arm_of(6), Some(Arm::Plain));
+    assert_eq!(arm_of(7), Some(Arm::Guard10));
+    assert_eq!(arm_of(9), Some(Arm::Guard10));
+    assert_eq!(arm_of(8), Some(Arm::Guard11));
+    assert_eq!(arm_of(0x50), Some(Arm::ResultByteGuard11));
+    assert_eq!(arm_of(0x4a), Some(Arm::ResultByte));
+    for kind in 0xb..=0x10 {
+        assert_eq!(arm_of(kind), Some(Arm::ClearFlag), "type {kind:#x}");
+    }
+    assert_eq!(arm_of(0x12), Some(Arm::StoreNine));
+    assert_eq!(arm_of(0x14), Some(Arm::Epilogue));
+    assert_eq!(arm_of(0x15), Some(Arm::StoreOne));
+    assert_eq!(arm_of(0x13), None);
+    assert_eq!(arm_of(0x2f), None);
 }
 
 #[test]
@@ -231,8 +289,8 @@ fn no_flag_bytes_make_only_the_instance_call_and_return() {
 }
 
 #[test]
-fn a_table_type_runs_the_lifted_body_and_the_port_touches_nothing() {
-    let (_g, file, outcome) = go(&plain(5));
+fn a_lifted_arm_runs_the_lifted_body_and_the_port_touches_nothing() {
+    let (_g, file, outcome) = go(&plain(0x13));
     assert!(outcome.is_ok());
     assert!(calls().is_empty());
     assert!(stores().is_empty());
@@ -472,4 +530,141 @@ fn class_words_that_are_zero_run_the_initializers_and_the_metadata_byte() {
     assert_eq!(stores().len(), 1);
     assert_eq!(stores()[0].1, 1);
     assert_epilogue(&file);
+}
+
+const LOGGER: u64 = 8 * 90;
+const RESULT: u64 = 8 * 200;
+
+#[test]
+fn a_table_type_that_goes_to_the_epilogue_stores_a_nonzero_result_only() {
+    let mut s = plain(0x14);
+    s.bytes = [1, 0, 0, 0, 0, 0];
+    reset();
+    BD6C0.with(|t| t.borrow_mut()[2] = 3);
+    let g = graph(&s);
+    install_all(&g);
+    let (file, outcome) = run(&g);
+    assert!(outcome.is_ok());
+    assert_eq!(stored_at(&g, LOGGER + 0x60), [3, 3]);
+    assert_epilogue(&file);
+    let (g, file, _) = go(&plain(0x14));
+    assert!(stored_at(&g, LOGGER + 0x60).is_empty());
+    assert_epilogue(&file);
+}
+
+#[test]
+fn type_0x12_stores_nine_and_type_0x15_stores_one_without_a_result() {
+    for (kind, value) in [(0x12u32, 9u64), (0x15, 1), (0x19, 1), (0x46, 1)] {
+        let (g, file, outcome) = go(&plain(kind));
+        assert!(outcome.is_ok());
+        assert_eq!(stored_at(&g, LOGGER + 0x60), [value], "type {kind:#x}");
+        assert_epilogue(&file);
+    }
+}
+
+#[test]
+fn types_0xb_to_0x10_clear_flag_44_and_mark_the_logger_when_the_loop_skipped() {
+    // not skipped (the debug block does not run): only the flag byte
+    for kind in 0xb..=0x10 {
+        let mut s = plain(kind);
+        s.flag_44 = 1;
+        let (g, file, outcome) = go(&s);
+        assert!(outcome.is_ok());
+        assert_eq!(stored_at(&g, 0x44), [0]);
+        assert!(stored_at(&g, LOGGER + 0x40).is_empty());
+        assert_epilogue(&file);
+    }
+    // skipped: the debug check fails, so x24 is 1 and the logger byte +0x40 is set
+    let mut s = plain(0xe);
+    s.bytes = [1, 0, 0, 0, 0, 0];
+    reset();
+    BD6C0.with(|t| t.borrow_mut()[2] = 3);
+    GET_VALUE.with(|c| c.set(1));
+    CHECK.with(|c| c.set(0));
+    let g = graph(&s);
+    install_all(&g);
+    let (file, outcome) = run(&g);
+    assert!(outcome.is_ok());
+    assert_eq!(stored_at(&g, LOGGER + 0x40), [1]);
+    assert_eq!(stored_at(&g, 0x44), [0]);
+    assert_epilogue(&file);
+}
+
+#[test]
+fn type_0x4a_sets_the_result_byte_and_types_7_8_9_0x50_set_flags() {
+    let (g, file, outcome) = go(&plain(0x4a));
+    assert!(outcome.is_ok());
+    assert_eq!(stored_at(&g, RESULT + 0x24), [1]);
+    assert_eq!(calls(), [callee::GET_INST]);
+    assert_epilogue(&file);
+    // the guard arms: the nested call on the target (x1 = 0), then the flag word or-ed with 8 or 4
+    for (kind, guard, bit, byte) in [
+        (8u32, callee::FLAG_11, 8u64, false),
+        (7, callee::FLAG_10, 4, false),
+        (9, callee::FLAG_10, 4, false),
+        (0x50, callee::FLAG_11, 8, true),
+    ] {
+        let mut s = plain(kind);
+        s.flags_38 = 0x30;
+        let (g, file, outcome) = go(&s);
+        assert!(outcome.is_ok());
+        assert_eq!(calls(), [callee::GET_INST, guard], "type {kind:#x}");
+        assert_eq!(stored_at(&g, RESULT + 0x38), [0x30 | bit], "type {kind:#x}");
+        assert_eq!(
+            stored_at(&g, RESULT + 0x24),
+            if byte { [1].to_vec() } else { Vec::new() }
+        );
+        assert_epilogue(&file);
+    }
+}
+
+#[test]
+fn type_5_stores_the_getter_value_or_half_of_it() {
+    for (field, value, expected, with_byte) in [
+        (0x7fu32, 11u64, 5u64, true),
+        (0x7f, 0xffff_fffd, 0xffff_ffff, true), // -3: (-3 + 1) >> 1 = -1
+        (0x7f, 0xffff_ffff, 0, true),
+        (0x20, 11, 11, false),
+    ] {
+        let mut s = plain(5);
+        s.field_14 = field;
+        reset();
+        GETTER.with(|c| c.set(value));
+        let g = graph(&s);
+        install_all(&g);
+        let (file, outcome) = run(&g);
+        assert!(outcome.is_ok());
+        assert_eq!(
+            stored_at(&g, LOGGER + 0x28),
+            [expected],
+            "field {field:#x} value {value:#x}"
+        );
+        assert_eq!(stored_at(&g, LOGGER + 0x2c), [1]);
+        assert_eq!(stored_at(&g, LOGGER + 0x60), [1]);
+        assert_eq!(
+            stored_at(&g, LOGGER + 0x45),
+            if with_byte { [1].to_vec() } else { Vec::new() }
+        );
+        assert_eq!(calls(), [callee::GET_INST, callee::GETTER_10]);
+        assert_epilogue(&file);
+        assert_eq!(file[0], value);
+    }
+}
+
+#[test]
+fn type_6_stores_the_other_getter_mode_3_and_a_byte() {
+    let s = plain(6);
+    reset();
+    GETTER.with(|c| c.set(42));
+    let g = graph(&s);
+    install_all(&g);
+    let (file, outcome) = run(&g);
+    assert!(outcome.is_ok());
+    assert_eq!(stored_at(&g, LOGGER + 0x28), [42]);
+    assert_eq!(stored_at(&g, LOGGER + 0x2c), [3]);
+    assert_eq!(stored_at(&g, LOGGER + 0x41), [1]);
+    assert!(stored_at(&g, LOGGER + 0x60).is_empty());
+    assert_eq!(calls(), [callee::GET_INST, callee::GETTER_18]);
+    assert_epilogue(&file);
+    assert_eq!(file[0], 42);
 }

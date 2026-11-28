@@ -1567,8 +1567,9 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
                              * +0xb8 result logger with the +0x47, +0x49 bytes and the +0x60 int), the three class cells (init words zero one time in eight), the list
                              * owner's statics with the list (length +0x18, elements +0x20, each a three-way choice of element objects with six flag bytes), the BattleManager
                              * statics with its +0x10 object, the static-field byte, six literal cells, the stand-in GlobalWork object (+304 -> +48 an int, compared with 1) and
-                             * singleton (+0x68 mode), and the lazy-initialization flag (clear one time in sixteen). Types that take the jump table and types past a short
-                             * list would run lifted on this stand-in graph (not built for them), so none are generated here; the unit tests cover them. */
+                             * singleton (+0x68 mode), and the lazy-initialization flag (clear one time in sixteen). Types of table arms that are still lifted and types past a short
+                             * list would run lifted on this stand-in graph (not built for them), so none are generated here; the unit tests cover them. Task-72 adds the
+                             * ported arms' objects (the result object at +0x18, the getters' object at target +0x28, skill object +0x14, the status manager's +0x10). */
         static uint64_t region[700];
         t63_save_globals();
         fill_fake_region(region, 700, state);
@@ -1576,7 +1577,9 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         const uint64_t rb = (uint64_t)(uintptr_t)region;
         #define WORD(n) (rb + 8 * (n))
         #define PUT32(word, off, value) do { uint32_t put_ = (value); memcpy(bytes + 8 * (word) + (off), &put_, 4); } while (0)
-        static const uint32_t types[] = {0, 1, 2, 3, 4, 0x60, 0x61, 0x6f, 0, 4, 0x65, 0x60, 0x6e, 3, 0x6f, 0x62, 1, 0x6d};
+        /* task-72: besides the types outside the table, the ported table 1 arms (5 to 9, 0xb to 0x10, 0x12, 0x14 to 0x16, 0x19, 0x1a, 0x46, 0x4a, 0x50) */
+        static const uint32_t types[] = {0, 1, 2, 3, 4, 0x60, 0x61, 0x6f, 0, 4, 0x65, 0x60, 0x6e, 3, 0x6f, 0x62, 1, 0x6d,
+                                         5, 6, 7, 8, 9, 5, 6, 7, 8, 9, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10, 0xe, 0x12, 0x14, 0x15, 0x16, 0x19, 0x1a, 0x46, 0x4a, 0x50};
         static const unsigned char flag_bytes[] = {0, 0, 0, 1, 1, 2, 0x80, 0xff};
         static const unsigned char small[] = {0, 0, 0, 1, 0x80};
         static const uint32_t turns[] = {0, 0, 0, 1, 2, 0xffffffffu, 5, 0x80000000u};
@@ -1620,6 +1623,20 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         region[560 + 304 / 8] = WORD(620);
         static const uint64_t values[] = {0, 1, 1, 1, 2, 0xffffffffULL, 0x100000001ULL};
         region[620 + 6] = values[(pick >> 14) % RT_ARRAY_LEN(values)];
+        {   /* task-72: the result object (+0x18: byte +0x24, flag word +0x38), the getters' object (target +0x28: ints at +0x10, +0x18), skill object +0x14, status */
+            static const uint32_t ints[] = {0, 1, 5, 11, 0xfffffffdu, 0xffffffffu, 0x7fffffffu, 0x80000000u, 0x7f, 2};
+            static const uint32_t fields[] = {0x7f, 0x7f, 0, 1, 0x80, 0xffffffffu, 0x7f, 3};
+            static const uint32_t statuses[] = {0, 5, 5, 1, 4, 6, 0xffffffffu};
+            const uint64_t r3 = random_word(state);
+            region[3] = WORD(650);
+            region[50 + 0x28 / 8] = WORD(660);
+            bytes[8 * 650 + 0x24] = small[(r3 >> 2) % RT_ARRAY_LEN(small)];
+            PUT32(650, 0x38, (uint32_t)(r3 >> 8) & ((r3 & 4) ? 0xffffffffu : 0x33u));
+            PUT32(660, 0x10, ints[(r3 >> 20) % RT_ARRAY_LEN(ints)]);
+            PUT32(660, 0x18, ints[(r3 >> 28) % RT_ARRAY_LEN(ints)]);
+            PUT32(70, 0x14, fields[(r3 >> 36) % RT_ARRAY_LEN(fields)]);
+            PUT32(130, 0x10, statuses[(r3 >> 44) % RT_ARRAY_LEN(statuses)]);
+        }
         tl_stub_instance = WORD(560);
         static const uint32_t modes[] = {0, 1, 2, 3, 3, 3, 0xffffffffu, 0x80000000u};
         PUT32(640, 0x68, modes[(pick >> 20) % RT_ARRAY_LEN(modes)]);
