@@ -22,6 +22,13 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SMRPG_DECOMPGE
 # Rewritten only when the content changes so an unchanged manifest does not rebuild every wrapped chunk.
 file(READ "${glue}/leaves.def" manifest_text)
 file(READ "${SMRPG_DECOMPGEN_DIR}/gen.def" generated_text)
+# A hand-written row wins over a generated one for the same address (task-64: a generated field getter that a replay row's port has to
+# see through the recorder, as a traced `PLEAF`, not run live after the lifted body). The generated Rust function stays, unused.
+string(REGEX MATCHALL "(^|\n)[A-Z]?LEAF[(]main_[0-9]+, [0-9a-f]+" hand_rows "${manifest_text}")
+foreach(hand_row IN LISTS hand_rows)
+  string(REGEX MATCH "[0-9a-f]+$" hand_address "${hand_row}")
+  string(REGEX REPLACE "(^|\n)[A-Z]?LEAF[(]main_[0-9]+, ${hand_address}, [^\n]*\n" "\\1" generated_text "${generated_text}")
+endforeach()
 set(manifest "${CMAKE_CURRENT_BINARY_DIR}/manifest.def")
 set(manifest_new "${manifest_text}${generated_text}")
 set(manifest_old "")

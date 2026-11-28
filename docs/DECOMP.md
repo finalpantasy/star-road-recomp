@@ -588,6 +588,19 @@ New traced rows (`PLEAF`): 0x71021f7690 (logger setter), 0x71018bfa40 (string li
 
 Evidence is in `backlog/tasks/task-63.md`.
 
+## exec_each_targets callees (task-64): skill_calc_exception ported
+
+`Battle.SkillExecter.skill_calc_exception` (0x71021f8040) is ported in `decomp/smrpg_decomp/src/battle/exec_exception.rs` as a `QLEAF` (`smrpg_skill_calc_exception`, hook `smrpg_skill_calc_exception_pre`). Still lifted: `is_hit_calc_succeed` (0x71021fe9d0), `exec_calc_type` (0x71021fee50), `exec_koudou_kouka` (0x71021f6340).
+
+- Body: the lazy-initialization flag (four metadata slots), the `BattleManager` class and static-field checks, then by skill id: 0x67 bumps a `GlobalWork` counter (at most 250), adds half of a second counter (rounded toward zero) to `_tmp_value` and writes a debug line built from `Int32.ToString`; 0x25d calls a class helper unless the acter's character id is 0x657. Then, for target character id 0x5ed, manager state 2 and a manager check that is not positive, a calculation type of 1, 2 or 4 (the `calc_element` ratio must be nonzero, `call_port` of the element row, `fcmp` through `fp.rs`) or 12 (an `in_range` test of a skill field against 1 to 0x49) sets a flag byte in the manager's object and in the target's result logger and makes two target calls. Every GC poll, class-initializer arm and register flush follows the lifted C.
+- Callee rows: `leaves.def` row 0x71021f8040 is now a `QLEAF`; new `PLEAF` rows 0x7101887b40, 0x7101887b50, 0x71021ba580, 0x7101bf43d0, 0x71021bde90, 0x71021bddd0 (names unknown; 7b40 and 7b50 are a `GlobalWork` getter and setter of one int field).
+- Generated rows lose to hand rows: 0x7101887b40 was already a generated `DLEAF` getter, which in a replay trial would run live after the lifted body and read a value the lifted setter had already changed. `runtime/decomp/game.cmake` now drops a generated manifest row whose address a hand-written row in `leaves.def` also declares (the generated Rust function stays, unused).
+- `swap.c`: `is_nested_row` has a fifth address; the selftest graph for the row (executer, acter, target with its element manager and result logger, skill object, the `BattleManager` class, instance, object and checker, a second class, the static-field byte, literal and debug cells); `t63_save_globals` saves and restores the flag byte 0xd60 and three more slots.
+- The hook defers the first run of a process in `ab` mode (flag byte clear, class cells still tokens); it snapshots the class words, the static-field flag byte, `_tmp_value` and the two flag cells the port stores to.
+- 6 unit tests (68 in total). The 0x67 arm, the 0x25d arm and the exception arm were never reached by the battle route (selftest, unit tests and the mutation cover them).
+
+Evidence is in `backlog/tasks/task-64.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.
