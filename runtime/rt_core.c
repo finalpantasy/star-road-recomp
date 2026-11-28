@@ -41,7 +41,12 @@ static _Thread_local uint64_t tl_vlast;
 uint64_t rt_cntvct(void) {
     if (rt_deterministic()) {
         uint32_t f = (uint32_t)g_rt_vframe;
-        if (f != tl_vframe) { tl_vframe = f; tl_vcalls = 0; }
+        if (f != tl_vframe) {
+            static int tr = -1;
+            if (tr < 0) { const char *e = getenv("SMRPG_DET_TRACE"); tr = (e && *e && *e != '0') ? 1 : 0; }
+            if (tr && tl_vcalls) rt_log("dettrace clock frame=%u calls=%u", tl_vframe, tl_vcalls);   /* task-71: diagnosis logging only */
+            tl_vframe = f; tl_vcalls = 0;
+        }
         uint64_t sub = (uint64_t)(++tl_vcalls) * RT_DET_CALL;
         if (f && sub > RT_DET_FRAME * 3 / 4) sub = RT_DET_FRAME * 3 / 4;       /* stay inside the frame, or deltaTime between frames collapses to 0 and the game freezes */
         uint64_t v = RT_DET_BASE + (uint64_t)f * RT_DET_FRAME + sub;

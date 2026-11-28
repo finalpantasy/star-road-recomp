@@ -196,9 +196,34 @@ int plat_window_visible(void) { return P.visible ? 1 : 0; }
 uint32_t plat_frame(void) { return (uint32_t)P.frame; }
 void *plat_sdl_window(void) { return P.win; }
 
-void plat_present_tick(void) {
+static void publish_pads(uint32_t frame);
+static volatile LONG64 g_det_poll_ms;                                          /* real time of the last logic-frame poll (SMRPG_DETERMINISTIC) */
+
+/* SMRPG_DETERMINISTIC (task-71): the frame counter (virtual clock, scripted input, pad samples) advances on the game main thread's own
+ * once-per-frame hid poll, not on the present. The present runs on the render thread (T30) a few hundred microseconds from the poll in
+ * either order, so a present-keyed counter made the main thread see frame k or k+1 at the same point of its logic from run to run. */
+void plat_det_poll(void) {
+    if (!rt_deterministic()) return;
+    InterlockedExchange64(&g_det_poll_ms, (LONG64)GetTickCount64());
     LONG f = InterlockedIncrement(&P.frame);
-    InterlockedIncrement(&g_rt_vframe);                                        /* virtual clock under SMRPG_DETERMINISTIC (task-69) */
+    InterlockedIncrement(&g_rt_vframe);
+    publish_pads((uint32_t)f);
+}
+
+void plat_present_tick(void) {
+    LONG f = P.frame;
+    if (!rt_deterministic()) {
+        f = InterlockedIncrement(&P.frame);
+        InterlockedIncrement(&g_rt_vframe);                                    /* virtual clock under SMRPG_DETERMINISTIC (task-69) */
+    } else if (!g_det_poll_ms) {
+        InterlockedExchange64(&g_det_poll_ms, (LONG64)GetTickCount64() | 1);       /* before the first poll */
+    } else if (GetTickCount64() - (ULONGLONG)g_det_poll_ms > 500) {            /* no hid poll for half a second (a stall or a screen that does not poll): keep the clock moving, and say so */
+        static int warned;
+        if (warned < 8) { ++warned; rt_log("platform: deterministic mode: no hid poll for 500 ms, frame advanced by the present (frame %ld)", (long)f + 1); }
+        InterlockedExchange64(&g_det_poll_ms, (LONG64)GetTickCount64());
+        f = InterlockedIncrement(&P.frame);
+        InterlockedIncrement(&g_rt_vframe);
+    }
     if (rt_deterministic()) {                                                  /* the guest clock is virtual, so its own frame limiter no longer waits: hold presents to 60 per real second (asset loads run in real time) */
         static LARGE_INTEGER qf, next;
         LARGE_INTEGER now;
@@ -290,7 +315,7 @@ void plat_run(void *boot_thread) {
                 reload_live_input(frame);
                 next_live_input = now + LIVE_INPUT_POLL_MS;
             }
-            publish_pads(frame);
+            if (!rt_deterministic()) publish_pads(frame);                           /* deterministic: published on the main thread poll (plat_det_poll) */
             next += PUBLISH_MS;
             if (now >= next + 100) next = now + PUBLISH_MS;                         /* fell far behind (a stall): do not burst */
         }

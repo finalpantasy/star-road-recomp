@@ -5,6 +5,8 @@
  * Add a real implementation with HLE(id, "mangled name") { ...use c->x[0..7], leave results in c->x[0] }.
  * HLE_OVR beats a lifted export of the same name (used for the libc routines the sdk hand-writes). */
 #include "rt_internal.h"
+extern uint32_t plat_frame(void) __attribute__((weak));   /* absent in the unit-test builds */
+extern void plat_det_poll(void) __attribute__((weak));
 
 /* ------------------------------------------------------------------ definitions table */
 static HleDef g_defs[512];
@@ -107,6 +109,7 @@ void hle_thunk(Ctx *c) {
         /* task-22 evidence: what the game's own sdk code read from the hid shared memory. GetNpadState(out, id) / GetNpadStates(out, n, id)
          * both start with the newest NpadXState entry: u64 sampling, u64 buttons, s32 lx, ly, rx, ry. Logged when the buttons change, and for the first few calls. */
         uint64_t out = c->x[0];
+        if (rt_deterministic() && strstr(s->name, "GetNpadStates") && plat_det_poll) plat_det_poll();   /* task-71: the logic frame boundary */
         rt_icall(c, s->real);
         static struct { HleSlot *s; uint64_t buttons; int calls; } seen[8];
         int k = 0;
@@ -117,7 +120,7 @@ void hle_thunk(Ctx *c) {
             const int32_t *st = (const int32_t *)(uintptr_t)(out + 16);
             seen[k].calls++;
             if (e[1] != seen[k].buttons || seen[k].calls <= 2) {
-                rt_log("hid read: %s call #%d newest entry sampling=%llu buttons=%#llx lstick=(%d,%d) rstick=(%d,%d)", s->name, seen[k].calls,
+                rt_log("hid read: frame=%u %s call #%d newest entry sampling=%llu buttons=%#llx lstick=(%d,%d) rstick=(%d,%d)", plat_frame ? plat_frame() : 0, s->name, seen[k].calls,
                        (unsigned long long)e[0], (unsigned long long)e[1], st[0], st[1], st[2], st[3]);
                 seen[k].buttons = e[1];
             }

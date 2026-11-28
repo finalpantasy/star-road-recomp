@@ -30,6 +30,7 @@ void plat_shutdown(void);
 int plat_window_visible(void);               /* 1 while the window is shown on screen */
 void plat_present_tick(void);                /* one presented frame (the scripted input clock) */
 uint32_t plat_frame(void);
+void plat_det_poll(void);                    /* SMRPG_DETERMINISTIC: the main thread polled hid; advance the frame and publish its pads (task-71) */
 void *plat_sdl_window(void);                 /* the SDL_Window (NULL before plat_init); the options overlay's Dear ImGui SDL3 backend needs it */
 int plat_create_surface(void *vk_instance, uint64_t *vk_surface);       /* VkInstance, VkSurfaceKHR; 1 ok */
 void plat_destroy_surface(void *vk_instance, uint64_t vk_surface);

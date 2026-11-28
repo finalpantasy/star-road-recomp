@@ -32,6 +32,15 @@ typedef struct {
     atomic_ullong raced;            /* load rows: first pair differed, the identical retry agreed (another thread wrote the field) */
 } Leaf;
 
+/* SMRPG_DET_TRACE=1 (task-71): log the present frame and thread of the first calls of every row, to find where two runs diverge. Logging only. */
+extern uint32_t plat_frame(void) __attribute__((weak));   /* absent in the unit-test builds */
+static void leaf_called(Leaf *leaf) {
+    unsigned long long n = atomic_fetch_add(&leaf->calls, 1);
+    static int tr = -1;
+    if (tr < 0) { const char *e = getenv("SMRPG_DET_TRACE"); tr = (e && *e && *e != '0') ? 1 : 0; }
+    if (tr && n < 48) rt_log("dettrace row=%#llx n=%llu frame=%u", (unsigned long long)leaf->address, n + 1, (plat_frame ? plat_frame() : 0));
+}
+
 #define LEAF(chunk, addr, rust) \
     void f_##addr(Ctx *); \
     extern void f_##addr##_lifted(Ctx *); \
@@ -180,7 +189,7 @@ static void compare_store(Leaf *leaf, Ctx *c) {
         rt_log("decomp mismatch addr=%#llx regs=%d memory=%d", (unsigned long long)leaf->address, regs_differ,
                memory_differs);
     }
-    atomic_fetch_add(&leaf->calls, 1);
+    leaf_called(leaf);
 }
 
 /* ---- Replay rows (ELEAF, task-52) ----
@@ -401,7 +410,7 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
         unsigned long long n = atomic_fetch_add(&leaf->deferred, 1);
         if (n < 3) rt_log("decomp replay deferred addr=%#llx (lazy initialization pending)", (unsigned long long)leaf->address);
         leaf->lifted(c);
-        atomic_fetch_add(&leaf->calls, 1);
+        leaf_called(leaf);
         return;
     }
     const uint32_t fpsr_cum = FPSR_CUM;
@@ -427,7 +436,7 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     tl_rec = 0;
     buffer[tl_nest] = rec.calls;
     buffer_cap[tl_nest] = rec.cap;
-    atomic_fetch_add(&leaf->calls, 1);
+    leaf_called(leaf);
     memcpy(&trial, &pristine, sizeof trial);
     tl_replay = &rec;
     leaf->rust_regs(trial.x);
@@ -478,7 +487,7 @@ static void compare(Leaf *leaf, Ctx *c) {
         if (!memcmp(&again, &lifted_again, sizeof again)) {
             atomic_fetch_add(&leaf->raced, 1);
             rt_log("decomp raced addr=%#llx (first pair differed, retry agrees)", (unsigned long long)leaf->address);
-            atomic_fetch_add(&leaf->calls, 1);
+            leaf_called(leaf);
             return;
         }
     }
@@ -490,7 +499,7 @@ static void compare(Leaf *leaf, Ctx *c) {
         rt_log("decomp mismatch addr=%#llx ctx_byte=%zu lifted=%02x rust=%02x",
                (unsigned long long)leaf->address, i, a[i], b[i]);
     }
-    atomic_fetch_add(&leaf->calls, 1);
+    leaf_called(leaf);
 }
 
 /* task-61: live damage_calc calls by the target's character id (0x5dd, 0x5ec, 0x615, 0x653 run the four enemy rules; the fifth counter is every other id) */
@@ -573,7 +582,7 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
     if (__builtin_expect(is_deep_row(leaf->address), 0))
         deep_replay = tl_rec && !tl_replay && tl_depth == 1 && tl_nest == 0 && !tl_stub;
     if (leaf->probe || nested_replay || deep_replay) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
-        if (mode == AB && leaf->probe) atomic_fetch_add(&leaf->calls, 1);
+        if (mode == AB && leaf->probe) leaf_called(leaf);
         Recording *r = tl_rec;
         if (r && tl_depth == 0) {
             if (r->count >= r->cap) {
@@ -619,7 +628,7 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
     }
     if (mode == OFF) leaf->lifted(c);
     else if (mode == ON) {
-        if (leaf->rust_regs) atomic_fetch_add(&leaf->calls, 1);   /* task-58: live counts of the replay and bridge rows in `on` mode (evidence the route reached them) */
+        if (leaf->rust_regs) leaf_called(leaf);   /* task-58: live counts of the replay and bridge rows in `on` mode (evidence the route reached them) */
         run_rust(leaf, c);
     } else compare(leaf, c);
 }
