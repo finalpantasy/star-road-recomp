@@ -21,6 +21,7 @@ static struct { HidShmWriter w; PadState pads[PAD_MAX_PLAYERS]; uint32_t mask; v
 static void pad_lock(void) { while (InterlockedCompareExchange(&g_pad.lock, 1, 0)) YieldProcessor(); }
 static void pad_unlock(void) { InterlockedExchange(&g_pad.lock, 0); }
 static uint64_t hid_ticks(void) {                                    /* 19.2 MHz, the Switch system tick */
+    if (rt_deterministic()) return rt_cntvct();
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);

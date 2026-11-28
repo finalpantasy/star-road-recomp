@@ -198,6 +198,20 @@ void *plat_sdl_window(void) { return P.win; }
 
 void plat_present_tick(void) {
     LONG f = InterlockedIncrement(&P.frame);
+    InterlockedIncrement(&g_rt_vframe);                                        /* virtual clock under SMRPG_DETERMINISTIC (task-69) */
+    if (rt_deterministic()) {                                                  /* the guest clock is virtual, so its own frame limiter no longer waits: hold presents to 60 per real second (asset loads run in real time) */
+        static LARGE_INTEGER qf, next;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); next = now; }
+        next.QuadPart += qf.QuadPart / 60;
+        if (now.QuadPart > next.QuadPart + qf.QuadPart / 10) next = now;       /* far behind: do not burst to catch up */
+        while (now.QuadPart < next.QuadPart) {
+            LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / qf.QuadPart;
+            if (ms > 1) Sleep((DWORD)(ms - 1)); else SwitchToThread();
+            QueryPerformanceCounter(&now);
+        }
+    }
     overlay_pace();                                                            /* frame rate cap (options; "game" = no cap) */
     if (f == 300) log_window_state("present 300");
 }

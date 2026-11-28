@@ -23,7 +23,31 @@ double rt_now(void) {
     return (double)(q.QuadPart - g_q0.QuadPart) / (double)g_qpf.QuadPart;
 }
 
+/* SMRPG_DETERMINISTIC=1 (task-69): the guest clock is virtual. Ticks = fixed base + presented frames * (1/60 s) + a per-thread call
+ * count (each call on a thread moves its clock a few microseconds, so a loop that waits for the clock to move still ends, and the
+ * value does not depend on the other threads). Default off: the host clock, unchanged. */
+volatile LONG g_rt_vframe;                       /* presented frames, bumped by plat_present_tick */
+static int g_det = -1;
+int rt_deterministic(void) {
+    if (g_det < 0) { const char *e = getenv("SMRPG_DETERMINISTIC"); g_det = (e && *e && *e != '0') ? 1 : 0; }
+    return g_det;
+}
+static _Thread_local uint32_t tl_vframe, tl_vcalls;
+static _Thread_local uint64_t tl_vlast;
+#define RT_DET_BASE (RT_CNTFRQ * 100000ULL)      /* about 27.7 h of uptime */
+#define RT_DET_FRAME (RT_CNTFRQ / 60)
+#define RT_DET_CALL 96ULL                        /* 5 us per call on one thread, at most 3/4 of a frame (frame 0, the boot, has no cap) */
+
 uint64_t rt_cntvct(void) {
+    if (rt_deterministic()) {
+        uint32_t f = (uint32_t)g_rt_vframe;
+        if (f != tl_vframe) { tl_vframe = f; tl_vcalls = 0; }
+        uint64_t sub = (uint64_t)(++tl_vcalls) * RT_DET_CALL;
+        if (f && sub > RT_DET_FRAME * 3 / 4) sub = RT_DET_FRAME * 3 / 4;       /* stay inside the frame, or deltaTime between frames collapses to 0 and the game freezes */
+        uint64_t v = RT_DET_BASE + (uint64_t)f * RT_DET_FRAME + sub;
+        if (v <= tl_vlast) v = tl_vlast + 1;
+        return tl_vlast = v;
+    }
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     uint64_t f = (uint64_t)g_qpf.QuadPart, v = (uint64_t)q.QuadPart;

@@ -61,6 +61,8 @@ extern uint64_t g_main_thread_handle;
 Ctx *rt_ctx_new(RtThread *t);
 uint64_t rt_cntvct(void);             /* 19.2 MHz tick from the host clock */
 #define RT_CNTFRQ 19200000ULL
+int rt_deterministic(void);           /* SMRPG_DETERMINISTIC=1: virtual guest clock (task-69) */
+extern volatile LONG g_rt_vframe;
 void rt_call_guest(Ctx *c, uint64_t addr);   /* x30 = sentinel, rt_icall, uncaught-exception report */
 #define RT_SENTINEL (GUEST_HLE_BASE + 0x10)
 

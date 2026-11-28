@@ -10,7 +10,7 @@ static const uint8_t g_steady_uuid[16] = {0x53, 0x52, 0x52, 0x43, 0x2D, 0x53, 0x
 static KObj *g_time_shm;
 
 static int64_t steady_secs(void) { return (int64_t)(rt_cntvct() / RT_CNTFRQ); }
-static int64_t posix_now(void) { return (int64_t)time(0); }
+static int64_t posix_now(void) { return rt_deterministic() ? 1767225600LL + steady_secs() - 100000 : (int64_t)time(0); }  /* deterministic: 2026-01-01 UTC plus virtual seconds */
 
 static void shm_put(uint8_t *base, uint32_t off, uint32_t size, const void *ctx) {
     uint32_t cnt = 2;
