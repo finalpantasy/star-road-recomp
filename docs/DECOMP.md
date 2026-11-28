@@ -601,6 +601,19 @@ Evidence is in `backlog/tasks/task-63.md`.
 
 Evidence is in `backlog/tasks/task-64.md`.
 
+## exec_each_targets callees (task-65): is_hit_calc_succeed ported
+
+`Battle.SkillExecter.is_hit_calc_succeed` (0x71021fe9d0) is ported in `decomp/smrpg_decomp/src/battle/exec_hit.rs` as a `QLEAF` (`smrpg_skill_is_hit_calc_succeed`, hook `smrpg_skill_is_hit_calc_succeed_pre`). Still lifted: `exec_calc_type` (0x71021fee50), `exec_koudou_kouka` (0x71021f6340).
+
+- Body (the module header has the C# form): the lazy-initialization flag byte (11 metadata slots); a range test of the skill id against 0x2c3 to 0x2c5 with a miss when the target's counter is below 1; sure hits from two flag bytes (the `GlobalWork` instance and a singleton), from the `BattleManager` state 0x7db with a flag on its object and skill 0x2ba; then the rate in percent as a float: 100 for skill 1, otherwise the skill's integer field through `scvtf`; for skill 1 against a target without the modifier flag the rate becomes `rate + modifier * -0.5f` (`fmul`, then `fadd`, not fused); the singleton's mode 1 or 2 forces 100 or 0; a rate of 100 or more (`fcmp`, the GE condition, so NaN does not pass) is a sure hit, anything else goes to the random check (`x0 & 1`), except that skill 1 against target id 0x434 always misses; a miss writes a debug line and a flag byte in the target's result logger. Debug lines build their strings with `Single.ToString` on the two stack floats at `x29 + 0x18` and `x29 + 0x1c`.
+- Float rules: every float operation goes through `Regs` (`f32_from_i32`, `f32_arith`, `f32_compare`), which read FPCR and FPSR from the context and, in `ab` mode, run the lifted helper on the same operands (the fp shadow). Operand order is the compiled one (`fmul s1, s1, s2` then `fadd s0, s0, s1`); the `fcsel` is a plain select on the skill id compare. No new `fp.rs` operation was needed. The stack cells are read back through `prestate::read_u32`, which answers a cell the port stored itself first (the replay journal), and `bridge.rs`'s test fake now does the same.
+- Callee rows: `leaves.def` row 0x71021fe9d0 is now a `QLEAF`; new `PLEAF` rows 0x7101892aa0 (a singleton getter, `main_0286`) and 0x71018bfce0 (the random check, `main_0288`). The debug writers 0x71018bebc0 and 0x71018bebf0 are generated empty `LEAF` rows; `Single.ToString` 0x7101d6a050 is the existing `OLEAF`.
+- `swap.c`: `is_nested_row` has a sixth address; `t63_save_globals` now covers five flag bytes and nineteen slots (the flag byte 0xd70 and the nine literal slots 0xaf8 to 0xb38 are new); a stand-in singleton (`tl_stub_singleton`) for 0x7101892aa0; the selftest graph for the row (executer, target with its counter, modifier float and result logger, skill object with its id and integer rate, the `BattleManager` class cell with statics, instance, state and object flag, the `GlobalWork` class cell, the static-field byte, nine literal cells, the stand-in `get_inst` object and singleton, FPCR in nine modes, random FPSR).
+- The hook defers the first run of a process in `ab` mode (flag byte clear); it snapshots the flag byte, the two class words, the static-field flag byte and the miss flag byte the port stores to.
+- 13 unit tests (81 in total): the verdict and the restored registers, the range skills and the counter edges, the two flag sure hits, skill 0x2ba, the modifier arithmetic (0, 40, -40, infinity), the integer-to-float rate (including 0xffffffff and 0x80000000), a rounded conversion setting IXC and an exact one setting nothing, modes 1 and 2, a quiet and a signaling NaN rate (IOC), the roll and the miss flag store, the 0x434 forced miss, the first run's eleven initializations, a zero class word.
+
+Evidence is in `backlog/tasks/task-65.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

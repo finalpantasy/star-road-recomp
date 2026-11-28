@@ -369,6 +369,7 @@ static void stub_callee(Ctx *c) {
 }
 
 static __thread uint64_t tl_stub_instance;   /* selftest: what the stand-in GlobalWork.get_inst returns (a fake object, never a random word) */
+static __thread uint64_t tl_stub_singleton;  /* selftest (task-65): what the stand-in 0x7101892aa0 (a singleton getter with a flag byte at +0x5c and a mode int at +0x68) returns */
 static __thread uint64_t tl_stub_new;        /* selftest (task-58): what the stand-in Object.new (0x71000c44d0) returns: a fake List<int> */
 static __thread uint64_t tl_stub_current;    /* selftest (task-59): what the stand-in List<T>.Enumerator.get_Current (0x7100183d20) returns: a fake element */
 
@@ -376,6 +377,7 @@ static void run_traced(Leaf *leaf, Ctx *c) {
     if (tl_stub) {
         stub_callee(c);
         if (leaf->address == 0x7101886a00ULL && tl_stub_instance) c->x[0] = tl_stub_instance;
+        if (leaf->address == 0x7101892aa0ULL && tl_stub_singleton) c->x[0] = tl_stub_singleton;
         if (leaf->address == 0x71000c44d0ULL && tl_stub_new) c->x[0] = tl_stub_new;
         if (leaf->address == 0x7100183d20ULL && tl_stub_current) c->x[0] = tl_stub_current;
     } else {
@@ -510,7 +512,7 @@ static void note_damage_calc(const Ctx *c) {
  * recorded as one call of the caller's body and compared on its own when it is reached from that body. */
 static int is_nested_row(uint64_t address) {
     return address == 0x71021ff580ULL || address == 0x71021fff20ULL || address == 0x71021bdef0ULL || address == 0x7102200060ULL ||
-           address == 0x71021f8040ULL;
+           address == 0x71021f8040ULL || address == 0x71021fe9d0ULL;
 }
 
 /* task-62: damage_calc reached from the lifted body of a row that records its callees (exec_each_targets, its only caller) is one
@@ -967,27 +969,33 @@ static void restore_driver_globals(void) {
     for (int i = 0; i < 4; ++i) *(volatile uint8_t *)(uintptr_t)driver_flag_address[i] = (uint8_t)driver_saved[DRIVER_SLOTS + i];
     for (int i = 0; i < DRIVER_SLOTS; ++i) *(uint64_t *)(uintptr_t)driver_slot_at(i) = driver_saved[i];
     driver_have_saved = 0;
-    tl_stub_instance = tl_stub_new = tl_stub_current = 0;
+    tl_stub_instance = tl_stub_new = tl_stub_current = tl_stub_singleton = 0;
 }
 
 /* got_physics_attack, resister_thank_you_message and heal_calc (task-63): three flag bytes and seven metadata slots (data page + offset),
  * pointed at private cells for the selftest of any of the three and restored after it. */
-static const uint64_t t63_flag_address[4] = {0x7103cba000ULL + 0xbef, 0x7103cba000ULL + 0xd6c, 0x7103cba000ULL + 0xd72, 0x7103cba000ULL + 0xd60};
-static const uint64_t t63_slot_address[10] = {0x7103a82000ULL + 0x900, 0x7103a68000ULL + 0x978, 0x7103a57000ULL + 0xe48, 0x7103a58000ULL + 0x1d0,
+#define T63_FLAGS 5
+#define T63_SLOTS 19
+static const uint64_t t63_flag_address[T63_FLAGS] = {0x7103cba000ULL + 0xbef, 0x7103cba000ULL + 0xd6c, 0x7103cba000ULL + 0xd72, 0x7103cba000ULL + 0xd60,
+                                                     0x7103cba000ULL + 0xd70};   /* the last is is_hit_calc_succeed's (task-65) */
+static const uint64_t t63_slot_address[T63_SLOTS] = {0x7103a82000ULL + 0x900, 0x7103a68000ULL + 0x978, 0x7103a57000ULL + 0xe48, 0x7103a58000ULL + 0x1d0,
                                               0x7103a46000ULL + 0xa90, 0x7103a83000ULL + 0xbd0, 0x7103a83000ULL + 0xbd8,
-                                              0x7103a58000ULL + 0x48, 0x7103a83000ULL + 0x640, 0x7103a82000ULL + 0xb08};   /* the last three are skill_calc_exception's (task-64) */
-static uint64_t t63_saved[14];
+                                              0x7103a58000ULL + 0x48, 0x7103a83000ULL + 0x640, 0x7103a82000ULL + 0xb08,   /* the last three are skill_calc_exception's (task-64) */
+                                              0x7103a83000ULL + 0xaf8, 0x7103a83000ULL + 0xb00, 0x7103a83000ULL + 0xb08, 0x7103a83000ULL + 0xb10,
+                                              0x7103a83000ULL + 0xb18, 0x7103a83000ULL + 0xb20, 0x7103a83000ULL + 0xb28, 0x7103a83000ULL + 0xb30,
+                                              0x7103a83000ULL + 0xb38};   /* the nine literal slots are is_hit_calc_succeed's (task-65) */
+static uint64_t t63_saved[T63_FLAGS + T63_SLOTS];
 static int t63_have_saved;
 static void t63_save_globals(void) {
     if (t63_have_saved) return;
-    for (int i = 0; i < 4; ++i) t63_saved[i] = *(volatile uint8_t *)(uintptr_t)t63_flag_address[i];
-    for (int i = 0; i < 10; ++i) t63_saved[4 + i] = *(uint64_t *)(uintptr_t)t63_slot_address[i];
+    for (int i = 0; i < T63_FLAGS; ++i) t63_saved[i] = *(volatile uint8_t *)(uintptr_t)t63_flag_address[i];
+    for (int i = 0; i < T63_SLOTS; ++i) t63_saved[T63_FLAGS + i] = *(uint64_t *)(uintptr_t)t63_slot_address[i];
     t63_have_saved = 1;
 }
 static void restore_t63_globals(void) {
     if (!t63_have_saved) return;
-    for (int i = 0; i < 4; ++i) *(volatile uint8_t *)(uintptr_t)t63_flag_address[i] = (uint8_t)t63_saved[i];
-    for (int i = 0; i < 10; ++i) *(uint64_t *)(uintptr_t)t63_slot_address[i] = t63_saved[4 + i];
+    for (int i = 0; i < T63_FLAGS; ++i) *(volatile uint8_t *)(uintptr_t)t63_flag_address[i] = (uint8_t)t63_saved[i];
+    for (int i = 0; i < T63_SLOTS; ++i) *(uint64_t *)(uintptr_t)t63_slot_address[i] = t63_saved[T63_FLAGS + i];
     t63_have_saved = 0;
 }
 
@@ -1357,6 +1365,75 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         *(uint64_t *)(uintptr_t)t63_slot_address[8] = WORD(232);
         *(uint64_t *)(uintptr_t)t63_slot_address[9] = WORD(233);
         *(volatile uint8_t *)(uintptr_t)t63_flag_address[3] = ((pick >> 48) & 15) == 0 ? 0 : 1;
+        #undef PUT32
+        #undef WORD
+        c->x[0] = rb;
+        break;
+    }
+    case 0x71021fe9d0ULL: { /* Battle.SkillExecter.is_hit_calc_succeed (task-65): the executer (+0x10 monitor, +0x28 target, +0x30 skill object with +0x14 _skill_id and
+                             * +0x34 an int rate), the target (+0x20 id, +0x58 float, +0x6c byte, +0x8c counter, +0xb8 result logger with the +0x40 miss flag), the
+                             * BattleManager class cell (statics, instance with its +0x168 state and +0x60 object with the +0x30 flag byte), the GlobalWork class cell,
+                             * the static-field byte, nine literal cells, the stand-in get_inst object (+0x61 flag) and singleton (+0x5c flag, +0x68 mode), and the
+                             * lazy-initialization flag (clear one time in sixteen). Float inputs carry NaNs, infinities, signed zeros, denormals and rounding
+                             * boundaries; FPCR takes every mode the float selftest uses. */
+        static uint64_t region[500];
+        t63_save_globals();
+        fill_fake_region(region, 500, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        #define WORD(n) (rb + 8 * (n))
+        #define PUT32(word, off, value) do { uint32_t put_ = (value); memcpy(bytes + 8 * (word) + (off), &put_, 4); } while (0)
+        region[2] = WORD(240);
+        region[5] = WORD(30);
+        region[6] = WORD(350);
+        static const uint32_t skill_ids[] = {1, 1, 1, 1, 1, 0x2c3, 0x2c4, 0x2c5, 0x2ba, 0x2ba, 0x2ba, 0x2c2, 0x2c6, 0, 5, 0x80000000u, 0xffffffffu, 100};
+        static const uint32_t rates[] = {0, 1, 55, 99, 100, 101, 200, 0x7fffffffu, 0x80000000u, 0xffffffffu, 0x1000001u, 0x1000003u, 0xfffffu, 0x7ffffff3u, 0xfffffff0u};
+        static const uint32_t counters[] = {0, 1, 2, 5, 0xffffffffu, 0x80000000u, 0x7fffffffu};
+        static const uint32_t target_ids[] = {0x434, 0x434, 0x434, 0, 0x433, 0x435, 0xffffffffu};
+        static const unsigned char no_modifier[] = {0, 0, 0, 1, 0x80, 0xff};
+        static const uint32_t modifiers[] = {0, 0x80000000u, 0x3f800000u, 0x42200000u, 0xc2200000u, 0x43480000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7fc01234u,
+                                             0x7f800001u, 0xffa00000u, 0x00000001u, 0x007fffffu, 0x00800000u, 0x7f7fffffu, 0xff7fffffu, 0x3f000000u, 0x42c80000u, 0xc2c80000u,
+                                             0x42c7ffffu, 0x42c80001u, 0xc47a0000u, 0x4b800000u, 0x80000001u, 0x3fc00000u};
+        uint64_t r = random_word(state);
+        PUT32(350, 0x14, (r & 15) == 0 ? (uint32_t)(r >> 8) % 0x400 : skill_ids[(r >> 8) % RT_ARRAY_LEN(skill_ids)]);
+        r = random_word(state);
+        PUT32(350, 0x34, (r & 7) == 0 ? (uint32_t)(r >> 8) : rates[(r >> 8) % RT_ARRAY_LEN(rates)]);
+        PUT32(30, 0x20, target_ids[(pick >> 8) % RT_ARRAY_LEN(target_ids)]);
+        PUT32(30, 0x8c, counters[(pick >> 12) % RT_ARRAY_LEN(counters)]);
+        bytes[8 * 30 + 0x6c] = no_modifier[(pick >> 16) % RT_ARRAY_LEN(no_modifier)];
+        r = random_word(state);
+        PUT32(30, 0x58, (r & 7) == 0 ? (uint32_t)(r >> 8) : modifiers[(r >> 8) % RT_ARRAY_LEN(modifiers)]);
+        region[30 + 0xb8 / 8] = WORD(60);
+        bytes[8 * 60 + 0x40] = ((pick >> 20) & 1) ? 0 : 0x7e;
+        region[22] = WORD(90);                                  /* the BattleManager class cell holds the class */
+        region[23] = WORD(125);                                 /* the GlobalWork class cell holds its class */
+        r = random_word(state);
+        PUT32(90, 0xe0, (r & 3) == 0 ? 0 : (uint32_t)(r | 1));
+        r = random_word(state);
+        PUT32(125, 0xe0, (r & 3) == 0 ? 0 : (uint32_t)(r | 1));
+        region[90 + 0xb8 / 8] = WORD(160);                      /* statics */
+        region[160 + 2] = WORD(300);                            /* _instance */
+        region[300 + 0x60 / 8] = WORD(180);                     /* the object with the flag byte */
+        static const uint32_t states[] = {0x7db, 0x7db, 0x7db, 0x7db, 0, 0x7dc, 0x7da, 0xffffffffu};
+        PUT32(300, 0x168, states[(pick >> 24) % RT_ARRAY_LEN(states)]);
+        bytes[8 * 180 + 0x30] = ((pick >> 28) & 3) == 0 ? 0 : (((pick >> 30) & 7) == 0 ? 0x80 : 1);
+        static const unsigned char global_flags[] = {0, 0, 0, 0, 0, 1, 0x80};
+        bytes[8 * 400 + 0x61] = global_flags[(pick >> 33) % RT_ARRAY_LEN(global_flags)];
+        tl_stub_instance = WORD(400);
+        static const unsigned char singleton_flags[] = {0, 0, 0, 0, 1, 0x40};
+        bytes[8 * 430 + 0x5c] = singleton_flags[(pick >> 36) % RT_ARRAY_LEN(singleton_flags)];
+        static const uint32_t modes[] = {0, 1, 2, 2, 1, 3, 0xffffffffu, 0x80000000u, 0};
+        PUT32(430, 0x68, modes[(pick >> 40) % RT_ARRAY_LEN(modes)]);
+        tl_stub_singleton = WORD(430);
+        bytes[8 * 460] = ((pick >> 44) & 3) == 0 ? 0 : (((pick >> 46) & 7) == 0 ? 0x80 : 1);   /* the static-field byte */
+        *(uint64_t *)(uintptr_t)t63_slot_address[2] = WORD(22);
+        *(uint64_t *)(uintptr_t)t63_slot_address[3] = WORD(460);
+        *(uint64_t *)(uintptr_t)t63_slot_address[7] = WORD(23);
+        for (int i = 0; i < 9; ++i) *(uint64_t *)(uintptr_t)t63_slot_address[10 + i] = WORD(470 + i);
+        *(volatile uint8_t *)(uintptr_t)t63_flag_address[4] = ((pick >> 49) & 15) == 0 ? 0 : 1;
+        static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
+        c->fpcr = fpcr_modes[(pick >> 53) % RT_ARRAY_LEN(fpcr_modes)];
+        c->fpsr = (uint32_t)(random_word(state) >> 32) & 0x0800009fu;
         #undef PUT32
         #undef WORD
         c->x[0] = rb;
@@ -1764,6 +1841,7 @@ static void selftest(Leaf *leaf, GuestFn entry) {
     }
     if (stores && !stores_seen) rt_exit(10, "decomp selftest: store leaf never wrote");
     tl_stub = 0;
+    tl_stub_singleton = 0;
     restore_attack_globals();
     restore_belome_globals();
     restore_renkei_globals();

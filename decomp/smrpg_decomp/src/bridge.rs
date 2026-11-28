@@ -465,6 +465,8 @@ pub(crate) mod tests {
         pub static STORES: RefCell<Vec<(u64, u32, u64)>> = const { RefCell::new(Vec::new()) };
         /// Pre-state a test installs: (address, size, value) answered by `fake_pre_read` before live memory.
         pub static PRE: RefCell<Vec<(u64, u32, u64)>> = const { RefCell::new(Vec::new()) };
+        /// A test whose out pointer is x0 whatever x2 holds (task-65: `Single.ToString`).
+        pub static OUT_FROM_X0: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     pub unsafe fn fake_safepoint_n(
@@ -503,6 +505,16 @@ pub(crate) mod tests {
     pub unsafe fn fake_snapshot(_addr: u64, _size: u32, _watch: u32) {}
 
     pub unsafe fn fake_pre_read(addr: u64, size: u32) -> u64 {
+        // a replay trial answers a cell the port stored itself first (task-65: the float cells of is_hit_calc_succeed)
+        if let Some(v) = STORES.with(|s| {
+            s.borrow()
+                .iter()
+                .rev()
+                .find(|e| e.0 == addr && e.1 == size)
+                .map(|e| e.2)
+        }) {
+            return v;
+        }
         if let Some(v) = PRE.with(|p| {
             p.borrow()
                 .iter()
@@ -535,6 +547,7 @@ pub(crate) mod tests {
         SAFEPOINTS.with(|c| c.borrow_mut().clear());
         STORES.with(|c| c.borrow_mut().clear());
         PRE.with(|c| c.borrow_mut().clear());
+        OUT_FROM_X0.with(|c| c.set(false));
     }
 
     /// Stands in for `smrpg_guest_bl` in unit tests: runs the installed fake on the register words.
@@ -556,7 +569,12 @@ pub(crate) mod tests {
     pub unsafe fn fake_guest_bl_out(x: *mut u64, target: u64, buf: *mut u8, n: u32) -> i32 {
         // task-63: a row whose out pointer is x0 (`Int32.ToString` in `heal_calc`) leaves x2 zero; read it before the fake runs
         let pointer = unsafe { *x.add(2) };
-        let slot = (if pointer == 0 { unsafe { *x } } else { pointer }) as *const u8;
+        let from_x0 = OUT_FROM_X0.with(std::cell::Cell::get);
+        let slot = (if pointer == 0 || from_x0 {
+            unsafe { *x }
+        } else {
+            pointer
+        }) as *const u8;
         let pending = unsafe { fake_guest_bl(x, target) };
         unsafe { std::ptr::copy_nonoverlapping(slot, buf, n as usize) };
         pending
