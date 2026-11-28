@@ -17,6 +17,7 @@ pub mod element;
 pub mod exec_exception;
 pub mod exec_hit;
 pub mod exec_steps;
+pub mod exec_type;
 pub(crate) mod frame;
 pub mod renkei;
 pub mod targets;

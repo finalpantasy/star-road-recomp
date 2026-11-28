@@ -614,6 +614,19 @@ Evidence is in `backlog/tasks/task-64.md`.
 
 Evidence is in `backlog/tasks/task-65.md`.
 
+## exec_each_targets callees (task-66): exec_calc_type ported
+
+`Battle.SkillExecter.exec_calc_type` (0x71021fee50, 1,136 lifted lines, about 470 instructions) is ported in `decomp/smrpg_decomp/src/battle/exec_type.rs` as a `QLEAF` (`smrpg_skill_exec_calc_type`, hook `_pre`). Still lifted: `exec_koudou_kouka` (0x71021f6340, 4,193 lifted lines; not started, over the size limit of the card).
+
+- Body: the lazy-initialization flag (six metadata slots), the `GlobalWork` class check and `get_inst`, then a compiled jump table (halfword table at 0x7102b050a4, `x10 = 0x71021fef1c + 4 * entry`, calc types 0 to 13, anything above returns). Types 8 to 10 (and 1): the acter's attack minus the target's defence into `_tmp_value`; type 2 the magic pair plus the skill value; type 3 the skill value plus the magic attack; types 4 and 5 the skill value; type 0 (skill 0x286 against another character) the target logger; types 6 and 7 a result object and the `GlobalWork` getters; type 11 nothing; types 12 and 13 a call with the skill id. Types 1, 2 and 4 then run the `BattleManager` class checks (class word, static-field flag byte, metadata, class initializer, each with its own flush lists and polls in the three copies the compiler made) and add 4, 2 or the acter's byte to a counter int in the manager's object. Every debug line (`Int32.ToString` through its stack cell, `String.Concat`, the empty debug writer) is kept, in the same order.
+- The four stat getters (`get_calc_attack`, `get_calc_defence`, `get_calc_magic_attack`, `get_calc_magic_defence`) are called through their own shims (`Frame::call_port`); in unit tests they are fakes on the guest addresses (`call_stat`). The hook calls the attack hooks (`smrpg_param_calc_attack_pre` or the magic one) with the acter, by calc type, so their pre-state is captured; a deferral there defers this call.
+- Callee rows: `leaves.def` row 0x71021fee50 is now a `QLEAF`; new `PLEAF` rows 0x7101887ac0, 0x7101887b00 (generated `DLEAF` getters before; the hand rows win), 0x710188bf40, 0x710188dd30, 0x71021b7fb0 and 0x7102200150 (names unknown; they are called with the singleton or the executer, see the module comment).
+- `swap.c`: `is_nested_row` has a seventh address; `t63_save_globals` covers six flag bytes and 23 slots (flag 0xd6a and the four literal slots 0x598 to 0x5b8 are new); the selftest graph for the row builds the executer, the result object, the skill object, the acter and the target as full `BattleCharacterParam`s (the four stat getters run lifted on them, with the attack globals saved and restored), the target's logger, the `BattleManager` class cell with statics, instance, id and counter object, the `GlobalWork` and strawberry class cells, the static-field byte, four literal cells, the lazy-initialization flag (clear one time in sixteen) and nine FPCR modes.
+- The hook snapshots the flag byte (defers when clear), the class words, the static-field byte, `_tmp_value` and the three flag bytes, the result object's byte and two ints, the logger's two ints and flag, and the counter int (read-modify-write, so its pre-state value matters).
+- 11 unit tests (92 in total): the jump table against the dispatch addresses, types above 13 and 11, types 8 to 10, 1, 2, 3, 4, 5, 0 (four skill and character combinations), 6 and 7, 12 and 13, a clear flag (six initializers), and the three class-word and flag-byte initializer arms.
+
+Evidence is in `backlog/tasks/task-66.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

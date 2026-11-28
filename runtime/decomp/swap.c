@@ -512,7 +512,7 @@ static void note_damage_calc(const Ctx *c) {
  * recorded as one call of the caller's body and compared on its own when it is reached from that body. */
 static int is_nested_row(uint64_t address) {
     return address == 0x71021ff580ULL || address == 0x71021fff20ULL || address == 0x71021bdef0ULL || address == 0x7102200060ULL ||
-           address == 0x71021f8040ULL || address == 0x71021fe9d0ULL;
+           address == 0x71021f8040ULL || address == 0x71021fe9d0ULL || address == 0x71021fee50ULL;
 }
 
 /* task-62: damage_calc reached from the lifted body of a row that records its callees (exec_each_targets, its only caller) is one
@@ -974,16 +974,17 @@ static void restore_driver_globals(void) {
 
 /* got_physics_attack, resister_thank_you_message and heal_calc (task-63): three flag bytes and seven metadata slots (data page + offset),
  * pointed at private cells for the selftest of any of the three and restored after it. */
-#define T63_FLAGS 5
-#define T63_SLOTS 19
+#define T63_FLAGS 6
+#define T63_SLOTS 23
 static const uint64_t t63_flag_address[T63_FLAGS] = {0x7103cba000ULL + 0xbef, 0x7103cba000ULL + 0xd6c, 0x7103cba000ULL + 0xd72, 0x7103cba000ULL + 0xd60,
-                                                     0x7103cba000ULL + 0xd70};   /* the last is is_hit_calc_succeed's (task-65) */
+                                                     0x7103cba000ULL + 0xd70, 0x7103cba000ULL + 0xd6a};   /* the last two are is_hit_calc_succeed's (task-65) and exec_calc_type's (task-66) */
 static const uint64_t t63_slot_address[T63_SLOTS] = {0x7103a82000ULL + 0x900, 0x7103a68000ULL + 0x978, 0x7103a57000ULL + 0xe48, 0x7103a58000ULL + 0x1d0,
                                               0x7103a46000ULL + 0xa90, 0x7103a83000ULL + 0xbd0, 0x7103a83000ULL + 0xbd8,
                                               0x7103a58000ULL + 0x48, 0x7103a83000ULL + 0x640, 0x7103a82000ULL + 0xb08,   /* the last three are skill_calc_exception's (task-64) */
                                               0x7103a83000ULL + 0xaf8, 0x7103a83000ULL + 0xb00, 0x7103a83000ULL + 0xb08, 0x7103a83000ULL + 0xb10,
                                               0x7103a83000ULL + 0xb18, 0x7103a83000ULL + 0xb20, 0x7103a83000ULL + 0xb28, 0x7103a83000ULL + 0xb30,
-                                              0x7103a83000ULL + 0xb38};   /* the nine literal slots are is_hit_calc_succeed's (task-65) */
+                                              0x7103a83000ULL + 0xb38,   /* the nine literal slots are is_hit_calc_succeed's (task-65) */
+                                              0x7103a83000ULL + 0x598, 0x7103a83000ULL + 0x5a8, 0x7103a83000ULL + 0x5b0, 0x7103a83000ULL + 0x5b8};   /* exec_calc_type's four (task-66) */
 static uint64_t t63_saved[T63_FLAGS + T63_SLOTS];
 static int t63_have_saved;
 static void t63_save_globals(void) {
@@ -1365,6 +1366,96 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         *(uint64_t *)(uintptr_t)t63_slot_address[8] = WORD(232);
         *(uint64_t *)(uintptr_t)t63_slot_address[9] = WORD(233);
         *(volatile uint8_t *)(uintptr_t)t63_flag_address[3] = ((pick >> 48) & 15) == 0 ? 0 : 1;
+        #undef PUT32
+        #undef WORD
+        c->x[0] = rb;
+        break;
+    }
+    case 0x71021fee50ULL: { /* Battle.SkillExecter.exec_calc_type (task-66): the executer (+0x10 monitor, +0x18 result object with a +0x23 byte, +0x20 acter, +0x28 target,
+                             * +0x30 skill object with +0x14 _skill_id, +0x24 calc type, +0x2c value, +0x40 _tmp_value and three flag bytes), the acter and the target as
+                             * full BattleCharacterParams (the four stat getters run lifted on them: stats, +0x6c byte, +0xa0 buff manager with its int[], +0xb0 weapon;
+                             * the target's +0xb8 result logger), the BattleManager class cell (statics, instance with its +0x168 id and +0x60 counter object), the
+                             * GlobalWork class cell, the strawberry class cell, the static-field byte, four literal cells, and the lazy-initialization flag (clear
+                             * one time in sixteen). The helper calls are stand-ins like any traced callee. */
+        static uint64_t region[290];
+        t63_save_globals();
+        volatile uint8_t *flag_physical = (volatile uint8_t *)(uintptr_t)0x7103cbac09ULL, *flag_magic = (volatile uint8_t *)(uintptr_t)0x7103cbac0bULL;
+        uint64_t *slot_strawberry = (uint64_t *)(uintptr_t)0x7103a59328ULL;
+        if (!attack_have_saved) {
+            attack_saved[0] = *flag_physical; attack_saved[1] = *flag_magic; attack_saved[2] = *slot_strawberry;
+            attack_saved[3] = *(uint64_t *)(uintptr_t)0x7103a57e48ULL; attack_saved[4] = *(uint64_t *)(uintptr_t)0x7103a581d0ULL;
+            attack_have_saved = 1;
+        }
+        fill_fake_region(region, 290, state);
+        unsigned char *bytes = (unsigned char *)region;
+        const uint64_t rb = (uint64_t)(uintptr_t)region;
+        #define WORD(n) (rb + 8 * (n))
+        #define PUT32(word, off, value) do { uint32_t put_ = (value); memcpy(bytes + 8 * (word) + (off), &put_, 4); } while (0)
+        static const uint32_t edge_ints[] = {0, 1, 0xffffffffu, 100, 0xffffff9cu, 0x00ffffffu, 0x7fffffffu, 0x80000000u, 0x01234567u, 5, 0x2aaaaaabu};
+        static const uint32_t lengths[] = {0, 1, 2, 3, 4, 5, 9, 0xffffffffu};
+        static const unsigned char byte_flags[] = {0, 0, 1, 1, 2, 0x80, 0xff};
+        #define EDGE_INT() (((r = random_word(state)) & 3) == 0 ? (uint32_t)(r >> 8) : edge_ints[(r >> 8) % RT_ARRAY_LEN(edge_ints)])
+        uint64_t r = random_word(state);
+        region[2] = WORD(38);
+        region[3] = WORD(20);
+        region[4] = WORD(40);
+        region[5] = WORD(90);
+        region[6] = WORD(30);
+        static const uint32_t tmp_values[] = {0, 1, 2, 7, 100, 0xffffffffu, 0x7fffffffu, 0x80000000u};
+        PUT32(8, 0, (r & 7) == 0 ? (uint32_t)(r >> 8) : tmp_values[(r >> 8) % RT_ARRAY_LEN(tmp_values)]);
+        static const uint32_t skill_ids[] = {0x286, 0x286, 0x286, 0x285, 0x287, 0, 1, 5, 0xffffffffu, 0x80000000u, 0x7fffffffu, 0x100};
+        static const uint32_t calc_types[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0x20, 0xffffffffu, 0x80000000u, 0x7fffffffu, 0, 1, 2, 3, 4, 8};
+        uint64_t pick = random_word(state);
+        PUT32(30, 0x14, ((pick >> 4) & 7) == 0 ? (uint32_t)(pick >> 8) : skill_ids[(pick >> 12) % RT_ARRAY_LEN(skill_ids)]);
+        PUT32(30, 0x24, calc_types[(pick >> 20) % RT_ARRAY_LEN(calc_types)]);
+        PUT32(30, 0x2c, EDGE_INT());
+        static const uint32_t char_ids[] = {0x657, 0x658, 0, 1, 2, 0xffffffffu};
+        const uint32_t acter_id = char_ids[(pick >> 28) % RT_ARRAY_LEN(char_ids)];
+        PUT32(40, 0x20, acter_id);
+        PUT32(90, 0x20, ((pick >> 33) & 3) == 0 ? acter_id : char_ids[(pick >> 36) % RT_ARRAY_LEN(char_ids)]);   /* the same character one time in four or more */
+        /* the two params: _attack 0x3c, _defence 0x40, _magic_attack 0x44, _magic_defence 0x48, _is_player 0x6c, _buff_mng 0xa0, _weapon 0xb0 */
+        static const unsigned params[2][4] = {{40, 64, 70, 78}, {90, 115, 120, 128}};   /* param, buff manager, int[], weapon */
+        for (unsigned k = 0; k < 2; ++k) {
+            const unsigned p = params[k][0], buff = params[k][1], array = params[k][2], weapon = params[k][3];
+            PUT32(p, 0x3c, EDGE_INT()); PUT32(p, 0x40, EDGE_INT()); PUT32(p, 0x44, EDGE_INT()); PUT32(p, 0x48, EDGE_INT());
+            bytes[8 * p + 0x6c] = byte_flags[(random_word(state) >> 8) % RT_ARRAY_LEN(byte_flags)];
+            region[p + 0xa0 / 8] = WORD(buff);
+            region[p + 0xb0 / 8] = WORD(weapon);
+            region[buff + 3] = WORD(array);
+            PUT32(array, 0x18, lengths[(random_word(state) >> 8) % RT_ARRAY_LEN(lengths)]);
+            for (unsigned i = 0; i < 4; ++i) PUT32(array, 0x20 + 4 * i, EDGE_INT());
+            bytes[8 * weapon + 0x10] = byte_flags[(random_word(state) >> 8) % RT_ARRAY_LEN(byte_flags)];
+            for (unsigned i = 0; i < 3; ++i) PUT32(weapon, 0x14 + 4 * i, EDGE_INT());
+        }
+        region[90 + 0xb8 / 8] = WORD(135);                      /* the target's result logger */
+        /* BattleManager class (word 150), statics (180), instance (190: +0x168 id, +0x60 counter object 210 with the int at +0x1c) */
+        region[150 + 0xb8 / 8] = WORD(180);
+        region[180 + 2] = WORD(190);
+        region[190 + 0x60 / 8] = WORD(210);
+        PUT32(210, 0x1c, EDGE_INT());
+        r = random_word(state);
+        PUT32(150, 0xe0, (r & 7) == 0 ? 0 : (uint32_t)(r >> 8) | 1);
+        pick = random_word(state);
+        PUT32(190, 0x168, ((pick >> 1) & 1) ? 0x81c : (((pick >> 2) & 3) == 0 ? 0x81b : EDGE_INT()));
+        r = random_word(state);
+        PUT32(245, 0xe0, (r & 7) == 0 ? 0 : (uint32_t)(r >> 8) | 1);   /* the GlobalWork class word */
+        PUT32(250, 0xe0, ((pick >> 8) & 7) == 0 ? 0 : 1);               /* the strawberry class word */
+        region[240] = WORD(150);
+        region[241] = WORD(245);
+        region[243] = WORD(250);
+        bytes[8 * 242] = ((pick >> 12) & 3) == 0 ? 0 : (((pick >> 14) & 7) == 0 ? 0x80 : (unsigned char)(1 + ((pick >> 17) & 1)));   /* the static-field byte */
+        *(uint64_t *)(uintptr_t)t63_slot_address[2] = WORD(240);
+        *(uint64_t *)(uintptr_t)t63_slot_address[3] = WORD(242);
+        *(uint64_t *)(uintptr_t)t63_slot_address[7] = WORD(241);
+        for (int i = 0; i < 4; ++i) *(uint64_t *)(uintptr_t)t63_slot_address[19 + i] = WORD(280 + i);
+        *slot_strawberry = WORD(243);
+        *(volatile uint8_t *)(uintptr_t)t63_flag_address[5] = ((pick >> 20) & 15) == 0 ? 0 : 1;   /* lazy initialization pending one time in sixteen */
+        *flag_physical = ((pick >> 24) & 15) == 0 ? 0 : 1;
+        *flag_magic = ((pick >> 28) & 15) == 0 ? 0 : 1;
+        static const uint32_t fpcr_modes[] = {0, 0, 0, 1u << 24, 1u << 25, (1u << 24) | (1u << 25), 1u << 22, 2u << 22, 3u << 22};
+        c->fpcr = fpcr_modes[(pick >> 32) % RT_ARRAY_LEN(fpcr_modes)];
+        c->fpsr = (uint32_t)(pick >> 40) & 0x0800009fu;
+        #undef EDGE_INT
         #undef PUT32
         #undef WORD
         c->x[0] = rb;
