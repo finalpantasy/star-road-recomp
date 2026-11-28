@@ -561,6 +561,19 @@ The `switch` on the target's `_character_id` in `damage_calc` (0x71021ff580) is 
 
 Evidence: selftest 25,625 calls, 0 differences (the four ids about one case in eight); route 15 live calls, 0 differences, 5 on 0x5dd, none on the other three; `on` mode reached the battle (10 calls); two mutations caught. Details in `backlog/tasks/task-61.md`.
 
+## exec_each_targets (task-62): the caller of damage_calc
+
+`damage_calc` has one direct caller, `Battle.SkillExecter.exec_each_targets` (0x71021fe920, 42 instructions, 168 bytes, called from main_0321). It runs live in the battle route (12 to 15 calls per run), so the next caller up was not needed. It is ported in `decomp/smrpg_decomp/src/battle/targets.rs` as a `QLEAF` (`smrpg_skill_exec_each_targets`, hook `smrpg_skill_exec_each_targets_pre`): `is_hit_calc_succeed`, then `_tmp_value = 0`, `exec_calc_type`, `skill_calc_exception`, `exec_koudou_kouka`, `damage_calc` and `heal_calc` behind two flag bytes (+0x44, +0x45), `got_physics_attack(false)` behind +0x46 and the logger byte +0x46, a flag byte store (+0x74) when the target's character id is 0x650, and a tail call to `resister_thank_you_message`. Every callee is lifted and goes through the bridge (`Frame::call`); the register flushes follow the lifted C (the early return leaves x30 alone, the tail path writes x0, x8, x9, x19, x29, x30 and sp). Rows added to `leaves.def`: the QLEAF and `PLEAF`s for `exec_calc_type`, `skill_calc_exception`, `exec_koudou_kouka`, `got_physics_attack` (0x71021bdef0) and `resister_thank_you_message`.
+
+Two changes to the replay machinery in `swap.c`, both needed because `damage_calc` is itself a replay row reached from inside the recorded body:
+
+- Nested replay call. A replay row reached while another body is recorded is normally run lifted and not recorded. `damage_calc` (and only it, in `dispatch`) is instead recorded as one call of the outer body and run as its own full replay comparison, with the outer recording and journal parked (`run_nested_replay`: own call buffer, own pre-state and store journal, restored afterwards). The outer port bridges the call and receives the recorded registers; the driver's port is still compared against the lifted driver at the moment of the call, so the live `damage_calc` count and its 0 differences are kept. `smrpg_guest_bl` accepts the address in a trial. In the selftest of the outer row the call is a stand-in like every other callee.
+- Timeline cells (`prestate::snapshot_timeline`, watch 2). A store the port makes to a cell that later lifted callees rewrite (`_tmp_value`, stored 0 before `exec_calc_type`, which then sets it) cannot be compared with memory at the end. The recorder reads each such cell at the start of every recorded call, and the journal remembers how many calls had been matched at each store; the store must equal the cell as it stood at the next recorded call (at the end of the body when no call follows). In the selftest, where the stand-in callees write no memory, the strict end-of-body check applies and also finds a forgotten store.
+
+What stays unproved: the port reads the three flag bytes, the target and the logger live after the body ran (a callee that rewrites a flag after the call that read it would show as a mismatch; none did), and the 0x650 branch (the +0x74 store) was never reached live (selftest only).
+
+Evidence is in `backlog/tasks/task-62.md`.
+
 ## Reproduce the comparison
 
 Run from the repository root with the game build toolchain on PATH and write access to the shared work directory.

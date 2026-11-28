@@ -130,6 +130,12 @@ pub mod prestate {
         unsafe { smrpg_guest_snapshot(addr, size, u32::from(watch)) }
     }
 
+    /// Pre-state hook: a cell the port stores to that later callees of the lifted body may rewrite (task-62). In the live
+    /// A/B the store is checked against the value the cell had at the next recorded call instead of at the end of the body.
+    pub fn snapshot_timeline(addr: u64, size: u32) {
+        unsafe { smrpg_guest_snapshot(addr, size, 2) }
+    }
+
     /// The journaled stores in `[lo, hi)` are dead (the stack frame of a nested port that has returned).
     pub fn forget_stores(lo: u64, hi: u64) {
         unsafe { smrpg_guest_forget_stores(lo, hi) }

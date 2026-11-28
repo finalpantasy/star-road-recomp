@@ -201,11 +201,13 @@ static void compare_store(Leaf *leaf, Ctx *c) {
 #define REC_START 64
 #define REC_LIMIT 4096
 #define OUT_MAX 24
-typedef struct { uint64_t target; Ctx pre, post; unsigned char out_pre[OUT_MAX], out_post[OUT_MAX]; } RecCall;
+#define TL_CAP 4   /* task-62: timeline cells (watch 2) captured at the start of each recorded call */
+typedef struct { uint64_t target; Ctx pre, post; unsigned char out_pre[OUT_MAX], out_post[OUT_MAX]; uint64_t cap[TL_CAP]; } RecCall;
 typedef struct { RecCall *calls; unsigned count, next, cap; int bad; int dumped; int hide_callee_fpsr; uint32_t raised; } Recording;
 #define FPSR_CUM 0x0800009fu   /* IOC DZC OFC UFC IXC IDC QC: the cumulative FPSR bits */
 static __thread Recording *tl_rec, *tl_replay;
 static __thread unsigned tl_depth;
+static __thread unsigned tl_nest;   /* task-62: 1 while a replay row is compared inside the recording of another (the exec_each_targets row records damage_calc) */
 static __thread uint64_t tl_stub;   /* selftest: nonzero = traced callees do not run, they clobber registers pseudo-randomly */
 
 /* ---- Pre-state and store journal for replay rows (task-55) ----
@@ -223,7 +225,7 @@ static __thread uint64_t tl_stub;   /* selftest: nonzero = traced callees do not
  *    the lifted body changed must have a journaled store of that value. */
 #define PRE_MAX 96   /* task-60: the damage_calc driver names the cells of its five nested ports too */
 typedef struct { uint64_t addr; unsigned size, watch; uint64_t value; } PreCell;
-typedef struct { uint64_t addr; unsigned size; uint64_t value; } StoreRec;
+typedef struct { uint64_t addr; unsigned size; uint64_t value; unsigned at_call; } StoreRec;   /* at_call: recorded calls matched when the port stored (task-62) */
 static __thread PreCell tl_pre[PRE_MAX];
 static __thread unsigned tl_pre_n;
 static __thread StoreRec tl_st[PRE_MAX];
@@ -268,7 +270,7 @@ void smrpg_guest_store(uint64_t addr, unsigned size, uint64_t value) {
         return;
     }
     if (tl_st_n >= PRE_MAX) tl_st_overflow = 1;
-    else tl_st[tl_st_n++] = (StoreRec){addr, size, value};
+    else tl_st[tl_st_n++] = (StoreRec){addr, size, value, tl_replay->next};
 }
 
 /* task-60: a nested port's stack frame is dead once it returned, and the lifted body's later callees overwrite it: forget its stores. */
@@ -281,10 +283,45 @@ void smrpg_guest_forget_stores(uint64_t lo, uint64_t hi) {
 }
 
 /* After the trial: 0 when the journal and the lifted body's memory agree, otherwise the first problem is logged. */
-static int check_store_journal(Leaf *leaf) {
+/* task-62: the rank of a cell among the timeline cells (watch 2) of the hook, or -1. */
+static int timeline_rank(uint64_t addr, unsigned size) {
+    int rank = 0;
+    for (unsigned i = 0; i < tl_pre_n; ++i) {
+        if (tl_pre[i].watch != 2) continue;
+        if (tl_pre[i].addr == addr && tl_pre[i].size == size) return rank < TL_CAP ? rank : -1;
+        ++rank;
+    }
+    return -1;
+}
+
+/* task-62: remember each timeline cell at the start of a recorded call (the lifted body has just stored to it, the callee has not run). */
+static void capture_timeline(RecCall *call) {
+    unsigned k = 0;
+    for (unsigned i = 0; i < tl_pre_n && k < TL_CAP; ++i)
+        if (tl_pre[i].watch == 2) call->cap[k++] = raw_load(tl_pre[i].addr, tl_pre[i].size);
+}
+
+static int check_store_journal(Leaf *leaf, const Recording *rec) {
     int bad = tl_st_overflow;
     if (bad) rt_log("decomp store journal addr=%#llx: more than %d stores", (unsigned long long)leaf->address, PRE_MAX);
     for (unsigned i = 0; i < tl_st_n; ++i) {
+        /* a cell the later callees rewrite (watch 2, task-62): the store must match the cell as it stood at the next recorded call
+         * (or at the end of the body when no call follows). The selftest's stand-in callees write no memory, so there the strict check below applies. */
+        int rank = tl_stub ? -1 : timeline_rank(tl_st[i].addr, tl_st[i].size);
+        if (rank >= 0) {
+            int later = 0;
+            for (unsigned k = i + 1; k < tl_st_n; ++k)
+                if (tl_st[k].addr == tl_st[i].addr && tl_st[k].size == tl_st[i].size && tl_st[k].at_call == tl_st[i].at_call) later = 1;
+            if (later) continue;
+            uint64_t expected = tl_st[i].at_call < rec->count ? rec->calls[tl_st[i].at_call].cap[rank] : raw_load(tl_st[i].addr, tl_st[i].size);
+            if (expected != tl_st[i].value) {
+                bad = 1;
+                rt_log("decomp store journal addr=%#llx: port stored %#llx to %#llx before call %u, the cell held %#llx there",
+                       (unsigned long long)leaf->address, (unsigned long long)tl_st[i].value, (unsigned long long)tl_st[i].addr,
+                       tl_st[i].at_call, (unsigned long long)expected);
+            }
+            continue;
+        }
         /* a cell stored twice (a default, then the real value) must match memory only at its last store (task-56) */
         int superseded = 0;
         for (unsigned k = i + 1; k < tl_st_n; ++k)
@@ -299,7 +336,7 @@ static int check_store_journal(Leaf *leaf) {
         }
     }
     for (unsigned i = 0; i < tl_pre_n; ++i) {
-        if (!tl_pre[i].watch) continue;
+        if (!tl_pre[i].watch || (tl_pre[i].watch == 2 && !tl_stub)) continue;
         uint64_t now = raw_load(tl_pre[i].addr, tl_pre[i].size);
         if (now == tl_pre[i].value) continue;
         int covered = 0;
@@ -371,11 +408,11 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     }
     Ctx pristine, trial;
     memcpy(&pristine, c, sizeof pristine);
-    static __thread RecCall *buffer;   /* kept between calls: a fresh allocation per call would cost more than the compare */
-    static __thread unsigned buffer_cap;
+    static __thread RecCall *buffer[2];   /* kept between calls: a fresh allocation per call would cost more than the compare; [1] is the nested comparison of task-62 */
+    static __thread unsigned buffer_cap[2];
     Recording rec;
-    rec.calls = buffer;
-    rec.cap = buffer_cap;
+    rec.calls = buffer[tl_nest];
+    rec.cap = buffer_cap[tl_nest];
     rec.count = rec.next = 0;
     rec.bad = 0;
     rec.hide_callee_fpsr = leaf->clear_fpsr;
@@ -384,15 +421,15 @@ static void compare_replay(Leaf *leaf, Ctx *c) {
     tl_depth = 0;
     leaf->lifted(c);   /* live memory sees only this run */
     tl_rec = 0;
-    buffer = rec.calls;
-    buffer_cap = rec.cap;
+    buffer[tl_nest] = rec.calls;
+    buffer_cap[tl_nest] = rec.cap;
     atomic_fetch_add(&leaf->calls, 1);
     memcpy(&trial, &pristine, sizeof trial);
     tl_replay = &rec;
     leaf->rust_regs(trial.x);
     tl_replay = 0;
     int unused = rec.next != rec.count;
-    int journal_bad = check_store_journal(leaf);
+    int journal_bad = check_store_journal(leaf, &rec);
     int differs = unused || rec.bad || journal_bad || memcmp(&trial, c, sizeof trial);
     if (differs) {
         atomic_fetch_add(&leaf->differences, 1);
@@ -458,7 +495,7 @@ static int rule_count_live;   /* set once the startup selftest is over: its regi
 
 static void note_damage_calc(const Ctx *c) {
     const uint64_t executer = c->x[0];
-    if (!rule_count_live || !executer || tl_stub || tl_rec || tl_replay) return;
+    if (!rule_count_live || !executer || tl_stub || tl_replay) return;
     const uint64_t target = *(const uint64_t *)(uintptr_t)(executer + 0x28);
     if (!target) return;
     static const uint32_t ids[4] = {0x5dd, 0x5ec, 0x615, 0x653};
@@ -469,10 +506,45 @@ static void note_damage_calc(const Ctx *c) {
     atomic_fetch_add(&rule_calls[slot], 1);
 }
 
+/* task-62: damage_calc reached from the lifted body of a row that records its callees (exec_each_targets, its only caller) is one
+ * recorded call of that body, run as its own replay comparison with the outer recording and journal parked: the outer port
+ * bridges the call, the driver's port is still compared against the lifted driver at the moment of the call. */
+typedef struct { PreCell pre[PRE_MAX]; unsigned pre_n; StoreRec st[PRE_MAX]; unsigned st_n; int overflow; } JournalSave;
+
+static void run_nested_replay(Leaf *leaf, Ctx *c) {
+    if (tl_stub) {   /* selftest of the outer row: a stand-in callee like any other */
+        stub_callee(c);
+        return;
+    }
+    Recording *outer = tl_rec;
+    const unsigned depth = tl_depth;
+    JournalSave save;
+    memcpy(save.pre, tl_pre, sizeof save.pre);
+    memcpy(save.st, tl_st, sizeof save.st);
+    save.pre_n = tl_pre_n;
+    save.st_n = tl_st_n;
+    save.overflow = tl_st_overflow;
+    tl_rec = 0;
+    tl_nest = 1;
+    compare_replay(leaf, c);
+    tl_nest = 0;
+    tl_rec = outer;
+    tl_depth = depth;
+    memcpy(tl_pre, save.pre, sizeof save.pre);
+    memcpy(tl_st, save.st, sizeof save.st);
+    tl_pre_n = save.pre_n;
+    tl_st_n = save.st_n;
+    tl_st_overflow = save.overflow;
+}
+
 static inline void dispatch(Leaf *leaf, Ctx *c) {
-    if (__builtin_expect(leaf->address == 0x71021ff580ULL, 0)) note_damage_calc(c);
-    if (leaf->probe) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
-        if (mode == AB) atomic_fetch_add(&leaf->calls, 1);
+    int nested_replay = 0;
+    if (__builtin_expect(leaf->address == 0x71021ff580ULL, 0)) {
+        note_damage_calc(c);
+        nested_replay = tl_rec && !tl_replay && tl_depth == 0 && tl_nest == 0;
+    }
+    if (leaf->probe || nested_replay) {   /* traced row: the lifted body runs unchanged; the call is counted and, for a replay row, recorded */
+        if (mode == AB && leaf->probe) atomic_fetch_add(&leaf->calls, 1);
         Recording *r = tl_rec;
         if (r && tl_depth == 0) {
             if (r->count >= r->cap) {
@@ -490,6 +562,7 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
                 RecCall *call = &r->calls[r->count];
                 call->target = leaf->address;
                 memcpy(&call->pre, c, sizeof *c);
+                capture_timeline(call);
                 if (leaf->out_bytes) memcpy(call->out_pre, (const void *)(uintptr_t)(c->x[leaf->out_reg] + leaf->out_off), leaf->out_bytes);
                 /* The flags the callee raises are kept out of the context while the compared body runs, so that a
                  * flag the port forgets after the call cannot hide behind one the callee already set (task-54).
@@ -497,7 +570,8 @@ static inline void dispatch(Leaf *leaf, Ctx *c) {
                 uint32_t held = 0;
                 if (r->hide_callee_fpsr) { held = c->fpsr & FPSR_CUM; c->fpsr &= ~FPSR_CUM; }
                 ++tl_depth;
-                run_traced(leaf, c);
+                if (nested_replay) run_nested_replay(leaf, c);
+                else run_traced(leaf, c);
                 --tl_depth;
                 if (r->hide_callee_fpsr) { r->raised |= c->fpsr & FPSR_CUM; c->fpsr = (c->fpsr & ~FPSR_CUM) | held; }
                 memcpy(&call->post, c, sizeof *c);
@@ -638,7 +712,7 @@ int smrpg_guest_bl(uint64_t *x, uint64_t target) {
     Ctx *c = (Ctx *)(void *)x;   /* Ctx.x is the first member: the Rust side holds a pointer to the register file */
     if (tl_replay) {
         for (int i = 0; i < leaf_count; ++i)
-            if (leaves[i].probe && leaves[i].address == target) return replay_call(tl_replay, c, target);
+            if ((leaves[i].probe || target == 0x71021ff580ULL) && leaves[i].address == target) return replay_call(tl_replay, c, target);   /* task-62: damage_calc is recorded by exec_each_targets */
     }
     if (mode == AB && !callee_is_pure(target)) {
         rt_log("decomp bridge: ab mode, callee %#llx is not on the pure allowlist (it would run twice)", (unsigned long long)target);
@@ -1087,6 +1161,26 @@ static void prepare_caller(uint64_t address, Ctx *c, uint64_t *fake, uint64_t *s
         c->x[0] = rb;                                          /* the executer */
         c->x[1] = rb + 8 * 70;                                 /* the skill object */
         c->x[2] = rb + 8 * 240;                                /* the ratio cell */
+        break;
+    }
+    case 0x71021fe920ULL: { /* Battle.SkillExecter.exec_each_targets (task-62): the executer (+0x28 target, +0x40 _tmp_value, +0x44/+0x45/+0x46 flag bytes),
+                             * the target (+0x20 character id, +0x74 byte, +0xb8 result logger with a +0x46 flag byte) in the private fake region. The stand-in callees
+                             * write no memory and return a random result in x0, so both the miss branch and the full path run. */
+        fill_fake_region(fake, 64, state);
+        unsigned char *bytes = (unsigned char *)fake;
+        static const unsigned char flags[] = {0, 0, 1, 1, 2, 0xff, 0x80};
+        static const uint32_t ids[] = {0x650, 0x650, 0x650, 0x64f, 0x651, 0, 1, 0xffffffffu, 0x80000650u};
+        uint64_t r = random_word(state);
+        fake[5] = base + 8 * 16;                      /* +0x28 target */
+        fake[16 + 23] = base + 8 * 48;                /* target +0xb8 result logger */
+        bytes[0x44] = flags[r % RT_ARRAY_LEN(flags)];
+        bytes[0x45] = flags[(r >> 8) % RT_ARRAY_LEN(flags)];
+        bytes[0x46] = flags[(r >> 16) % RT_ARRAY_LEN(flags)];
+        bytes[8 * 48 + 0x46] = flags[(r >> 24) % RT_ARRAY_LEN(flags)];
+        bytes[8 * 16 + 0x74] = (r >> 32) & 1 ? 0 : flags[(r >> 40) % RT_ARRAY_LEN(flags)];
+        uint32_t id = ids[(r >> 48) % RT_ARRAY_LEN(ids)];
+        memcpy(bytes + 8 * 16 + 0x20, &id, 4);
+        c->x[0] = base;
         break;
     }
     case 0x71021ff580ULL: { /* Battle.SkillExecter.damage_calc (task-60): the executer (+0x10 monitor, +0x20 acter, +0x28 target, +0x30 skill object,

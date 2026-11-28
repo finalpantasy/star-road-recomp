@@ -16,6 +16,7 @@ pub mod damage;
 pub mod element;
 pub(crate) mod frame;
 pub mod renkei;
+pub mod targets;
 
 /// `Battle.BadStatusManager.BadStatusKind`, the raw 32-bit value (the game stores any int, so no Rust enum).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
